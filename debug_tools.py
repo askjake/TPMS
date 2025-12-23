@@ -406,38 +406,45 @@ class DebugTools:
     def run_full_diagnostic(self) -> Dict:
         """Run complete diagnostic suite"""
         print("🔍 Starting full diagnostic...")
-        
+    
         results = {
             'timestamp': time.time(),
             'hardware': None,
             'spectrum_scan': [],
+            'raw_spectrum': [],  # NEW
             'modulation_analysis': []
         }
-        
+    
         # 1. Hardware check
         print("📡 Checking hardware...")
         results['hardware'] = self.get_hardware_info()
-        
+    
         if not results['hardware'].device_found:
             print("❌ Hardware not found!")
             return results
-        
+    
         # 2. Spectrum scan on TPMS frequencies
         print("📊 Scanning TPMS frequencies...")
+        all_raw_spectrum = []
+    
         for freq in config.FREQUENCIES:
             # Scan ±5 MHz around each TPMS frequency
-            peaks = self.spectrum_scan(freq - 5, freq + 5, step=0.5, duration=0.3)
+            peaks, raw_spectrum = self.spectrum_scan(freq - 5, freq + 5, step=0.5, duration=0.3)
             results['spectrum_scan'].extend(peaks)
+            all_raw_spectrum.extend(raw_spectrum)
+    
+        results['raw_spectrum'] = all_raw_spectrum
         
         # 3. Analyze top peaks
         print("🔬 Analyzing detected signals...")
         top_peaks = sorted(results['spectrum_scan'], key=lambda x: x.power, reverse=True)[:5]
-        
+    
         for peak in top_peaks:
             print(f"   Analyzing {peak.frequency:.2f} MHz...")
             analysis = self.analyze_modulation(peak.frequency, duration=1.0)
             results['modulation_analysis'].append(analysis)
-        
+    
         print("✅ Diagnostic complete!")
-        
+    
         return results
+
