@@ -102,32 +102,39 @@ class DebugTools:
             )
     
     def spectrum_scan(self, start_freq: float, end_freq: float, 
-                     step: float = 0.5, duration: float = 0.5) -> List[SpectrumPeak]:
+                 step: float = 0.5, duration: float = 0.5) -> Tuple[List[SpectrumPeak], List[Tuple[float, float]]]:
         """
         Perform a spectrum scan across frequency range
-        
+    
         Args:
             start_freq: Start frequency in MHz
             end_freq: End frequency in MHz
             step: Step size in MHz
             duration: Duration to sample each frequency in seconds
-        
+    
         Returns:
-            List of detected peaks
+            Tuple of (peaks list, raw spectrum data as [(freq, power)])
         """
         peaks = []
+        raw_spectrum = []
         num_steps = int((end_freq - start_freq) / step) + 1
-        
+    
+        print(f"📊 Scanning {num_steps} frequencies from {start_freq} to {end_freq} MHz...")
+    
         for i in range(num_steps):
             freq = start_freq + (i * step)
-            
+        
             # Capture samples at this frequency
             power, snr = self._measure_frequency(freq, duration)
-            
-            if power > -80:  # Only record significant signals
+        
+            # Store all measurements for visualization
+            raw_spectrum.append((freq, power))
+        
+            # Only record significant signals as peaks
+            if power > -80:
                 # Estimate bandwidth
                 bandwidth = self._estimate_bandwidth(freq, power)
-                
+            
                 peaks.append(SpectrumPeak(
                     frequency=freq,
                     power=power,
@@ -135,10 +142,17 @@ class DebugTools:
                     snr=snr
                 ))
         
-        # Sort by power
+            # Progress indicator
+            if (i + 1) % 10 == 0:
+                print(f"   Progress: {i+1}/{num_steps} frequencies scanned...")
+    
+        # Sort peaks by power
         peaks.sort(key=lambda x: x.power, reverse=True)
-        
-        return peaks
+    
+        print(f"✅ Scan complete! Found {len(peaks)} peaks above -80 dBm")
+    
+        return peaks, raw_spectrum
+
     
     def _measure_frequency(self, freq: float, duration: float) -> Tuple[float, float]:
         """Measure power and SNR at a specific frequency"""
