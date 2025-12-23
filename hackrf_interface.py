@@ -246,28 +246,42 @@ class HackRFInterface:
     def _read_samples(self):
         """Read IQ samples from HackRF"""
         buffer_size = 262144
-        
+    
         while self.is_running and self.process:
             try:
                 data = self.process.stdout.read(buffer_size)
                 if not data:
                     break
-                
+            
                 # Convert bytes to IQ samples
                 iq_data = np.frombuffer(data, dtype=np.int8)
+            
+                # Ensure we have pairs of I/Q samples (even length)
+                if len(iq_data) % 2 != 0:
+                    iq_data = iq_data[:-1]  # Drop the last byte if odd
+            
+                if len(iq_data) < 2:  # Need at least one I/Q pair
+                    continue
+            
                 i_samples = iq_data[0::2].astype(np.float32) / 128.0
                 q_samples = iq_data[1::2].astype(np.float32) / 128.0
+            
+                # Double-check they're the same length
+                min_len = min(len(i_samples), len(q_samples))
+                i_samples = i_samples[:min_len]
+                q_samples = q_samples[:min_len]
+            
                 complex_samples = i_samples + 1j * q_samples
-                
+            
                 # Calculate signal metrics
                 power = np.mean(np.abs(complex_samples) ** 2)
                 signal_strength_dbm = 10 * np.log10(power + 1e-10) - 60
-                
+            
                 # Store metrics
                 self.signal_history.append(signal_strength_dbm)
                 if len(self.signal_history) > self.max_history_size:
                     self.signal_history.pop(0)
-                
+            
                 # Update frequency stats
                 freq_key = self.current_frequency
                 if freq_key in self.frequency_stats:
@@ -275,15 +289,16 @@ class HackRFInterface:
                     stats['samples'] += 1
                     # Running average
                     stats['avg_strength'] = (stats['avg_strength'] * (stats['samples'] - 1) + signal_strength_dbm) / stats['samples']
-                
+            
                 # Pass to callback
                 if self.callback:
                     self.callback(complex_samples, signal_strength_dbm, self.current_frequency)
-                
+            
             except Exception as e:
                 if self.is_running:
                     print(f"Error reading samples: {e}")
                 break
+
     
     def _auto_tune(self):
         """Automatically adjust gain for optimal reception - DISABLED during frequency hopping"""
@@ -361,3 +376,4 @@ class HackRFInterface:
             'hop_interval': self.hop_interval,
             'frequency_stats': self.frequency_stats
         }
+
