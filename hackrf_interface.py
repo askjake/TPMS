@@ -17,6 +17,10 @@ class HackRFInterface:
         self.data_queue = Queue(maxsize=1000)
         self.callback: Optional[Callable] = None
         
+        # Thread safety
+        self.restart_lock = threading.Lock()
+        self.restart_pending = False
+        
         # Find hackrf_transfer
         self.hackrf_transfer_path = self._find_hackrf_transfer()
         
@@ -32,10 +36,10 @@ class HackRFInterface:
         self.frequency_stats = {freq: {'samples': 0, 'avg_strength': 0, 'detections': 0} 
                                for freq in config.FREQUENCIES}
         
-        # Auto-tuning parameters
-        self.auto_tune_enabled = True
+        # Auto-tuning parameters - DISABLED during frequency hopping
+        self.auto_tune_enabled = False  # Disabled to prevent conflicts
         self.last_tune_time = 0
-        self.tune_interval = 10
+        self.tune_interval = 60  # Only tune once per minute if enabled
     
     def _find_hackrf_transfer(self):
         """Find hackrf_transfer executable"""
@@ -49,108 +53,169 @@ class HackRFInterface:
     
     def start(self, frequency: float, callback: Callable):
         """Start HackRF reception"""
-        if self.is_running:
-            self.stop()
-        
-        self.current_frequency = frequency
-        self.callback = callback
-        self.is_running = True
-        self.last_hop_time = time.time()
-        
-        # Start on first frequency if hopping enabled
-        if self.frequency_hop_enabled:
-            self.frequency_index = 0
-            self.current_frequency = config.FREQUENCIES[self.frequency_index]
-        
-        # Build command
-        cmd = [
-            self.hackrf_transfer_path,
-            '-r', '-',
-            '-f', str(int(self.current_frequency * 1e6)),
-            '-s', str(config.SAMPLE_RATE),
-            '-g', str(self.current_gain),
-            '-l', '32',
-            '-a', '1'
-        ]
-        
-        print(f"🚀 Starting HackRF on {self.current_frequency} MHz with gain {self.current_gain} dB")
-        if self.frequency_hop_enabled:
-            print(f"🔄 Frequency hopping enabled: {config.FREQUENCIES}")
-        print(f"Command: {' '.join(cmd)}")
-        
-        try:
-            self.process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=0
-            )
+        with self.restart_lock:
+            if self.is_running:
+                self._stop_internal()
             
-            # Check if process started successfully
-            time.sleep(0.5)
-            if self.process.poll() is not None:
-                stderr = self.process.stderr.read().decode()
-                print(f"❌ HackRF failed to start: {stderr}")
-                return False
+            self.current_frequency = frequency
+            self.callback = callback
+            self.is_running = True
+            self.last_hop_time = time.time()
             
-            # Start reading thread
-            self.read_thread = threading.Thread(target=self._read_samples, daemon=True)
-            self.read_thread.start()
-            
-            # Start frequency hopping thread
+            # Start on first frequency if hopping enabled
             if self.frequency_hop_enabled:
-                self.hop_thread = threading.Thread(target=self._frequency_hopper, daemon=True)
-                self.hop_thread.start()
+                self.frequency_index = config.FREQUENCIES.index(frequency) if frequency in config.FREQUENCIES else 0
+                self.current_frequency = config.FREQUENCIES[self.frequency_index]
             
-            # Start auto-tune thread
-            if self.auto_tune_enabled:
-                self.tune_thread = threading.Thread(target=self._auto_tune, daemon=True)
-                self.tune_thread.start()
+            # Ensure gain is valid (must be multiple of 2)
+            self.current_gain = (self.current_gain // 2) * 2
             
-            print("✅ HackRF started successfully")
-            return True
+            # Build command
+            cmd = [
+                self.hackrf_transfer_path,
+                '-r', '-',
+                '-f', str(int(self.current_frequency * 1e6)),
+                '-s', str(config.SAMPLE_RATE),
+                '-g', str(self.current_gain),
+                '-l', '32',
+                '-a', '1'
+            ]
             
-        except FileNotFoundError:
-            print(f"❌ hackrf_transfer not found at: {self.hackrf_transfer_path}")
-            return False
+            print(f"🚀 Starting HackRF on {self.current_frequency} MHz with gain {self.current_gain} dB")
+            if self.frequency_hop_enabled:
+                print(f"🔄 Frequency hopping enabled: {config.FREQUENCIES} (interval: {self.hop_interval}s)")
+            print(f"Command: {' '.join(cmd)}")
             
-        except Exception as e:
-            print(f"❌ Failed to start HackRF: {e}")
-            return False
+            try:
+                self.process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    bufsize=0
+                )
+                
+                # Check if process started successfully
+                time.sleep(0.5)
+                if self.process.poll() is not None:
+                    stderr = self.process.stderr.read().decode()
+                    print(f"❌ HackRF failed to start: {stderr}")
+                    return False
+                
+                # Start reading thread
+                self.read_thread = threading.Thread(target=self._read_samples, daemon=True)
+                self.read_thread.start()
+                
+                # Start frequency hopping thread
+                if self.frequency_hop_enabled:
+                    self.hop_thread = threading.Thread(target=self._frequency_hopper, daemon=True)
+                    self.hop_thread.start()
+                
+                # Don't start auto-tune if frequency hopping is enabled
+                if self.auto_tune_enabled and not self.frequency_hop_enabled:
+                    self.tune_thread = threading.Thread(target=self._auto_tune, daemon=True)
+                    self.tune_thread.start()
+                
+                print("✅ HackRF started successfully")
+                return True
+                
+            except FileNotFoundError:
+                print(f"❌ hackrf_transfer not found at: {self.hackrf_transfer_path}")
+                return False
+                
+            except Exception as e:
+                print(f"❌ Failed to start HackRF: {e}")
+                return False
+    
+    def _stop_internal(self):
+        """Internal stop method without lock (called from within locked context)"""
+        self.is_running = False
+        if self.process:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=2)
+            except:
+                try:
+                    self.process.kill()
+                    self.process.wait(timeout=1)
+                except:
+                    pass
+            self.process = None
+        # Give the device time to release
+        time.sleep(0.5)
     
     def stop(self):
         """Stop HackRF reception"""
-        self.is_running = False
-        if self.process:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=5)
-            except:
-                self.process.kill()
-            self.process = None
+        with self.restart_lock:
+            self._stop_internal()
         print("⏹️  HackRF stopped")
     
     def _frequency_hopper(self):
         """Automatically hop between frequencies"""
         while self.is_running:
+            time.sleep(1.0)  # Check every second
+            
+            if not self.is_running:
+                break
+            
             current_time = time.time()
             
+            # Check if it's time to hop
             if current_time - self.last_hop_time >= self.hop_interval:
-                # Move to next frequency
-                self.frequency_index = (self.frequency_index + 1) % len(config.FREQUENCIES)
-                new_frequency = config.FREQUENCIES[self.frequency_index]
-                
-                print(f"🔄 Hopping to {new_frequency} MHz")
-                
-                # Restart with new frequency
-                callback = self.callback
-                self.stop()
-                time.sleep(config.FREQUENCY_HOP_DWELL_TIME)
-                self.start(new_frequency, callback)
-                
-                self.last_hop_time = current_time
-            
-            time.sleep(0.1)
+                # Try to acquire lock
+                if self.restart_lock.acquire(blocking=False):
+                    try:
+                        # Move to next frequency
+                        self.frequency_index = (self.frequency_index + 1) % len(config.FREQUENCIES)
+                        new_frequency = config.FREQUENCIES[self.frequency_index]
+                        
+                        print(f"🔄 Hopping to {new_frequency} MHz")
+                        
+                        # Stop current reception
+                        self._stop_internal()
+                        
+                        # Wait for settling
+                        time.sleep(config.FREQUENCY_HOP_DWELL_TIME)
+                        
+                        if not self.is_running:  # Check if we were stopped
+                            break
+                        
+                        # Restart with new frequency
+                        self.current_frequency = new_frequency
+                        self.last_hop_time = current_time
+                        
+                        # Ensure gain is valid
+                        self.current_gain = (self.current_gain // 2) * 2
+                        
+                        cmd = [
+                            self.hackrf_transfer_path,
+                            '-r', '-',
+                            '-f', str(int(self.current_frequency * 1e6)),
+                            '-s', str(config.SAMPLE_RATE),
+                            '-g', str(self.current_gain),
+                            '-l', '32',
+                            '-a', '1'
+                        ]
+                        
+                        self.process = subprocess.Popen(
+                            cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            bufsize=0
+                        )
+                        
+                        # Restart reading thread
+                        self.read_thread = threading.Thread(target=self._read_samples, daemon=True)
+                        self.read_thread.start()
+                        
+                        print(f"✅ Now scanning {new_frequency} MHz")
+                        
+                    except Exception as e:
+                        print(f"❌ Error during frequency hop: {e}")
+                    finally:
+                        self.restart_lock.release()
+                else:
+                    # Lock is busy, skip this hop
+                    print("⏭️  Skipping hop (device busy)")
     
     def _read_samples(self):
         """Read IQ samples from HackRF"""
@@ -195,8 +260,8 @@ class HackRFInterface:
                 break
     
     def _auto_tune(self):
-        """Automatically adjust gain for optimal reception"""
-        while self.is_running:
+        """Automatically adjust gain for optimal reception - DISABLED during frequency hopping"""
+        while self.is_running and not self.frequency_hop_enabled:
             time.sleep(self.tune_interval)
             
             if len(self.signal_history) < 10:
@@ -208,32 +273,40 @@ class HackRFInterface:
             
             avg_signal = np.mean(self.signal_history[-20:])
             
-            # Adjust gain based on signal strength
-            if avg_signal < config.MIN_SIGNAL_STRENGTH - 10:
-                new_gain = min(self.current_gain + config.GAIN_STEP, config.GAIN_MAX)
-                if new_gain != self.current_gain:
-                    self.current_gain = new_gain
-                    print(f"🔧 Auto-tune: Increased gain to {new_gain} dB (signal: {avg_signal:.1f} dBm)")
-            
-            elif avg_signal > -30:
-                new_gain = max(self.current_gain - config.GAIN_STEP, config.GAIN_MIN)
-                if new_gain != self.current_gain:
-                    self.current_gain = new_gain
-                    print(f"🔧 Auto-tune: Decreased gain to {new_gain} dB (signal: {avg_signal:.1f} dBm)")
-            
-            self.last_tune_time = current_time
+            # Only adjust if we're not frequency hopping
+            if not self.frequency_hop_enabled and self.restart_lock.acquire(blocking=False):
+                try:
+                    # Adjust gain based on signal strength
+                    if avg_signal < config.MIN_SIGNAL_STRENGTH - 10:
+                        new_gain = min(self.current_gain + config.GAIN_STEP, config.GAIN_MAX)
+                        new_gain = (new_gain // 2) * 2  # Ensure multiple of 2
+                        if new_gain != self.current_gain:
+                            self.current_gain = new_gain
+                            print(f"🔧 Auto-tune: Increased gain to {new_gain} dB (signal: {avg_signal:.1f} dBm)")
+                    
+                    elif avg_signal > -30:
+                        new_gain = max(self.current_gain - config.GAIN_STEP, config.GAIN_MIN)
+                        new_gain = (new_gain // 2) * 2  # Ensure multiple of 2
+                        if new_gain != self.current_gain:
+                            self.current_gain = new_gain
+                            print(f"🔧 Auto-tune: Decreased gain to {new_gain} dB (signal: {avg_signal:.1f} dBm)")
+                    
+                    self.last_tune_time = current_time
+                finally:
+                    self.restart_lock.release()
     
     def set_frequency_hopping(self, enabled: bool):
         """Enable or disable frequency hopping"""
         self.frequency_hop_enabled = enabled
-        if enabled and self.is_running:
+        if enabled:
+            self.auto_tune_enabled = False  # Disable auto-tune when hopping
             print("🔄 Frequency hopping enabled")
-        elif not enabled:
+        else:
             print("⏸️  Frequency hopping disabled")
     
     def set_hop_interval(self, interval: float):
         """Set frequency hop interval in seconds"""
-        self.hop_interval = max(1.0, interval)
+        self.hop_interval = max(10.0, interval)  # Minimum 10 seconds
         print(f"⏱️  Hop interval set to {self.hop_interval}s")
     
     def get_frequency_stats(self):
