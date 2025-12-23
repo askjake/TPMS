@@ -15,8 +15,8 @@ class Config:
     
     # Frequency Hopping Settings
     FREQUENCY_HOP_ENABLED = True
-    FREQUENCY_HOP_INTERVAL = 5.0  # seconds per frequency
-    FREQUENCY_HOP_DWELL_TIME = 0.1  # settling time after hop
+    FREQUENCY_HOP_INTERVAL = 30.0  # seconds per frequency
+    FREQUENCY_HOP_DWELL_TIME = 1.1  # settling time after hop
     
     # Signal Detection
     MIN_SIGNAL_STRENGTH = -70  # dBm
@@ -61,3 +61,4 @@ class Config:
     PREDICTION_CONFIDENCE_THRESHOLD = 0.6
 
 config = Config()
+
