@@ -36,11 +36,15 @@ if 'db' not in st.session_state:
     st.session_state.hackrf = HackRFInterface()
     st.session_state.decoder = TPMSDecoder(config.SAMPLE_RATE)
     st.session_state.ml_engine = VehicleClusteringEngine(st.session_state.db)
-    st.session_state.signal_learning = SignalLearningEngine(st.session_state.db)  # NEW
+    st.session_state.signal_learning = SignalLearningEngine(st.session_state.db)
+
+    # NEW: Wire up the learning engine to decoder and hackrf
+    st.session_state.decoder.set_learning_engine(st.session_state.signal_learning)
+    st.session_state.hackrf.set_learning_engine(st.session_state.signal_learning)
+
     st.session_state.is_scanning = False
     st.session_state.signal_buffer = []
     st.session_state.recent_detections = []
-
 
 
 def signal_callback(iq_samples, signal_strength, frequency):
@@ -56,17 +60,18 @@ def signal_callback(iq_samples, signal_strength, frequency):
     except queue.Full:
         pass  # Drop samples if queue is full
 
+
 def show_signal_histogram():
     """Display real-time signal strength histogram"""
     st.subheader("📊 Signal Strength Distribution")
-    
+
     if len(signal_history_queue) < 10:
         st.info("Collecting signal data...")
         return
-    
+
     # Convert to numpy array
     signal_data = np.array(list(signal_history_queue))
-    
+
     # Create histogram
     fig = go.Figure()
     fig.add_trace(go.Histogram(
@@ -75,7 +80,7 @@ def show_signal_histogram():
         name='Signal Strength',
         marker_color='lightblue'
     ))
-    
+
     # Add threshold line
     fig.add_vline(
         x=config.SIGNAL_THRESHOLD,
@@ -83,7 +88,7 @@ def show_signal_histogram():
         line_color="red",
         annotation_text="Detection Threshold"
     )
-    
+
     fig.update_layout(
         title='Signal Strength Distribution (dBm)',
         xaxis_title='Signal Strength (dBm)',
@@ -91,9 +96,9 @@ def show_signal_histogram():
         showlegend=True,
         height=300
     )
-    
+
     st.plotly_chart(fig, use_container_width=True)
-    
+
     # Statistics
     col1, col2, col3, col4 = st.columns(4)
     with col1:
@@ -104,35 +109,35 @@ def show_signal_histogram():
         st.metric("Max", f"{np.max(signal_data):.1f} dBm")
     with col4:
         above_threshold = np.sum(signal_data > config.SIGNAL_THRESHOLD)
-        st.metric("Above Threshold", f"{above_threshold} ({above_threshold/len(signal_data)*100:.1f}%)")
+        st.metric("Above Threshold", f"{above_threshold} ({above_threshold / len(signal_data) * 100:.1f}%)")
+
 
 def show_live_detection():
     """Live detection tab"""
     if st.session_state.is_scanning:
         process_signal_queue()
-    
+
     st.header("Live TPMS Detection")
-    
+
     # Add frequency status at top
     show_frequency_status()
-    
+
     st.divider()
-    
+
     # Signal histogram
     show_signal_histogram()
-    
+
     st.divider()
-    
+
     # Protocol monitoring
     show_protocol_monitoring()
-    
+
     st.divider()
 
     col1, col2 = st.columns([2, 1])
 
     with col1:
         st.subheader("Recent Vehicle Detections")
-
 
         if st.session_state.recent_detections:
             recent = st.session_state.recent_detections[-10:][::-1]
@@ -181,46 +186,47 @@ def show_live_detection():
             time.sleep(1)
             st.rerun()
 
+
 def show_protocol_monitoring():
     """Display detected protocols and unknown signals"""
     st.subheader("🔍 Protocol Detection")
-    
+
     if not hasattr(st.session_state, 'decoder'):
         return
-    
+
     # Get protocol statistics
     stats = st.session_state.decoder.get_protocol_statistics()
-    
+
     col1, col2 = st.columns(2)
-    
+
     with col1:
         st.write("**Unknown Signals Detected**")
         st.metric("Total Unknown", stats['total_unknown'])
-        
+
         if stats['modulation_types']:
             st.write("**Modulation Types:**")
             for mod_type, count in stats['modulation_types'].items():
                 st.write(f"- {mod_type}: {count}")
         else:
             st.info("No unknown signals detected yet")
-    
+
     with col2:
         st.write("**Signal Characteristics**")
-        
+
         if stats['common_baud_rates']:
             st.write("**Detected Baud Rates:**")
             for rate in stats['common_baud_rates']:
                 st.write(f"- {rate:,} bps")
-        
+
         if stats['avg_signal_strength'] > 0:
             st.metric("Avg Signal Strength", f"{stats['avg_signal_strength']:.1f} dBm")
-    
+
     # Show recent unknown signals
     unknown_signals = st.session_state.decoder.get_unknown_signals(60)
-    
+
     if unknown_signals:
         st.write("**Recent Unknown Signals (last 60s):**")
-        
+
         unknown_df = pd.DataFrame([
             {
                 'Time': datetime.fromtimestamp(s.timestamp).strftime('%H:%M:%S'),
@@ -232,8 +238,9 @@ def show_protocol_monitoring():
             }
             for s in unknown_signals[-10:]
         ])
-        
+
         st.dataframe(unknown_df, use_container_width=True, hide_index=True)
+
 
 def show_vehicle_database():
     """Vehicle database tab"""
@@ -309,26 +316,27 @@ def show_vehicle_database():
                     st.progress(prediction['confidence'])
                     st.caption(f"Confidence: {prediction['confidence'] * 100:.0f}%")
 
+
 def show_frequency_status():
     """Display frequency hopping status and statistics"""
     st.subheader("📡 Frequency Status")
-    
+
     if not st.session_state.is_scanning:
         st.info("Start scanning to see frequency statistics")
         return
-    
+
     status = st.session_state.hackrf.get_status()
     freq_stats = status.get('frequency_stats', {})
-    
+
     # Current frequency
     st.write(f"**Current Frequency:** {status['frequency']:.2f} MHz")
-    
+
     # Initialize session state for controls if not exists
     if 'freq_hop_enabled' not in st.session_state:
         st.session_state.freq_hop_enabled = status.get('frequency_hopping', True)
     if 'hop_interval' not in st.session_state:
         st.session_state.hop_interval = status.get('hop_interval', 30.0)
-    
+
     # Frequency hopping control
     col1, col2 = st.columns(2)
     with col1:
@@ -342,7 +350,7 @@ def show_frequency_status():
             st.session_state.freq_hop_enabled = hop_enabled
             st.session_state.hackrf.set_frequency_hopping(hop_enabled)
             st.rerun()
-    
+
     with col2:
         if st.session_state.freq_hop_enabled:
             hop_interval = st.slider(
@@ -357,11 +365,11 @@ def show_frequency_status():
             if abs(hop_interval - st.session_state.hop_interval) > 0.1:
                 st.session_state.hop_interval = hop_interval
                 st.session_state.hackrf.set_hop_interval(hop_interval)
-    
+
     # Frequency statistics table
     if freq_stats:
         st.write("**Frequency Statistics:**")
-        
+
         freq_df = pd.DataFrame([
             {
                 'Frequency': f"{freq:.2f} MHz",
@@ -371,9 +379,9 @@ def show_frequency_status():
             }
             for freq, stats in freq_stats.items()
         ])
-        
+
         st.dataframe(freq_df, use_container_width=True, hide_index=True)
-        
+
         # Bar chart of detections per frequency
         if any(stats['detections'] > 0 for stats in freq_stats.values()):
             fig = go.Figure(data=[
@@ -565,12 +573,12 @@ def show_maintenance():
 def show_ml_learning():
     """ML Signal Learning tab - replaces old ML Insights"""
     st.header("🤖 Signal Learning & Intelligence")
-    
+
     # Learning Statistics
     st.subheader("📊 Learning Progress")
-    
+
     stats = st.session_state.signal_learning.get_learning_statistics()
-    
+
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Total Attempts", stats['total_attempts'])
@@ -581,23 +589,23 @@ def show_ml_learning():
         st.metric("Success Rate", f"{success_rate:.1f}%")
     with col4:
         st.metric("Learned Profiles", stats['learned_profiles'])
-    
+
     # Progress bar for learning
     if stats['total_attempts'] > 0:
         progress = min(stats['successful_decodes'] / 100, 1.0)  # Cap at 100 samples
         st.progress(progress)
         st.caption(f"Learning progress: {stats['successful_decodes']}/100 samples for full training")
-    
+
     st.divider()
-    
+
     # Learning Controls
     st.subheader("⚙️ Learning Parameters")
-    
+
     col1, col2 = st.columns(2)
-    
+
     with col1:
         st.write("**Adaptive Thresholds:**")
-        
+
         # Power threshold
         power_thresh = st.slider(
             "Power Threshold (dBm)",
@@ -607,7 +615,7 @@ def show_ml_learning():
             step=5.0,
             key="ml_power_thresh"
         )
-        
+
         # SNR threshold
         snr_thresh = st.slider(
             "SNR Threshold (dB)",
@@ -617,15 +625,15 @@ def show_ml_learning():
             step=1.0,
             key="ml_snr_thresh"
         )
-        
+
         if st.button("Apply Thresholds"):
             st.session_state.signal_learning.adaptive_thresholds['power_threshold'] = power_thresh
             st.session_state.signal_learning.adaptive_thresholds['snr_threshold'] = snr_thresh
             st.success("✅ Thresholds updated!")
-    
+
     with col2:
         st.write("**Tolerance Settings:**")
-        
+
         # Bandwidth tolerance
         bw_tol = st.slider(
             "Bandwidth Tolerance (MHz)",
@@ -635,7 +643,7 @@ def show_ml_learning():
             step=0.05,
             key="ml_bw_tol"
         )
-        
+
         # Frequency tolerance
         freq_tol = st.slider(
             "Frequency Tolerance (MHz)",
@@ -645,33 +653,116 @@ def show_ml_learning():
             step=0.01,
             key="ml_freq_tol"
         )
-        
+
         if st.button("Apply Tolerances"):
             st.session_state.signal_learning.adaptive_thresholds['bandwidth_tolerance'] = bw_tol
             st.session_state.signal_learning.adaptive_thresholds['frequency_tolerance'] = freq_tol
             st.success("✅ Tolerances updated!")
-    
+
+    # Add this section after "Learning Controls" in show_ml_learning()
+
     st.divider()
-    
+
+    # Adaptive Features Status
+    st.subheader("🎯 Adaptive Features")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.write("**Adaptive Frequency Hopping:**")
+
+        if hasattr(st.session_state.hackrf, 'adaptive_hopping'):
+            st.success("✅ Active")
+
+            # Show frequency priorities
+            priorities = {}
+            for freq in config.FREQUENCIES:
+                priority = st.session_state.signal_learning.get_frequency_priority(freq)
+                should_skip = st.session_state.signal_learning.should_skip_frequency(freq)
+                priorities[freq] = {
+                    'priority': priority,
+                    'skip': should_skip
+                }
+
+            # Display frequency priorities
+            for freq, info in priorities.items():
+                status = "⏭️ SKIP" if info['skip'] else f"Priority: {info['priority']:.2f}"
+                color = "🔴" if info['skip'] else ("🟢" if info['priority'] > 0.7 else "🟡")
+                st.write(f"{color} {freq:.2f} MHz - {status}")
+        else:
+            st.info("Not active - start scanning to enable")
+
+    with col2:
+        st.write("**ML-Guided Decoding:**")
+
+        if hasattr(st.session_state.decoder, 'learning_engine'):
+            st.success("✅ Active")
+
+            # Show decoder hints for current frequency
+            if st.session_state.is_scanning:
+                current_freq = st.session_state.hackrf.current_frequency
+                hints = st.session_state.signal_learning.get_decoder_hints(current_freq, -60)
+
+                if hints['try_protocols']:
+                    st.write(f"**Current Frequency ({current_freq:.2f} MHz):**")
+                    st.write(f"Suggested protocols: {', '.join(hints['try_protocols'])}")
+                    if hints['baud_rates']:
+                        st.write(f"Baud rates: {', '.join(map(str, hints['baud_rates'][:3]))} bps")
+                    st.write(f"Confidence: {hints['confidence'] * 100:.0f}%")
+            else:
+                st.info("Start scanning to see decoder hints")
+        else:
+            st.info("Not active - start scanning to enable")
+
+    # Adaptive Hopping Schedule
+    if st.session_state.is_scanning and hasattr(st.session_state.hackrf, 'adaptive_hopping'):
+        st.write("**Current Hopping Schedule:**")
+
+        schedule = st.session_state.hackrf._get_adaptive_hop_schedule()
+        schedule_df = pd.DataFrame([
+            {
+                'Frequency': f"{freq:.2f} MHz",
+                'Dwell Time': f"{dwell:.1f}s",
+                'Percentage': f"{(dwell / sum(d for _, d in schedule) * 100):.1f}%"
+            }
+            for freq, dwell in schedule
+        ])
+
+        st.dataframe(schedule_df, use_container_width=True, hide_index=True)
+
+        # Pie chart of time allocation
+        fig = go.Figure(data=[go.Pie(
+            labels=[f"{freq:.2f} MHz" for freq, _ in schedule],
+            values=[dwell for _, dwell in schedule],
+            hole=.3
+        )])
+        fig.update_layout(
+            title='Time Allocation by Frequency',
+            height=300
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
     # Learned Signal Profiles
     st.subheader("📚 Learned Signal Profiles")
-    
+
     if stats['profiles']:
         # Create tabs for each profile
-        profile_tabs = st.tabs([f"Profile {i+1}" for i in range(len(stats['profiles']))])
-        
+        profile_tabs = st.tabs([f"Profile {i + 1}" for i in range(len(stats['profiles']))])
+
         for idx, (key, profile) in enumerate(stats['profiles'].items()):
             with profile_tabs[idx]:
                 col1, col2, col3 = st.columns(3)
-                
+
                 with col1:
                     st.metric("Frequency", f"{profile['frequency']:.2f} MHz")
-                    st.metric("Confidence", f"{profile['confidence']*100:.0f}%")
-                
+                    st.metric("Confidence", f"{profile['confidence'] * 100:.0f}%")
+
                 with col2:
                     st.metric("Modulation", profile['modulation'])
                     st.metric("Sample Count", profile['sample_count'])
-                
+
                 with col3:
                     # Get optimal parameters for this profile
                     optimal = st.session_state.signal_learning.get_optimal_scan_parameters(
@@ -679,28 +770,32 @@ def show_ml_learning():
                     )
                     st.metric("Optimal Gain", f"{optimal['gain']} dB")
                     st.metric("Optimal Duration", f"{optimal['duration']:.1f}s")
-                
+
                 # Show full profile details
                 with st.expander("📋 Full Profile Details"):
                     full_profile = st.session_state.signal_learning.signal_profiles.get(key)
                     if full_profile:
-                        st.write(f"**Bandwidth Range:** {full_profile.bandwidth_range[0]:.2f} - {full_profile.bandwidth_range[1]:.2f} MHz")
-                        st.write(f"**Power Range:** {full_profile.power_range[0]:.1f} - {full_profile.power_range[1]:.1f} dBm")
-                        st.write(f"**Baud Rate Range:** {full_profile.baud_rate_range[0]:,} - {full_profile.baud_rate_range[1]:,} bps")
+                        st.write(
+                            f"**Bandwidth Range:** {full_profile.bandwidth_range[0]:.2f} - {full_profile.bandwidth_range[1]:.2f} MHz")
+                        st.write(
+                            f"**Power Range:** {full_profile.power_range[0]:.1f} - {full_profile.power_range[1]:.1f} dBm")
+                        st.write(
+                            f"**Baud Rate Range:** {full_profile.baud_rate_range[0]:,} - {full_profile.baud_rate_range[1]:,} bps")
                         st.write(f"**SNR Threshold:** {full_profile.snr_threshold:.1f} dB")
-                        st.write(f"**Last Updated:** {datetime.fromtimestamp(full_profile.last_updated).strftime('%Y-%m-%d %H:%M:%S')}")
+                        st.write(
+                            f"**Last Updated:** {datetime.fromtimestamp(full_profile.last_updated).strftime('%Y-%m-%d %H:%M:%S')}")
     else:
         st.info("No signal profiles learned yet. Start scanning to begin learning!")
-    
+
     st.divider()
-    
+
     # Manual Feedback Section
     st.subheader("👍 Manual Feedback")
-    
+
     st.write("Help improve detection by providing feedback on recent signals:")
-    
+
     recent_signals = st.session_state.db.get_recent_signals(20)
-    
+
     if recent_signals:
         feedback_df = pd.DataFrame([
             {
@@ -712,9 +807,9 @@ def show_ml_learning():
             }
             for s in recent_signals[:10]
         ])
-        
+
         st.dataframe(feedback_df, use_container_width=True, hide_index=True)
-        
+
         col1, col2, col3 = st.columns(3)
         with col1:
             if st.button("✅ All Correct", type="primary"):
@@ -732,32 +827,32 @@ def show_ml_learning():
                 st.success("Models retrained!")
     else:
         st.info("No recent signals to review")
-    
+
     st.divider()
-    
+
     # Model Performance
     st.subheader("📈 Model Performance")
-    
+
     if stats['model_trained']:
         st.success("✅ ML model is trained and active")
-        
+
         # Show training history if available
         if len(st.session_state.signal_learning.training_buffer) > 10:
             training_data = list(st.session_state.signal_learning.training_buffer)
-            
+
             # Plot success rate over time
             success_over_time = []
             window_size = 20
-            
+
             for i in range(len(training_data)):
                 if i >= window_size:
-                    window = training_data[i-window_size:i]
+                    window = training_data[i - window_size:i]
                     successes = sum(1 for s in window if s['decoded'])
                     success_over_time.append({
                         'sample': i,
                         'success_rate': successes / window_size
                     })
-            
+
             if success_over_time:
                 df = pd.DataFrame(success_over_time)
                 fig = px.line(
@@ -771,22 +866,22 @@ def show_ml_learning():
                 st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("ℹ️  ML model not yet trained. Need at least 50 successful decodes.")
-        
+
         if stats['successful_decodes'] > 0:
             progress = stats['successful_decodes'] / 50
             st.progress(progress)
             st.caption(f"{stats['successful_decodes']}/50 samples collected")
-    
+
     # Save/Load Models
     st.divider()
     st.subheader("💾 Model Management")
-    
+
     col1, col2 = st.columns(2)
     with col1:
         if st.button("💾 Save Learning Data"):
             st.session_state.signal_learning._save_models()
             st.success("✅ Learning data saved!")
-    
+
     with col2:
         if st.button("📂 Load Learning Data"):
             st.session_state.signal_learning._load_models()
@@ -798,23 +893,23 @@ def process_signal_queue():
     """Process signals from the queue - runs in main Streamlit thread"""
     processed = 0
     max_batch = 10
-    
+
     while not signal_queue.empty() and processed < max_batch:
         try:
             data = signal_queue.get_nowait()
-            
+
             # Add to signal history for histogram
             signal_history_queue.append(data['signal_strength'])
-            
+
             # Process with decoder
             signals = st.session_state.decoder.process_samples(
-                data['iq_samples'], 
+                data['iq_samples'],
                 data['frequency']
             )
 
             for signal in signals:
                 signal.signal_strength = data['signal_strength']
-                
+
                 # Increment detection count for this frequency
                 st.session_state.hackrf.increment_detection(data['frequency'])
 
@@ -830,7 +925,7 @@ def process_signal_queue():
                     'protocol': signal.protocol,
                     'raw_data': signal.raw_data
                 }
-                
+
                 # NEW: Learn from successful decode
                 st.session_state.signal_learning.learn_from_signal(
                     {
@@ -843,7 +938,7 @@ def process_signal_queue():
                     decoded=True,
                     protocol=signal.protocol
                 )
-                
+
                 st.session_state.db.insert_signal(signal_dict)
                 st.session_state.signal_buffer.append(signal_dict)
 
@@ -860,9 +955,9 @@ def process_signal_queue():
                     })
 
                 st.session_state.signal_buffer = []
-            
+
             processed += 1
-            
+
         except queue.Empty:
             break
         except Exception as e:
@@ -873,20 +968,20 @@ def process_signal_queue():
 def show_debug_tools():
     """Debug and diagnostic tools tab"""
     st.header("🔧 Debug & Diagnostic Tools")
-    
+
     st.warning("⚠️ Running diagnostics will stop any active scanning!")
-    
+
     # Initialize debug tools
     if 'debug_tools' not in st.session_state:
         st.session_state.debug_tools = DebugTools()
-    
+
     # Hardware Info Section
     st.subheader("📡 Hardware Information")
-    
+
     if st.button("🔍 Check Hardware", type="primary"):
         with st.spinner("Checking hardware..."):
             hw_info = st.session_state.debug_tools.get_hardware_info()
-            
+
             if hw_info.device_found:
                 col1, col2 = st.columns(2)
                 with col1:
@@ -900,12 +995,12 @@ def show_debug_tools():
                         st.info("🎛️ Opera Cake detected")
             else:
                 st.error("❌ HackRF not found or not responding")
-    
+
     st.divider()
-    
+
     # Spectrum Scan Section
     st.subheader("📊 Spectrum Scanner")
-    
+
     col1, col2, col3 = st.columns(3)
     with col1:
         scan_start = st.number_input("Start Freq (MHz)", value=310.0, step=1.0)
@@ -913,28 +1008,28 @@ def show_debug_tools():
         scan_end = st.number_input("End Freq (MHz)", value=320.0, step=1.0)
     with col3:
         scan_step = st.number_input("Step (MHz)", value=0.5, step=0.1, min_value=0.1)
-    
+
     if st.button("🔍 Run Spectrum Scan"):
         # Stop any active scanning
         if st.session_state.is_scanning:
             st.session_state.hackrf.stop()
             st.session_state.is_scanning = False
             time.sleep(1)
-    
+
         with st.spinner(f"Scanning {scan_start} - {scan_end} MHz..."):
             peaks, raw_spectrum = st.session_state.debug_tools.spectrum_scan(
                 scan_start, scan_end, step=scan_step, duration=0.5
             )
-        
+
             # Always show the full spectrum plot
             st.subheader("📊 Full Spectrum")
-        
+
             if raw_spectrum:
                 freqs = [f for f, p in raw_spectrum]
                 powers = [p for f, p in raw_spectrum]
-            
+
                 fig = go.Figure()
-            
+
                 # Plot all measurements
                 fig.add_trace(go.Scatter(
                     x=freqs,
@@ -944,15 +1039,15 @@ def show_debug_tools():
                     line=dict(color='lightblue', width=2),
                     marker=dict(size=4)
                 ))
-            
+
                 # Add threshold line
                 fig.add_hline(
-                    y=-80, 
-                    line_dash="dash", 
+                    y=-80,
+                    line_dash="dash",
                     line_color="red",
                     annotation_text="Detection Threshold (-80 dBm)"
                 )
-            
+
                 # Highlight peaks
                 if peaks:
                     peak_freqs = [p.frequency for p in peaks]
@@ -964,7 +1059,7 @@ def show_debug_tools():
                         name='Detected Peaks',
                         marker=dict(size=12, color='red', symbol='star')
                     ))
-            
+
                 fig.update_layout(
                     title=f'Spectrum Scan: {scan_start} - {scan_end} MHz',
                     xaxis_title='Frequency (MHz)',
@@ -973,9 +1068,9 @@ def show_debug_tools():
                     showlegend=True,
                     hovermode='x unified'
                 )
-            
+
                 st.plotly_chart(fig, use_container_width=True)
-            
+
                 # Statistics
                 col1, col2, col3, col4 = st.columns(4)
                 with col1:
@@ -986,7 +1081,7 @@ def show_debug_tools():
                     st.metric("Avg Power", f"{np.mean(powers):.1f} dBm")
                 with col4:
                     st.metric("Max Power", f"{np.max(powers):.1f} dBm")
-        
+
             # Show peaks table if any
             if peaks:
                 st.subheader("🎯 Detected Peaks")
@@ -999,44 +1094,43 @@ def show_debug_tools():
                     }
                     for p in peaks
                 ])
-            
+
                 st.dataframe(peaks_df, use_container_width=True, hide_index=True)
             else:
                 st.info("ℹ️ No peaks detected above -80 dBm threshold")
 
-    
     st.divider()
-    
+
     # Modulation Analysis Section
     st.subheader("🔬 Modulation Analyzer")
-    
+
     analyze_freq = st.number_input("Frequency to Analyze (MHz)", value=314.9, step=0.1)
     analyze_duration = st.slider("Capture Duration (seconds)", 0.5, 5.0, 2.0, 0.5)
-    
+
     if st.button("🔬 Analyze Modulation"):
         # Stop any active scanning
         if st.session_state.is_scanning:
             st.session_state.hackrf.stop()
             st.session_state.is_scanning = False
             time.sleep(1)
-        
+
         with st.spinner(f"Analyzing {analyze_freq} MHz..."):
             analysis = st.session_state.debug_tools.analyze_modulation(
                 analyze_freq, duration=analyze_duration
             )
-            
+
             st.success("✅ Analysis complete")
-            
+
             col1, col2, col3 = st.columns(3)
             with col1:
                 st.metric("Modulation Type", analysis.modulation_type)
-                st.metric("Confidence", f"{analysis.confidence*100:.0f}%")
+                st.metric("Confidence", f"{analysis.confidence * 100:.0f}%")
             with col2:
                 st.metric("Baud Rate", f"{analysis.baud_rate:,} bps" if analysis.baud_rate > 0 else "Unknown")
                 st.metric("Bandwidth", f"{analysis.bandwidth:.2f} MHz")
             with col3:
                 st.metric("Frequency", f"{analysis.frequency:.2f} MHz")
-            
+
             # Show characteristics
             if analysis.characteristics:
                 with st.expander("📈 Signal Characteristics"):
@@ -1045,35 +1139,36 @@ def show_debug_tools():
                         for k, v in analysis.characteristics.items()
                     ])
                     st.dataframe(char_df, use_container_width=True, hide_index=True)
-    
+
     st.divider()
-    
+
     # Full Diagnostic Suite
     st.subheader("🚀 Full Diagnostic Suite")
-    
-    st.info("This will run a complete diagnostic including hardware check, spectrum scan, and modulation analysis on all detected signals.")
-    
+
+    st.info(
+        "This will run a complete diagnostic including hardware check, spectrum scan, and modulation analysis on all detected signals.")
+
     if st.button("🚀 Run Full Diagnostic", type="primary"):
         # Stop any active scanning
         if st.session_state.is_scanning:
             st.session_state.hackrf.stop()
             st.session_state.is_scanning = False
             time.sleep(1)
-        
+
         progress_bar = st.progress(0)
         status_text = st.empty()
-        
+
         status_text.text("Starting diagnostic...")
         progress_bar.progress(10)
-        
+
         results = st.session_state.debug_tools.run_full_diagnostic()
-        
+
         progress_bar.progress(100)
         status_text.text("Complete!")
-        
+
         # Display results
         st.success("✅ Full diagnostic complete!")
-        
+
         # Hardware
         with st.expander("📡 Hardware Info", expanded=True):
             hw = results['hardware']
@@ -1083,14 +1178,14 @@ def show_debug_tools():
                 st.write(f"**Firmware:** {hw.firmware_version}")
             else:
                 st.error("Hardware not detected")
-        
+
         # Spectrum
         if results['raw_spectrum']:
             with st.expander(f"📊 Spectrum Scan ({len(results['raw_spectrum'])} frequencies measured)", expanded=True):
                 # Plot full spectrum
                 freqs = [f for f, p in results['raw_spectrum']]
                 powers = [p for f, p in results['raw_spectrum']]
-        
+
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(
                     x=freqs,
@@ -1100,7 +1195,7 @@ def show_debug_tools():
                     line=dict(color='lightblue', width=2),
                     marker=dict(size=3)
                 ))
-        
+
                 # Mark TPMS frequencies
                 for tpms_freq in config.FREQUENCIES:
                     fig.add_vline(
@@ -1109,18 +1204,18 @@ def show_debug_tools():
                         line_color="green",
                         annotation_text=f"{tpms_freq} MHz"
                     )
-        
+
                 fig.add_hline(y=-80, line_dash="dash", line_color="red", annotation_text="Threshold")
-        
+
                 fig.update_layout(
                     title='Complete Spectrum Scan',
                     xaxis_title='Frequency (MHz)',
                     yaxis_title='Power (dBm)',
                     height=400
                 )
-        
+
                 st.plotly_chart(fig, use_container_width=True)
-        
+
                 # Show top peaks
                 if results['spectrum_scan']:
                     st.write("**Top Detected Peaks:**")
@@ -1136,13 +1231,12 @@ def show_debug_tools():
                 else:
                     st.info("No peaks above -80 dBm detected")
 
-        
         # Modulation
         if results['modulation_analysis']:
             with st.expander(f"🔬 Modulation Analysis ({len(results['modulation_analysis'])} signals)", expanded=True):
                 for analysis in results['modulation_analysis']:
                     st.write(f"**{analysis.frequency:.2f} MHz:** {analysis.modulation_type} "
-                            f"({analysis.confidence*100:.0f}% confidence, {analysis.baud_rate:,} baud)")
+                             f"({analysis.confidence * 100:.0f}% confidence, {analysis.baud_rate:,} baud)")
 
 
 def main():
@@ -1157,11 +1251,11 @@ def main():
             config.FREQUENCIES,
             index=0
         )
-        
+
         # In the sidebar, after frequency selection
         if st.session_state.is_scanning:
             st.divider()
-    
+
             # Manual gain control
             with st.expander("⚙️ Advanced Settings"):
                 current_gain = st.session_state.hackrf.current_gain
@@ -1173,10 +1267,37 @@ def main():
                     step=2,
                     help="Adjust receiver gain (must be even number)"
                 )
-        
+
                 if new_gain != current_gain and st.button("Apply Gain"):
                     st.session_state.hackrf.current_gain = new_gain
                     st.success(f"Gain set to {new_gain} dB (will apply on next hop)")
+
+        # Add after the Advanced Settings expander in sidebar
+
+        st.divider()
+
+        # Adaptive Features Toggle
+        with st.expander("🎯 Adaptive Features"):
+            adaptive_hop = st.checkbox(
+                "Adaptive Frequency Hopping",
+                value=hasattr(st.session_state.hackrf, 'adaptive_hopping') and st.session_state.hackrf.adaptive_hopping,
+                help="Spend more time on productive frequencies"
+            )
+
+            if adaptive_hop != getattr(st.session_state.hackrf, 'adaptive_hopping', False):
+                st.session_state.hackrf.adaptive_hopping = adaptive_hop
+                if adaptive_hop:
+                    st.success("✅ Adaptive hopping enabled")
+                else:
+                    st.info("ℹ️ Using standard hopping")
+
+            ml_guided = st.checkbox(
+                "ML-Guided Decoding",
+                value=hasattr(st.session_state.decoder, 'learning_engine'),
+                help="Use learned patterns to optimize decoding"
+            )
+
+            st.caption("These features improve over time as the system learns")
 
         col1, col2 = st.columns(2)
         with col1:
@@ -1233,10 +1354,9 @@ def main():
 
     with tab5:
         show_ml_learning()
-    
+
     with tab6:
         show_debug_tools()
-
 
 
 if __name__ == "__main__":
