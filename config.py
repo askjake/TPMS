@@ -20,7 +20,8 @@ class Config:
     
     # Signal Detection
     MIN_SIGNAL_STRENGTH = -70  # dBm
-    SIGNAL_THRESHOLD = -60  # dBm for detection
+    SIGNAL_THRESHOLD = -90  # dBm for detection
+    DETECTION_THRESHOLD = -90  # dBm - minimum power to consider as potential signal
     
     # Gain Settings
     GAIN_MIN = 0
@@ -61,4 +62,5 @@ class Config:
     PREDICTION_CONFIDENCE_THRESHOLD = 0.6
 
 config = Config()
+
 
