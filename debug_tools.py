@@ -131,7 +131,7 @@ class DebugTools:
             raw_spectrum.append((freq, power))
         
             # Only record significant signals as peaks
-            if power > -80:
+            if power > -85:
                 # Estimate bandwidth
                 bandwidth = self._estimate_bandwidth(freq, power)
             
@@ -149,7 +149,7 @@ class DebugTools:
         # Sort peaks by power
         peaks.sort(key=lambda x: x.power, reverse=True)
     
-        print(f"✅ Scan complete! Found {len(peaks)} peaks above -80 dBm")
+        print(f"✅ Scan complete! Found {len(peaks)} peaks above -85 dBm")
     
         return peaks, raw_spectrum
 
