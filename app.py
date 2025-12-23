@@ -769,7 +769,7 @@ def show_debug_tools():
                 with col3:
                     st.metric("Avg Power", f"{np.mean(powers):.1f} dBm")
                 with col4:
-                st.metric("Max Power", f"{np.max(powers):.1f} dBm")
+                    st.metric("Max Power", f"{np.max(powers):.1f} dBm")
         
             # Show peaks table if any
             if peaks:
