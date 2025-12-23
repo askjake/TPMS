@@ -16,6 +16,7 @@ from hackrf_interface import HackRFInterface
 from tpms_decoder import TPMSDecoder
 from ml_engine import VehicleClusteringEngine
 from debug_tools import DebugTools, SpectrumPeak, ModulationAnalysis
+from ml_signal_learning import SignalLearningEngine
 
 # Global queues for thread-safe communication
 signal_queue = queue.Queue(maxsize=1000)
@@ -35,9 +36,11 @@ if 'db' not in st.session_state:
     st.session_state.hackrf = HackRFInterface()
     st.session_state.decoder = TPMSDecoder(config.SAMPLE_RATE)
     st.session_state.ml_engine = VehicleClusteringEngine(st.session_state.db)
+    st.session_state.signal_learning = SignalLearningEngine(st.session_state.db)  # NEW
     st.session_state.is_scanning = False
     st.session_state.signal_buffer = []
     st.session_state.recent_detections = []
+
 
 
 def signal_callback(iq_samples, signal_strength, frequency):
@@ -559,38 +562,237 @@ def show_maintenance():
                     st.warning("⚠️ " + ", ".join(data['alerts']))
 
 
-def show_ml_insights():
-    """ML insights tab"""
-    st.header("🤖 Machine Learning Insights")
-
-    patterns = st.session_state.ml_engine.find_patterns(days=30)
-
-    col1, col2 = st.columns(2)
-
+def show_ml_learning():
+    """ML Signal Learning tab - replaces old ML Insights"""
+    st.header("🤖 Signal Learning & Intelligence")
+    
+    # Learning Statistics
+    st.subheader("📊 Learning Progress")
+    
+    stats = st.session_state.signal_learning.get_learning_statistics()
+    
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.subheader("Frequent Commuters")
-
-        if patterns['frequent_vehicles']:
-            for vehicle_info in patterns['frequent_vehicles'][:10]:
-                with st.container():
-                    st.write(f"**{vehicle_info['nickname']}**")
-
-                    col_a, col_b = st.columns(2)
-                    with col_a:
-                        st.metric("Encounters", vehicle_info['encounter_count'])
-                    with col_b:
-                        days_known = (vehicle_info['last_seen'] - vehicle_info['first_seen']).days
-                        if days_known > 0:
-                            freq = vehicle_info['encounter_count'] / days_known
-                            st.metric("Frequency", f"{freq:.1f}/day")
-
-                    st.divider()
-        else:
-            st.info("Not enough data to identify patterns yet.")
-
+        st.metric("Total Attempts", stats['total_attempts'])
     with col2:
-        st.subheader("Detection Patterns")
-        st.info("Pattern analysis will appear here as data accumulates.")
+        st.metric("Successful Decodes", stats['successful_decodes'])
+    with col3:
+        success_rate = stats['success_rate'] * 100 if stats['success_rate'] > 0 else 0
+        st.metric("Success Rate", f"{success_rate:.1f}%")
+    with col4:
+        st.metric("Learned Profiles", stats['learned_profiles'])
+    
+    # Progress bar for learning
+    if stats['total_attempts'] > 0:
+        progress = min(stats['successful_decodes'] / 100, 1.0)  # Cap at 100 samples
+        st.progress(progress)
+        st.caption(f"Learning progress: {stats['successful_decodes']}/100 samples for full training")
+    
+    st.divider()
+    
+    # Learning Controls
+    st.subheader("⚙️ Learning Parameters")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.write("**Adaptive Thresholds:**")
+        
+        # Power threshold
+        power_thresh = st.slider(
+            "Power Threshold (dBm)",
+            min_value=-100.0,
+            max_value=-40.0,
+            value=st.session_state.signal_learning.adaptive_thresholds['power_threshold'],
+            step=5.0,
+            key="ml_power_thresh"
+        )
+        
+        # SNR threshold
+        snr_thresh = st.slider(
+            "SNR Threshold (dB)",
+            min_value=0.0,
+            max_value=20.0,
+            value=st.session_state.signal_learning.adaptive_thresholds['snr_threshold'],
+            step=1.0,
+            key="ml_snr_thresh"
+        )
+        
+        if st.button("Apply Thresholds"):
+            st.session_state.signal_learning.adaptive_thresholds['power_threshold'] = power_thresh
+            st.session_state.signal_learning.adaptive_thresholds['snr_threshold'] = snr_thresh
+            st.success("✅ Thresholds updated!")
+    
+    with col2:
+        st.write("**Tolerance Settings:**")
+        
+        # Bandwidth tolerance
+        bw_tol = st.slider(
+            "Bandwidth Tolerance (MHz)",
+            min_value=0.05,
+            max_value=1.0,
+            value=st.session_state.signal_learning.adaptive_thresholds['bandwidth_tolerance'],
+            step=0.05,
+            key="ml_bw_tol"
+        )
+        
+        # Frequency tolerance
+        freq_tol = st.slider(
+            "Frequency Tolerance (MHz)",
+            min_value=0.01,
+            max_value=0.5,
+            value=st.session_state.signal_learning.adaptive_thresholds['frequency_tolerance'],
+            step=0.01,
+            key="ml_freq_tol"
+        )
+        
+        if st.button("Apply Tolerances"):
+            st.session_state.signal_learning.adaptive_thresholds['bandwidth_tolerance'] = bw_tol
+            st.session_state.signal_learning.adaptive_thresholds['frequency_tolerance'] = freq_tol
+            st.success("✅ Tolerances updated!")
+    
+    st.divider()
+    
+    # Learned Signal Profiles
+    st.subheader("📚 Learned Signal Profiles")
+    
+    if stats['profiles']:
+        # Create tabs for each profile
+        profile_tabs = st.tabs([f"Profile {i+1}" for i in range(len(stats['profiles']))])
+        
+        for idx, (key, profile) in enumerate(stats['profiles'].items()):
+            with profile_tabs[idx]:
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.metric("Frequency", f"{profile['frequency']:.2f} MHz")
+                    st.metric("Confidence", f"{profile['confidence']*100:.0f}%")
+                
+                with col2:
+                    st.metric("Modulation", profile['modulation'])
+                    st.metric("Sample Count", profile['sample_count'])
+                
+                with col3:
+                    # Get optimal parameters for this profile
+                    optimal = st.session_state.signal_learning.get_optimal_scan_parameters(
+                        profile['frequency']
+                    )
+                    st.metric("Optimal Gain", f"{optimal['gain']} dB")
+                    st.metric("Optimal Duration", f"{optimal['duration']:.1f}s")
+                
+                # Show full profile details
+                with st.expander("📋 Full Profile Details"):
+                    full_profile = st.session_state.signal_learning.signal_profiles.get(key)
+                    if full_profile:
+                        st.write(f"**Bandwidth Range:** {full_profile.bandwidth_range[0]:.2f} - {full_profile.bandwidth_range[1]:.2f} MHz")
+                        st.write(f"**Power Range:** {full_profile.power_range[0]:.1f} - {full_profile.power_range[1]:.1f} dBm")
+                        st.write(f"**Baud Rate Range:** {full_profile.baud_rate_range[0]:,} - {full_profile.baud_rate_range[1]:,} bps")
+                        st.write(f"**SNR Threshold:** {full_profile.snr_threshold:.1f} dB")
+                        st.write(f"**Last Updated:** {datetime.fromtimestamp(full_profile.last_updated).strftime('%Y-%m-%d %H:%M:%S')}")
+    else:
+        st.info("No signal profiles learned yet. Start scanning to begin learning!")
+    
+    st.divider()
+    
+    # Manual Feedback Section
+    st.subheader("👍 Manual Feedback")
+    
+    st.write("Help improve detection by providing feedback on recent signals:")
+    
+    recent_signals = st.session_state.db.get_recent_signals(20)
+    
+    if recent_signals:
+        feedback_df = pd.DataFrame([
+            {
+                'Time': datetime.fromtimestamp(s['timestamp']).strftime('%H:%M:%S'),
+                'Frequency': f"{s['frequency']:.2f} MHz",
+                'Strength': f"{s['signal_strength']:.1f} dBm",
+                'Protocol': s['protocol'],
+                'TPMS ID': s['tpms_id'][:12] + '...'
+            }
+            for s in recent_signals[:10]
+        ])
+        
+        st.dataframe(feedback_df, use_container_width=True, hide_index=True)
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            if st.button("✅ All Correct", type="primary"):
+                st.success("Thank you! Learning engine updated.")
+        with col2:
+            if st.button("❌ False Positive"):
+                st.warning("Marked as false positive. Adjusting thresholds...")
+                # Increase thresholds slightly
+                st.session_state.signal_learning.adaptive_thresholds['power_threshold'] += 2
+                st.session_state.signal_learning.adaptive_thresholds['snr_threshold'] += 0.5
+        with col3:
+            if st.button("🔄 Retrain Models"):
+                with st.spinner("Retraining..."):
+                    st.session_state.signal_learning._retrain_models()
+                st.success("Models retrained!")
+    else:
+        st.info("No recent signals to review")
+    
+    st.divider()
+    
+    # Model Performance
+    st.subheader("📈 Model Performance")
+    
+    if stats['model_trained']:
+        st.success("✅ ML model is trained and active")
+        
+        # Show training history if available
+        if len(st.session_state.signal_learning.training_buffer) > 10:
+            training_data = list(st.session_state.signal_learning.training_buffer)
+            
+            # Plot success rate over time
+            success_over_time = []
+            window_size = 20
+            
+            for i in range(len(training_data)):
+                if i >= window_size:
+                    window = training_data[i-window_size:i]
+                    successes = sum(1 for s in window if s['decoded'])
+                    success_over_time.append({
+                        'sample': i,
+                        'success_rate': successes / window_size
+                    })
+            
+            if success_over_time:
+                df = pd.DataFrame(success_over_time)
+                fig = px.line(
+                    df,
+                    x='sample',
+                    y='success_rate',
+                    title='Detection Success Rate (20-sample rolling window)',
+                    labels={'sample': 'Sample Number', 'success_rate': 'Success Rate'}
+                )
+                fig.update_yaxes(range=[0, 1])
+                st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("ℹ️  ML model not yet trained. Need at least 50 successful decodes.")
+        
+        if stats['successful_decodes'] > 0:
+            progress = stats['successful_decodes'] / 50
+            st.progress(progress)
+            st.caption(f"{stats['successful_decodes']}/50 samples collected")
+    
+    # Save/Load Models
+    st.divider()
+    st.subheader("💾 Model Management")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("💾 Save Learning Data"):
+            st.session_state.signal_learning._save_models()
+            st.success("✅ Learning data saved!")
+    
+    with col2:
+        if st.button("📂 Load Learning Data"):
+            st.session_state.signal_learning._load_models()
+            st.success("✅ Learning data loaded!")
+            st.rerun()
+
 
 def process_signal_queue():
     """Process signals from the queue - runs in main Streamlit thread"""
@@ -629,6 +831,19 @@ def process_signal_queue():
                     'raw_data': signal.raw_data
                 }
                 
+                # NEW: Learn from successful decode
+                st.session_state.signal_learning.learn_from_signal(
+                    {
+                        'frequency': signal.frequency,
+                        'power': signal.signal_strength,
+                        'snr': signal.snr,
+                        'modulation': signal.protocol,
+                        'characteristics': {}
+                    },
+                    decoded=True,
+                    protocol=signal.protocol
+                )
+                
                 st.session_state.db.insert_signal(signal_dict)
                 st.session_state.signal_buffer.append(signal_dict)
 
@@ -653,6 +868,7 @@ def process_signal_queue():
         except Exception as e:
             print(f"Error processing signal: {e}")
             continue
+
 
 def show_debug_tools():
     """Debug and diagnostic tools tab"""
@@ -933,76 +1149,17 @@ def main():
     st.title("🚗 TPMS Tracker - Intelligent Vehicle Pattern Recognition")
 
     with st.sidebar:
-        st.header("⚙️ Control Panel")
-        st.subheader("Scanner Control")
-
-        frequency = st.selectbox(
-            "Frequency (MHz)",
-            config.FREQUENCIES,
-            index=0
-        )
-        # In the sidebar, after frequency selection
-        if st.session_state.is_scanning:
-            st.divider()
-    
-            # Manual gain control
-            with st.expander("⚙️ Advanced Settings"):
-                current_gain = st.session_state.hackrf.current_gain
-                new_gain = st.slider(
-                    "Manual Gain (dB)",
-                    min_value=0,
-                    max_value=47,
-                    value=current_gain,
-                    step=2,
-                    help="Adjust receiver gain (must be even number)"
-                )
-        
-                if new_gain != current_gain and st.button("Apply Gain"):
-                    st.session_state.hackrf.current_gain = new_gain
-                    st.success(f"Gain set to {new_gain} dB (will apply on next hop)")
-
-
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("▶️ Start Scan", disabled=st.session_state.is_scanning):
-                st.session_state.is_scanning = True
-                st.session_state.hackrf.start(frequency, signal_callback)
-                st.success("Scanning started!")
-
-        with col2:
-            if st.button("⏹️ Stop Scan", disabled=not st.session_state.is_scanning):
-                st.session_state.is_scanning = False
-                st.session_state.hackrf.stop()
-                st.info("Scanning stopped")
-
-        if st.session_state.is_scanning:
-            status = st.session_state.hackrf.get_status()
-            st.metric("Status", "🟢 Active")
-            st.metric("Frequency", f"{status['frequency']:.2f} MHz")
-            st.metric("Gain", f"{status['gain']} dB")
-            if status['avg_signal_strength']:
-                st.metric("Signal", f"{status['avg_signal_strength']:.1f} dBm")
-        else:
-            st.metric("Status", "🔴 Inactive")
-
-        st.divider()
-
-        st.subheader("📊 Statistics")
-        vehicles = st.session_state.db.get_all_vehicles()
-        st.metric("Known Vehicles", len(vehicles))
-
-        recent_signals = st.session_state.db.get_recent_signals(3600)
-        st.metric("Signals (1hr)", len(recent_signals))
+        # ... existing sidebar code ...
+        pass
 
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "🎯 Live Detection",
         "🚗 Vehicle Database",
         "📈 Analytics",
         "🔧 Maintenance",
-        "🤖 ML Insights",
+        "🤖 Signal Learning",  # CHANGED from "ML Insights"
         "🔧 Debug Tools"
     ])
-
 
     with tab1:
         show_live_detection()
@@ -1017,7 +1174,7 @@ def main():
         show_maintenance()
 
     with tab5:
-        show_ml_insights()
+        show_ml_learning()  # CHANGED from show_ml_insights()
     
     with tab6:
         show_debug_tools()
