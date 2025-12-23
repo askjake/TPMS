@@ -14,6 +14,11 @@ from hackrf_interface import HackRFInterface
 from tpms_decoder import TPMSDecoder
 from ml_engine import VehicleClusteringEngine
 
+import queue
+
+# Global queue for thread-safe communication
+signal_queue = queue.Queue(maxsize=1000)
+
 # Page config
 st.set_page_config(
     page_title="TPMS Tracker",
@@ -34,47 +39,24 @@ if 'db' not in st.session_state:
 
 
 def signal_callback(iq_samples, signal_strength, frequency):
-    """Callback for processing HackRF samples"""
-    # Decode TPMS signals
-    signals = st.session_state.decoder.process_samples(iq_samples, frequency)
-
-    for signal in signals:
-        # Add signal strength
-        signal.signal_strength = signal_strength
-
-        # Store in database
-        signal_dict = {
-            'tpms_id': signal.tpms_id,
-            'timestamp': signal.timestamp,
-            'frequency': signal.frequency,
-            'signal_strength': signal.signal_strength,
-            'snr': signal.snr,
-            'pressure_psi': signal.pressure_psi,
-            'temperature_c': signal.temperature_c,
-            'battery_low': signal.battery_low,
-            'protocol': signal.protocol,
-            'raw_data': signal.raw_data
-        }
-        st.session_state.db.insert_signal(signal_dict)
-        st.session_state.signal_buffer.append(signal_dict)
-
-    # Process signals for vehicle clustering
-    if len(st.session_state.signal_buffer) > 10:
-        vehicle_ids = st.session_state.ml_engine.process_signals(st.session_state.signal_buffer)
-
-        for vehicle_id in vehicle_ids:
-            vehicle_info = st.session_state.db.get_vehicle_history(vehicle_id)
-            st.session_state.recent_detections.append({
-                'vehicle_id': vehicle_id,
-                'timestamp': time.time(),
-                'vehicle': vehicle_info['vehicle']
-            })
-
-        st.session_state.signal_buffer = []
+    """Callback for processing HackRF samples - queue-based"""
+    try:
+        # Put data in queue instead of processing directly
+        signal_queue.put({
+            'iq_samples': iq_samples,
+            'signal_strength': signal_strength,
+            'frequency': frequency,
+            'timestamp': time.time()
+        }, block=False)
+    except queue.Full:
+        pass  # Drop samples if queue is full
 
 
 def show_live_detection():
     """Live detection tab"""
+    if st.session_state.is_scanning:
+        process_signal_queue()
+    
     st.header("Live TPMS Detection")
 
     col1, col2 = st.columns([2, 1])
@@ -228,7 +210,7 @@ def show_analytics():
             for encounter in history['encounters']:
                 encounter_data.append({
                     'vehicle_id': vehicle['id'],
-                    'nickname': vehicle.get('nickname', f"Vehicle {vehicle['id']}"),
+                    'nickname': vehicle.get('nickname', 'Vehicle ' + str(vehicle['id'])),
                     'timestamp': datetime.fromtimestamp(encounter['timestamp']),
                     'date': datetime.fromtimestamp(encounter['timestamp']).date()
                 })
@@ -278,7 +260,7 @@ def show_analytics():
 
         top_df = pd.DataFrame([
             {
-                'Vehicle': v.get('nickname', f"Vehicle {v['id']}"),
+                'Vehicle': v.get('nickname', 'Vehicle ' + str(v['id'])),
                 'Encounters': v['encounter_count'],
                 'Last Seen': datetime.fromtimestamp(v['last_seen']).strftime('%Y-%m-%d')
             }
@@ -310,7 +292,8 @@ def show_analytics():
             else:
                 time_str = f"{int(hours_ago / 24)} days ago"
 
-            st.write(f"**{v.get('nickname', f'Vehicle {v['id']}')}** - {time_str}")
+            nickname = v.get('nickname', 'Vehicle ' + str(v['id']))
+            st.write(f"**{nickname}** - {time_str}")
 
 
 def show_maintenance():
@@ -324,7 +307,7 @@ def show_maintenance():
         return
 
     vehicle_options = {
-        f"{v.get('nickname', f'Vehicle {v['id']}')} (ID: {v['id']})": v['id']
+        f"{v.get('nickname', 'Vehicle ' + str(v['id']))} (ID: {v['id']})": v['id']
         for v in vehicles
     }
 
@@ -406,6 +389,62 @@ def show_ml_insights():
     with col2:
         st.subheader("Detection Patterns")
         st.info("Pattern analysis will appear here as data accumulates.")
+
+def process_signal_queue():
+    """Process signals from the queue - runs in main Streamlit thread"""
+    processed = 0
+    max_batch = 10  # Process up to 10 signals per call
+    
+    while not signal_queue.empty() and processed < max_batch:
+        try:
+            data = signal_queue.get_nowait()
+            
+            # Now we're in the main thread, safe to access session_state
+            signals = st.session_state.decoder.process_samples(
+                data['iq_samples'], 
+                data['frequency']
+            )
+
+            for signal in signals:
+                signal.signal_strength = data['signal_strength']
+
+                signal_dict = {
+                    'tpms_id': signal.tpms_id,
+                    'timestamp': signal.timestamp,
+                    'frequency': signal.frequency,
+                    'signal_strength': signal.signal_strength,
+                    'snr': signal.snr,
+                    'pressure_psi': signal.pressure_psi,
+                    'temperature_c': signal.temperature_c,
+                    'battery_low': signal.battery_low,
+                    'protocol': signal.protocol,
+                    'raw_data': signal.raw_data
+                }
+                
+                st.session_state.db.insert_signal(signal_dict)
+                st.session_state.signal_buffer.append(signal_dict)
+
+            # Process for vehicle clustering
+            if len(st.session_state.signal_buffer) > 10:
+                vehicle_ids = st.session_state.ml_engine.process_signals(st.session_state.signal_buffer)
+
+                for vehicle_id in vehicle_ids:
+                    vehicle_info = st.session_state.db.get_vehicle_history(vehicle_id)
+                    st.session_state.recent_detections.append({
+                        'vehicle_id': vehicle_id,
+                        'timestamp': time.time(),
+                        'vehicle': vehicle_info['vehicle']
+                    })
+
+                st.session_state.signal_buffer = []
+            
+            processed += 1
+            
+        except queue.Empty:
+            break
+        except Exception as e:
+            print(f"Error processing signal: {e}")
+            continue
 
 
 def main():
