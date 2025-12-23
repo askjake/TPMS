@@ -96,7 +96,7 @@ Track and analyze vehicles through their Tire Pressure Monitoring System (TPMS) 
 ### 1. Clone Repository
 
 ```bash
-git clone https://github.com/yourusername/tpms-tracker.git
+git clone https://github.com/askjake/TPMS.git
 cd tpms-tracker
 
 2. Install Python Dependencies
@@ -546,7 +546,7 @@ if __name__ == "__main__":
 
 ## 1. Clone Repository
 ```bash
-git clone https://github.com/yourusername/tpms-tracker.git
+git clone https://github.com/askjake/TPMS.git
 cd tpms-tracker
 
 2. Setup Python Environment
@@ -587,14 +587,14 @@ git add .
 git commit -m "Initial commit: TPMS Tracker v1.0"
 
 # Add remote (replace with your GitHub repo URL)
-git remote add origin https://github.com/yourusername/tpms-tracker.git
+git remote add origin https://github.com/askjake/TPMS.git
 
 # Push
 git push -u origin main
 
 9. On Your Other Laptop
 # Clone
-git clone https://github.com/yourusername/tpms-tracker.git
+git clone https://github.com/askjake/TPMS.git
 cd tpms-tracker
 
 # Setup

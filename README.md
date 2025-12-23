@@ -27,7 +27,7 @@ Track and analyze vehicles through their Tire Pressure Monitoring System (TPMS) 
 ### 1. Clone Repository
 
 ```bash
-git clone https://github.com/askjake/TPMS/tpms-tracker.git
+git clone https://github.com/askjake/TPMS.git
 cd tpms-tracker
 
 
