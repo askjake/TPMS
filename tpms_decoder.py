@@ -1,9 +1,12 @@
+"""
+TPMS Signal Decoder with Protocol Detection
+"""
 import numpy as np
-from typing import Optional, Dict, List
-from dataclasses import dataclass
 from scipy import signal as scipy_signal
-import struct
-
+from dataclasses import dataclass
+from typing import List, Optional, Dict
+import time
+from config import config
 
 @dataclass
 class TPMSSignal:
@@ -12,201 +15,338 @@ class TPMSSignal:
     frequency: float
     signal_strength: float
     snr: float
-    pressure_psi: Optional[float] = None
-    temperature_c: Optional[float] = None
-    battery_low: bool = False
-    protocol: str = "unknown"
-    raw_data: bytes = b''
+    pressure_psi: Optional[float]
+    temperature_c: Optional[float]
+    battery_low: bool
+    protocol: str
+    raw_data: bytes
+    confidence: float = 0.0
 
+@dataclass
+class UnknownSignal:
+    timestamp: float
+    frequency: float
+    signal_strength: float
+    modulation_type: str
+    baud_rate: Optional[int]
+    packet_length: int
+    pattern_signature: str
+    raw_samples: np.ndarray
 
 class TPMSDecoder:
-    """Decode TPMS signals from IQ samples"""
-
     def __init__(self, sample_rate: int):
         self.sample_rate = sample_rate
-        self.protocols = {
-            'toyota': self._decode_toyota,
-            'schrader': self._decode_schrader,
-            'continental': self._decode_continental,
-            'generic': self._decode_generic
+        self.unknown_signals = []
+        self.protocol_patterns = {}
+        self._init_protocol_patterns()
+        
+    def _init_protocol_patterns(self):
+        """Initialize known TPMS protocol patterns"""
+        self.protocol_patterns = {
+            'Toyota/Lexus': {
+                'preamble': [0xAA, 0xAA],
+                'packet_length': 10,
+                'modulation': 'FSK',
+                'baud_rate': 10000
+            },
+            'Schrader': {
+                'preamble': [0x55, 0x55],
+                'packet_length': 8,
+                'modulation': 'Manchester',
+                'baud_rate': 19200
+            },
+            'Continental': {
+                'preamble': [0xFF, 0x00],
+                'packet_length': 9,
+                'modulation': 'FSK',
+                'baud_rate': 9600
+            }
         }
-
+    
     def process_samples(self, iq_samples: np.ndarray, frequency: float) -> List[TPMSSignal]:
-        """Process IQ samples and extract TPMS signals"""
+        """Process IQ samples and decode TPMS signals"""
         signals = []
-
-        # Demodulate FSK/ASK
-        demod_data = self._demodulate(iq_samples)
-
-        # Find preambles and decode packets
-        packets = self._find_packets(demod_data)
-
-        for packet in packets:
-            # Try each protocol
-            for protocol_name, decoder in self.protocols.items():
-                try:
-                    tpms_signal = decoder(packet, frequency)
-                    if tpms_signal:
-                        signals.append(tpms_signal)
-                        break
-                except:
-                    continue
-
+        
+        # Calculate signal power
+        power = np.abs(iq_samples) ** 2
+        avg_power = np.mean(power)
+        signal_strength = 10 * np.log10(avg_power + 1e-10) - 60
+        
+        # Check if signal is strong enough
+        if signal_strength < config.SIGNAL_THRESHOLD:
+            return signals
+        
+        # Try to decode with known protocols
+        for protocol_name, pattern in self.protocol_patterns.items():
+            decoded = self._try_decode_protocol(iq_samples, protocol_name, pattern, frequency, signal_strength)
+            if decoded:
+                signals.append(decoded)
+                return signals
+        
+        # If no known protocol matched, analyze as unknown
+        if config.PROTOCOL_DETECTION_ENABLED:
+            unknown = self._analyze_unknown_signal(iq_samples, frequency, signal_strength)
+            if unknown:
+                self.unknown_signals.append(unknown)
+        
         return signals
-
-    def _demodulate(self, iq_samples: np.ndarray) -> np.ndarray:
-        """Demodulate FSK/ASK signal"""
-        # Calculate magnitude
-        magnitude = np.abs(iq_samples)
-
-        # Calculate instantaneous frequency
-        phase = np.unwrap(np.angle(iq_samples))
-        inst_freq = np.diff(phase) / (2 * np.pi) * self.sample_rate
-
-        # Threshold for bit detection
-        threshold = np.mean(magnitude)
-        bits = (magnitude[:-1] > threshold).astype(int)
-
-        return bits
-
-    def _find_packets(self, bits: np.ndarray) -> List[bytes]:
-        """Find packet preambles and extract data"""
-        packets = []
-
-        # Common TPMS preambles (varies by protocol)
-        preambles = [
-            [1, 0, 1, 0, 1, 0, 1, 0],  # Alternating pattern
-            [1, 1, 1, 1, 0, 0, 0, 0],  # Block pattern
-        ]
-
-        for preamble in preambles:
-            preamble_arr = np.array(preamble)
-
-            # Find preamble using correlation
-            correlation = np.correlate(bits, preamble_arr, mode='valid')
-            peaks = np.where(correlation > len(preamble) * 0.8)[0]
-
-            for peak in peaks:
-                # Extract packet (typically 64-128 bits)
-                packet_start = peak + len(preamble)
-                packet_end = packet_start + 128
-
-                if packet_end < len(bits):
-                    packet_bits = bits[packet_start:packet_end]
-                    packet_bytes = self._bits_to_bytes(packet_bits)
-                    packets.append(packet_bytes)
-
-        return packets
-
+    
+    def _try_decode_protocol(self, iq_samples: np.ndarray, protocol_name: str, 
+                            pattern: dict, frequency: float, signal_strength: float) -> Optional[TPMSSignal]:
+        """Attempt to decode signal with specific protocol"""
+        try:
+            # Demodulate based on modulation type
+            if pattern['modulation'] == 'FSK':
+                bits = self._demodulate_fsk(iq_samples, pattern['baud_rate'])
+            elif pattern['modulation'] == 'Manchester':
+                bits = self._demodulate_manchester(iq_samples, pattern['baud_rate'])
+            else:
+                return None
+            
+            if bits is None or len(bits) < pattern['packet_length'] * 8:
+                return None
+            
+            # Look for preamble
+            preamble_bits = self._bytes_to_bits(pattern['preamble'])
+            preamble_pos = self._find_preamble(bits, preamble_bits)
+            
+            if preamble_pos == -1:
+                return None
+            
+            # Extract packet
+            packet_start = preamble_pos + len(preamble_bits)
+            packet_bits = bits[packet_start:packet_start + pattern['packet_length'] * 8]
+            
+            if len(packet_bits) < pattern['packet_length'] * 8:
+                return None
+            
+            # Convert to bytes
+            packet_bytes = self._bits_to_bytes(packet_bits)
+            
+            # Decode packet based on protocol
+            decoded = self._decode_packet(packet_bytes, protocol_name)
+            
+            if decoded:
+                # Calculate SNR
+                snr = self._calculate_snr(iq_samples)
+                
+                return TPMSSignal(
+                    tpms_id=decoded['id'],
+                    timestamp=time.time(),
+                    frequency=frequency,
+                    signal_strength=signal_strength,
+                    snr=snr,
+                    pressure_psi=decoded.get('pressure'),
+                    temperature_c=decoded.get('temperature'),
+                    battery_low=decoded.get('battery_low', False),
+                    protocol=protocol_name,
+                    raw_data=packet_bytes,
+                    confidence=decoded.get('confidence', 0.8)
+                )
+        
+        except Exception as e:
+            print(f"Error decoding {protocol_name}: {e}")
+            return None
+    
+    def _analyze_unknown_signal(self, iq_samples: np.ndarray, frequency: float, 
+                                signal_strength: float) -> Optional[UnknownSignal]:
+        """Analyze unknown signal characteristics"""
+        try:
+            # Detect modulation type
+            modulation = self._detect_modulation(iq_samples)
+            
+            # Estimate baud rate
+            baud_rate = self._estimate_baud_rate(iq_samples)
+            
+            # Estimate packet length
+            packet_length = len(iq_samples) // (self.sample_rate // (baud_rate or 10000))
+            
+            # Create pattern signature
+            pattern_sig = self._create_pattern_signature(iq_samples)
+            
+            return UnknownSignal(
+                timestamp=time.time(),
+                frequency=frequency,
+                signal_strength=signal_strength,
+                modulation_type=modulation,
+                baud_rate=baud_rate,
+                packet_length=packet_length,
+                pattern_signature=pattern_sig,
+                raw_samples=iq_samples[:1000]  # Store first 1000 samples
+            )
+        
+        except Exception as e:
+            print(f"Error analyzing unknown signal: {e}")
+            return None
+    
+    def _detect_modulation(self, iq_samples: np.ndarray) -> str:
+        """Detect modulation type"""
+        # Check phase variations
+        phase = np.angle(iq_samples)
+        phase_diff = np.diff(phase)
+        phase_var = np.var(phase_diff)
+        
+        # Check amplitude variations
+        amplitude = np.abs(iq_samples)
+        amp_var = np.var(amplitude)
+        
+        if phase_var > 0.5 and amp_var < 0.1:
+            return "FSK/PSK"
+        elif amp_var > 0.3:
+            return "ASK/OOK"
+        elif phase_var > 0.3:
+            return "PSK"
+        else:
+            return "Unknown"
+    
+    def _estimate_baud_rate(self, iq_samples: np.ndarray) -> Optional[int]:
+        """Estimate symbol/baud rate"""
+        try:
+            # Use autocorrelation to find symbol period
+            amplitude = np.abs(iq_samples)
+            autocorr = np.correlate(amplitude, amplitude, mode='full')
+            autocorr = autocorr[len(autocorr)//2:]
+            
+            # Find peaks
+            peaks, _ = scipy_signal.find_peaks(autocorr, distance=10)
+            
+            if len(peaks) > 1:
+                # Average distance between peaks
+                avg_distance = np.mean(np.diff(peaks[:5]))
+                baud_rate = int(self.sample_rate / avg_distance)
+                return baud_rate
+        
+        except Exception:
+            pass
+        
+        return None
+    
+    def _create_pattern_signature(self, iq_samples: np.ndarray) -> str:
+        """Create a signature for pattern matching"""
+        # Simplified signature based on amplitude envelope
+        amplitude = np.abs(iq_samples[:100])
+        # Normalize
+        amplitude = (amplitude - np.min(amplitude)) / (np.max(amplitude) - np.min(amplitude) + 1e-10)
+        # Quantize to 4 levels
+        quantized = (amplitude * 3).astype(int)
+        # Convert to string
+        return ''.join(map(str, quantized))
+    
+    def _demodulate_fsk(self, iq_samples: np.ndarray, baud_rate: int) -> Optional[np.ndarray]:
+        """Demodulate FSK signal"""
+        # Simplified FSK demodulation
+        instantaneous_freq = np.diff(np.unwrap(np.angle(iq_samples)))
+        samples_per_bit = self.sample_rate // baud_rate
+        
+        bits = []
+        for i in range(0, len(instantaneous_freq) - samples_per_bit, samples_per_bit):
+            bit_sample = instantaneous_freq[i:i+samples_per_bit]
+            bits.append(1 if np.mean(bit_sample) > 0 else 0)
+        
+        return np.array(bits) if bits else None
+    
+    def _demodulate_manchester(self, iq_samples: np.ndarray, baud_rate: int) -> Optional[np.ndarray]:
+        """Demodulate Manchester encoded signal"""
+        # Simplified Manchester demodulation
+        amplitude = np.abs(iq_samples)
+        samples_per_bit = self.sample_rate // baud_rate
+        
+        bits = []
+        for i in range(0, len(amplitude) - samples_per_bit * 2, samples_per_bit * 2):
+            first_half = np.mean(amplitude[i:i+samples_per_bit])
+            second_half = np.mean(amplitude[i+samples_per_bit:i+samples_per_bit*2])
+            
+            if first_half > second_half:
+                bits.append(1)
+            else:
+                bits.append(0)
+        
+        return np.array(bits) if bits else None
+    
+    def _bytes_to_bits(self, bytes_data: List[int]) -> np.ndarray:
+        """Convert bytes to bit array"""
+        bits = []
+        for byte in bytes_data:
+            for i in range(7, -1, -1):
+                bits.append((byte >> i) & 1)
+        return np.array(bits)
+    
     def _bits_to_bytes(self, bits: np.ndarray) -> bytes:
         """Convert bit array to bytes"""
-        # Pad to multiple of 8
-        padding = (8 - len(bits) % 8) % 8
-        bits = np.concatenate([bits, np.zeros(padding, dtype=int)])
-
-        # Convert to bytes
-        byte_array = []
+        bytes_data = []
         for i in range(0, len(bits), 8):
-            byte_bits = bits[i:i + 8]
-            byte_val = sum(bit << (7 - j) for j, bit in enumerate(byte_bits))
-            byte_array.append(byte_val)
-
-        return bytes(byte_array)
-
-    def _decode_toyota(self, packet: bytes, frequency: float) -> Optional[TPMSSignal]:
-        """Decode Toyota TPMS protocol"""
-        if len(packet) < 8:
-            return None
-
-        # Toyota format (simplified):
-        # Bytes 0-3: ID
-        # Byte 4: Pressure
-        # Byte 5: Temperature
-        # Byte 6: Flags
-        # Byte 7: Checksum
-
-        tpms_id = packet[0:4].hex().upper()
-        pressure_raw = packet[4]
-        temp_raw = packet[5]
-        flags = packet[6]
-
-        # Convert to physical units
-        pressure_psi = pressure_raw * 0.25  # Example conversion
-        temperature_c = temp_raw - 40  # Example conversion
-        battery_low = bool(flags & 0x80)
-
-        return TPMSSignal(
-            tpms_id=tpms_id,
-            timestamp=time.time(),
-            frequency=frequency,
-            signal_strength=0,  # Will be filled by caller
-            snr=0,  # Will be filled by caller
-            pressure_psi=pressure_psi,
-            temperature_c=temperature_c,
-            battery_low=battery_low,
-            protocol='toyota',
-            raw_data=packet
-        )
-
-    def _decode_schrader(self, packet: bytes, frequency: float) -> Optional[TPMSSignal]:
-        """Decode Schrader TPMS protocol"""
-        if len(packet) < 10:
-            return None
-
-        # Schrader format varies, this is a simplified version
-        tpms_id = packet[0:4].hex().upper()
-
-        # Extract pressure and temperature (format varies)
-        pressure_psi = struct.unpack('>H', packet[4:6])[0] * 0.01
-        temperature_c = packet[6] - 50
-
-        return TPMSSignal(
-            tpms_id=tpms_id,
-            timestamp=time.time(),
-            frequency=frequency,
-            signal_strength=0,
-            snr=0,
-            pressure_psi=pressure_psi,
-            temperature_c=temperature_c,
-            protocol='schrader',
-            raw_data=packet
-        )
-
-    def _decode_continental(self, packet: bytes, frequency: float) -> Optional[TPMSSignal]:
-        """Decode Continental TPMS protocol"""
-        # Similar structure to above
-        if len(packet) < 8:
-            return None
-
-        tpms_id = packet[0:4].hex().upper()
-
-        return TPMSSignal(
-            tpms_id=tpms_id,
-            timestamp=time.time(),
-            frequency=frequency,
-            signal_strength=0,
-            snr=0,
-            protocol='continental',
-            raw_data=packet
-        )
-
-    def _decode_generic(self, packet: bytes, frequency: float) -> Optional[TPMSSignal]:
-        """Generic decoder for unknown protocols"""
+            byte = 0
+            for j in range(8):
+                if i + j < len(bits):
+                    byte = (byte << 1) | int(bits[i + j])
+            bytes_data.append(byte)
+        return bytes(bytes_data)
+    
+    def _find_preamble(self, bits: np.ndarray, preamble: np.ndarray) -> int:
+        """Find preamble in bit stream"""
+        for i in range(len(bits) - len(preamble)):
+            if np.array_equal(bits[i:i+len(preamble)], preamble):
+                return i
+        return -1
+    
+    def _decode_packet(self, packet: bytes, protocol: str) -> Optional[Dict]:
+        """Decode packet based on protocol"""
+        # Simplified decoding - in reality this would be protocol-specific
         if len(packet) < 4:
             return None
-
-        # Just extract ID
-        tpms_id = packet[0:4].hex().upper()
-
-        return TPMSSignal(
-            tpms_id=tpms_id,
-            timestamp=time.time(),
-            frequency=frequency,
-            signal_strength=0,
-            snr=0,
-            protocol='generic',
-            raw_data=packet
-        )
-
-
-import time
+        
+        # Extract ID (first 4 bytes typically)
+        tpms_id = ''.join(f'{b:02X}' for b in packet[:4])
+        
+        # Mock pressure and temperature (would be protocol-specific)
+        pressure = None
+        temperature = None
+        battery_low = False
+        
+        if len(packet) > 4:
+            pressure = packet[4] * 0.5  # Example conversion
+        if len(packet) > 5:
+            temperature = packet[5] - 40  # Example conversion
+        if len(packet) > 6:
+            battery_low = bool(packet[6] & 0x80)
+        
+        return {
+            'id': tpms_id,
+            'pressure': pressure,
+            'temperature': temperature,
+            'battery_low': battery_low,
+            'confidence': 0.7
+        }
+    
+    def _calculate_snr(self, iq_samples: np.ndarray) -> float:
+        """Calculate Signal-to-Noise Ratio"""
+        power = np.abs(iq_samples) ** 2
+        signal_power = np.max(power)
+        noise_power = np.median(power)
+        snr = 10 * np.log10((signal_power / (noise_power + 1e-10)))
+        return snr
+    
+    def get_unknown_signals(self, max_age: float = 60.0) -> List[UnknownSignal]:
+        """Get recent unknown signals"""
+        current_time = time.time()
+        return [s for s in self.unknown_signals if current_time - s.timestamp < max_age]
+    
+    def get_protocol_statistics(self) -> Dict:
+        """Get statistics on detected protocols"""
+        recent_unknown = self.get_unknown_signals(300)  # Last 5 minutes
+        
+        modulation_counts = {}
+        baud_rates = []
+        
+        for signal in recent_unknown:
+            mod = signal.modulation_type
+            modulation_counts[mod] = modulation_counts.get(mod, 0) + 1
+            if signal.baud_rate:
+                baud_rates.append(signal.baud_rate)
+        
+        return {
+            'total_unknown': len(recent_unknown),
+            'modulation_types': modulation_counts,
+            'common_baud_rates': list(set(baud_rates)) if baud_rates else [],
+            'avg_signal_strength': np.mean([s.signal_strength for s in recent_unknown]) if recent_unknown else 0
+        }
