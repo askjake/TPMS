@@ -12,7 +12,7 @@ class HackRFInterface:
     def __init__(self):
         self.process: Optional[subprocess.Popen] = None
         self.current_frequency = config.FREQUENCIES[0]
-        self.current_gain = 20
+        self.current_gain = config.DEFAULT_GAIN
         self.is_running = False
         self.data_queue = Queue(maxsize=1000)
         self.callback: Optional[Callable] = None
@@ -20,37 +20,29 @@ class HackRFInterface:
         # Find hackrf_transfer
         self.hackrf_transfer_path = self._find_hackrf_transfer()
         
-        # Auto-tuning parameters
+        # Frequency hopping
+        self.frequency_hop_enabled = config.FREQUENCY_HOP_ENABLED
+        self.frequency_index = 0
+        self.last_hop_time = 0
+        self.hop_interval = config.FREQUENCY_HOP_INTERVAL
+        
+        # Signal metrics
         self.signal_history = []
         self.max_history_size = 100
+        self.frequency_stats = {freq: {'samples': 0, 'avg_strength': 0, 'detections': 0} 
+                               for freq in config.FREQUENCIES}
+        
+        # Auto-tuning parameters
         self.auto_tune_enabled = True
         self.last_tune_time = 0
-        self.tune_interval = 5
+        self.tune_interval = 10
     
     def _find_hackrf_transfer(self):
         """Find hackrf_transfer executable"""
-        # First check if it's in PATH
         path = shutil.which('hackrf_transfer')
         if path:
             print(f"✅ Found hackrf_transfer in PATH: {path}")
             return 'hackrf_transfer'
-        
-        # Search common locations
-        search_paths = [
-            Path("C:/hackrf/bin/hackrf_transfer.exe"),
-            Path("C:/Program Files/HackRF/bin/hackrf_transfer.exe"),
-            Path("C:/Program Files (x86)/HackRF/bin/hackrf_transfer.exe"),
-        ]
-        
-        # Add URH paths
-        urh_base = Path(os.environ.get('PROGRAMFILES', 'C:/Program Files')) / "Universal Radio Hacker"
-        if urh_base.exists():
-            search_paths.extend(urh_base.rglob("hackrf_transfer.exe"))
-        
-        for path in search_paths:
-            if isinstance(path, Path) and path.exists():
-                print(f"✅ Found hackrf_transfer at: {path}")
-                return str(path)
         
         print("⚠️  hackrf_transfer not found, will try 'hackrf_transfer' command")
         return 'hackrf_transfer'
@@ -63,19 +55,27 @@ class HackRFInterface:
         self.current_frequency = frequency
         self.callback = callback
         self.is_running = True
+        self.last_hop_time = time.time()
+        
+        # Start on first frequency if hopping enabled
+        if self.frequency_hop_enabled:
+            self.frequency_index = 0
+            self.current_frequency = config.FREQUENCIES[self.frequency_index]
         
         # Build command
         cmd = [
             self.hackrf_transfer_path,
             '-r', '-',
-            '-f', str(int(frequency * 1e6)),
+            '-f', str(int(self.current_frequency * 1e6)),
             '-s', str(config.SAMPLE_RATE),
             '-g', str(self.current_gain),
             '-l', '32',
             '-a', '1'
         ]
         
-        print(f"🚀 Starting HackRF on {frequency} MHz with gain {self.current_gain} dB")
+        print(f"🚀 Starting HackRF on {self.current_frequency} MHz with gain {self.current_gain} dB")
+        if self.frequency_hop_enabled:
+            print(f"🔄 Frequency hopping enabled: {config.FREQUENCIES}")
         print(f"Command: {' '.join(cmd)}")
         
         try:
@@ -89,7 +89,6 @@ class HackRFInterface:
             # Check if process started successfully
             time.sleep(0.5)
             if self.process.poll() is not None:
-                # Process died immediately
                 stderr = self.process.stderr.read().decode()
                 print(f"❌ HackRF failed to start: {stderr}")
                 return False
@@ -97,6 +96,11 @@ class HackRFInterface:
             # Start reading thread
             self.read_thread = threading.Thread(target=self._read_samples, daemon=True)
             self.read_thread.start()
+            
+            # Start frequency hopping thread
+            if self.frequency_hop_enabled:
+                self.hop_thread = threading.Thread(target=self._frequency_hopper, daemon=True)
+                self.hop_thread.start()
             
             # Start auto-tune thread
             if self.auto_tune_enabled:
@@ -108,15 +112,6 @@ class HackRFInterface:
             
         except FileNotFoundError:
             print(f"❌ hackrf_transfer not found at: {self.hackrf_transfer_path}")
-            print("\nTrying to locate it...")
-            
-            # Try to find it
-            found = shutil.which('hackrf_transfer')
-            if found:
-                print(f"Found at: {found}")
-                self.hackrf_transfer_path = found
-                return self.start(frequency, callback)  # Retry
-            
             return False
             
         except Exception as e:
@@ -134,6 +129,28 @@ class HackRFInterface:
                 self.process.kill()
             self.process = None
         print("⏹️  HackRF stopped")
+    
+    def _frequency_hopper(self):
+        """Automatically hop between frequencies"""
+        while self.is_running:
+            current_time = time.time()
+            
+            if current_time - self.last_hop_time >= self.hop_interval:
+                # Move to next frequency
+                self.frequency_index = (self.frequency_index + 1) % len(config.FREQUENCIES)
+                new_frequency = config.FREQUENCIES[self.frequency_index]
+                
+                print(f"🔄 Hopping to {new_frequency} MHz")
+                
+                # Restart with new frequency
+                callback = self.callback
+                self.stop()
+                time.sleep(config.FREQUENCY_HOP_DWELL_TIME)
+                self.start(new_frequency, callback)
+                
+                self.last_hop_time = current_time
+            
+            time.sleep(0.1)
     
     def _read_samples(self):
         """Read IQ samples from HackRF"""
@@ -160,6 +177,14 @@ class HackRFInterface:
                 if len(self.signal_history) > self.max_history_size:
                     self.signal_history.pop(0)
                 
+                # Update frequency stats
+                freq_key = self.current_frequency
+                if freq_key in self.frequency_stats:
+                    stats = self.frequency_stats[freq_key]
+                    stats['samples'] += 1
+                    # Running average
+                    stats['avg_strength'] = (stats['avg_strength'] * (stats['samples'] - 1) + signal_strength_dbm) / stats['samples']
+                
                 # Pass to callback
                 if self.callback:
                     self.callback(complex_samples, signal_strength_dbm, self.current_frequency)
@@ -183,38 +208,42 @@ class HackRFInterface:
             
             avg_signal = np.mean(self.signal_history[-20:])
             
+            # Adjust gain based on signal strength
             if avg_signal < config.MIN_SIGNAL_STRENGTH - 10:
                 new_gain = min(self.current_gain + config.GAIN_STEP, config.GAIN_MAX)
                 if new_gain != self.current_gain:
-                    self.set_gain(new_gain)
+                    self.current_gain = new_gain
                     print(f"🔧 Auto-tune: Increased gain to {new_gain} dB (signal: {avg_signal:.1f} dBm)")
             
             elif avg_signal > -30:
                 new_gain = max(self.current_gain - config.GAIN_STEP, config.GAIN_MIN)
                 if new_gain != self.current_gain:
-                    self.set_gain(new_gain)
+                    self.current_gain = new_gain
                     print(f"🔧 Auto-tune: Decreased gain to {new_gain} dB (signal: {avg_signal:.1f} dBm)")
             
             self.last_tune_time = current_time
     
-    def set_gain(self, gain: int):
-        """Change receiver gain"""
-        self.current_gain = gain
-        if self.is_running:
-            callback = self.callback
-            freq = self.current_frequency
-            self.stop()
-            time.sleep(0.5)
-            self.start(freq, callback)
+    def set_frequency_hopping(self, enabled: bool):
+        """Enable or disable frequency hopping"""
+        self.frequency_hop_enabled = enabled
+        if enabled and self.is_running:
+            print("🔄 Frequency hopping enabled")
+        elif not enabled:
+            print("⏸️  Frequency hopping disabled")
     
-    def set_frequency(self, frequency: float):
-        """Change receiver frequency"""
-        self.current_frequency = frequency
-        if self.is_running:
-            callback = self.callback
-            self.stop()
-            time.sleep(0.5)
-            self.start(frequency, callback)
+    def set_hop_interval(self, interval: float):
+        """Set frequency hop interval in seconds"""
+        self.hop_interval = max(1.0, interval)
+        print(f"⏱️  Hop interval set to {self.hop_interval}s")
+    
+    def get_frequency_stats(self):
+        """Get statistics for each frequency"""
+        return self.frequency_stats
+    
+    def increment_detection(self, frequency: float):
+        """Increment detection count for a frequency"""
+        if frequency in self.frequency_stats:
+            self.frequency_stats[frequency]['detections'] += 1
     
     def get_status(self) -> dict:
         """Get current receiver status"""
@@ -223,5 +252,8 @@ class HackRFInterface:
             'frequency': self.current_frequency,
             'gain': self.current_gain,
             'avg_signal_strength': np.mean(self.signal_history[-10:]) if self.signal_history else None,
-            'sample_rate': config.SAMPLE_RATE
+            'sample_rate': config.SAMPLE_RATE,
+            'frequency_hopping': self.frequency_hop_enabled,
+            'hop_interval': self.hop_interval,
+            'frequency_stats': self.frequency_stats
         }
