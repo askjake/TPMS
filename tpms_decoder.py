@@ -39,7 +39,123 @@ class TPMSDecoder:
         self.unknown_signals = []
         self.protocol_patterns = {}
         self._init_protocol_patterns()
+
+    # Add to TPMSDecoder class after __init__
+
+    def set_learning_engine(self, learning_engine):
+        """Set reference to learning engine for adaptive decoding"""
+        self.learning_engine = learning_engine
+
+    def process_samples(self, iq_samples: np.ndarray, frequency: float) -> List[TPMSSignal]:
+        """Process IQ samples and decode TPMS signals with ML guidance"""
+        signals = []
+    
+        # Calculate signal power
+        power = np.abs(iq_samples) ** 2
+        avg_power = np.mean(power)
+        signal_strength = 10 * np.log10(avg_power + 1e-10) - 60
+    
+        # Get ML-guided parameters if available
+        if hasattr(self, 'learning_engine') and self.learning_engine:
+            optimal_params = self.learning_engine.get_optimal_scan_parameters(frequency)
+            threshold = optimal_params.get('threshold', config.SIGNAL_THRESHOLD)
+            expected_modulation = optimal_params.get('expected_modulation', None)
+            expected_baud = optimal_params.get('expected_baud_rate', None)
+        else:
+            threshold = config.SIGNAL_THRESHOLD
+            expected_modulation = None
+            expected_baud = None
+    
+        # Check if signal is strong enough
+        if signal_strength < threshold:
+            return signals
+    
+        # If we have ML guidance, try expected protocol first
+        if expected_modulation and expected_modulation in self.protocol_patterns:
+            pattern = self.protocol_patterns[expected_modulation]
         
+            # Override baud rate if we have learned value
+            if expected_baud:
+                pattern = pattern.copy()
+                pattern['baud_rate'] = expected_baud
+        
+            decoded = self._try_decode_protocol(
+                iq_samples, expected_modulation, pattern, frequency, signal_strength
+            )
+        
+            if decoded:
+                signals.append(decoded)
+            
+                # Learn from this successful decode
+                if hasattr(self, 'learning_engine'):
+                    self.learning_engine.learn_from_signal(
+                        {
+                            'frequency': frequency,
+                            'power': signal_strength,
+                            'snr': decoded.snr,
+                            'modulation': expected_modulation,
+                            'baud_rate': pattern['baud_rate'],
+                            'characteristics': {}
+                        },
+                        decoded=True,
+                        protocol=expected_modulation
+                    )
+            
+                return signals
+    
+        # Try all known protocols (original behavior)
+        for protocol_name, pattern in self.protocol_patterns.items():
+            # Skip if we already tried this one
+            if protocol_name == expected_modulation:
+                continue
+        
+            decoded = self._try_decode_protocol(
+                iq_samples, protocol_name, pattern, frequency, signal_strength
+            )
+        
+            if decoded:
+                signals.append(decoded)
+            
+                # Learn from this successful decode
+                if hasattr(self, 'learning_engine'):
+                    self.learning_engine.learn_from_signal(
+                        {
+                            'frequency': frequency,
+                            'power': signal_strength,
+                            'snr': decoded.snr,
+                            'modulation': protocol_name,
+                            'baud_rate': pattern['baud_rate'],
+                            'characteristics': {}
+                        },
+                        decoded=True,
+                        protocol=protocol_name
+                    )
+            
+                return signals
+    
+        # If no known protocol matched, analyze as unknown
+        if config.PROTOCOL_DETECTION_ENABLED:
+            unknown = self._analyze_unknown_signal(iq_samples, frequency, signal_strength)
+            if unknown:
+                self.unknown_signals.append(unknown)
+            
+                # Learn from failed decode
+                if hasattr(self, 'learning_engine'):
+                    self.learning_engine.learn_from_signal(
+                        {
+                            'frequency': frequency,
+                            'power': signal_strength,
+                            'snr': 0,
+                            'modulation': unknown.modulation_type,
+                            'baud_rate': unknown.baud_rate or 0,
+                            'characteristics': {}
+                        },
+                        decoded=False,
+                        protocol=None
+                    )
+    
+        return signals
+
     def _init_protocol_patterns(self):
         """Initialize known TPMS protocol patterns"""
         self.protocol_patterns = {
@@ -350,3 +466,4 @@ class TPMSDecoder:
             'common_baud_rates': list(set(baud_rates)) if baud_rates else [],
             'avg_signal_strength': np.mean([s.signal_strength for s in recent_unknown]) if recent_unknown else 0
         }
+
