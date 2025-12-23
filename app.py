@@ -1149,15 +1149,73 @@ def main():
     st.title("🚗 TPMS Tracker - Intelligent Vehicle Pattern Recognition")
 
     with st.sidebar:
-        # ... existing sidebar code ...
-        pass
+        st.header("⚙️ Control Panel")
+        st.subheader("Scanner Control")
+
+        frequency = st.selectbox(
+            "Frequency (MHz)",
+            config.FREQUENCIES,
+            index=0
+        )
+        
+        # In the sidebar, after frequency selection
+        if st.session_state.is_scanning:
+            st.divider()
+    
+            # Manual gain control
+            with st.expander("⚙️ Advanced Settings"):
+                current_gain = st.session_state.hackrf.current_gain
+                new_gain = st.slider(
+                    "Manual Gain (dB)",
+                    min_value=0,
+                    max_value=47,
+                    value=current_gain,
+                    step=2,
+                    help="Adjust receiver gain (must be even number)"
+                )
+        
+                if new_gain != current_gain and st.button("Apply Gain"):
+                    st.session_state.hackrf.current_gain = new_gain
+                    st.success(f"Gain set to {new_gain} dB (will apply on next hop)")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("▶️ Start Scan", disabled=st.session_state.is_scanning):
+                st.session_state.is_scanning = True
+                st.session_state.hackrf.start(frequency, signal_callback)
+                st.success("Scanning started!")
+
+        with col2:
+            if st.button("⏹️ Stop Scan", disabled=not st.session_state.is_scanning):
+                st.session_state.is_scanning = False
+                st.session_state.hackrf.stop()
+                st.info("Scanning stopped")
+
+        if st.session_state.is_scanning:
+            status = st.session_state.hackrf.get_status()
+            st.metric("Status", "🟢 Active")
+            st.metric("Frequency", f"{status['frequency']:.2f} MHz")
+            st.metric("Gain", f"{status['gain']} dB")
+            if status['avg_signal_strength']:
+                st.metric("Signal", f"{status['avg_signal_strength']:.1f} dBm")
+        else:
+            st.metric("Status", "🔴 Inactive")
+
+        st.divider()
+
+        st.subheader("📊 Statistics")
+        vehicles = st.session_state.db.get_all_vehicles()
+        st.metric("Known Vehicles", len(vehicles))
+
+        recent_signals = st.session_state.db.get_recent_signals(3600)
+        st.metric("Signals (1hr)", len(recent_signals))
 
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "🎯 Live Detection",
         "🚗 Vehicle Database",
         "📈 Analytics",
         "🔧 Maintenance",
-        "🤖 Signal Learning",  # CHANGED from "ML Insights"
+        "🤖 Signal Learning",
         "🔧 Debug Tools"
     ])
 
@@ -1174,7 +1232,7 @@ def main():
         show_maintenance()
 
     with tab5:
-        show_ml_learning()  # CHANGED from show_ml_insights()
+        show_ml_learning()
     
     with tab6:
         show_debug_tools()
