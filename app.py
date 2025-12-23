@@ -5,22 +5,18 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import time
 import threading
-from queue import Queue
+import queue
 import numpy as np
-import plotly.graph_objects as go
 from collections import deque
 
-signal_history_queue = deque(maxlen=config.SIGNAL_HISTORY_SIZE)
-
+# Import config and modules
 from config import config
 from database import TPMSDatabase
 from hackrf_interface import HackRFInterface
 from tpms_decoder import TPMSDecoder
 from ml_engine import VehicleClusteringEngine
 
-import queue
-
-# Global queue for thread-safe communication
+# Global queues for thread-safe communication
 signal_queue = queue.Queue(maxsize=1000)
 signal_history_queue = deque(maxlen=config.SIGNAL_HISTORY_SIZE)
 
