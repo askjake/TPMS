@@ -52,17 +52,17 @@ def get_fallback_url():
     fallback_urls = [
         {
             'version': '2024.02.1',
-            'url': 'https://github.com/greatscottgadgets/hackrf/releases/download/v2024.02.1/hackrf-2024.02.1-win-x64.zip',
+            'url': 'https://github.com/greatscottgadgets/hackrf/releases/download/v2024.02.1/hackrf-2024.02.1.zip',
             'name': 'hackrf-2024.02.1-win-x64.zip'
         },
         {
             'version': '2023.01.1',
-            'url': 'https://github.com/greatscottgadgets/hackrf/releases/download/v2023.01.1/hackrf-2023.01.1-win-x64.zip',
+            'url': 'https://github.com/greatscottgadgets/hackrf/releases/download/v2023.01.1/hackrf-2023.01.1.zip',
             'name': 'hackrf-2023.01.1-win-x64.zip'
         },
         {
             'version': '2022.09.1',
-            'url': 'https://github.com/greatscottgadgets/hackrf/releases/download/v2022.09.1/hackrf-2022.09.1-win-x64.zip',
+            'url': 'https://github.com/greatscottgadgets/hackrf/releases/download/v2022.09.1/hackrf-2022.09.1.zip',
             'name': 'hackrf-2022.09.1-win-x64.zip'
         }
     ]
@@ -331,3 +331,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
