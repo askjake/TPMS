@@ -15,6 +15,7 @@ from database import TPMSDatabase
 from hackrf_interface import HackRFInterface
 from tpms_decoder import TPMSDecoder
 from ml_engine import VehicleClusteringEngine
+from debug_tools import DebugTools, SpectrumPeak, ModulationAnalysis
 
 # Global queues for thread-safe communication
 signal_queue = queue.Queue(maxsize=1000)
@@ -653,6 +654,195 @@ def process_signal_queue():
             print(f"Error processing signal: {e}")
             continue
 
+def show_debug_tools():
+    """Debug and diagnostic tools tab"""
+    st.header("🔧 Debug & Diagnostic Tools")
+    
+    st.warning("⚠️ Running diagnostics will stop any active scanning!")
+    
+    # Initialize debug tools
+    if 'debug_tools' not in st.session_state:
+        st.session_state.debug_tools = DebugTools()
+    
+    # Hardware Info Section
+    st.subheader("📡 Hardware Information")
+    
+    if st.button("🔍 Check Hardware", type="primary"):
+        with st.spinner("Checking hardware..."):
+            hw_info = st.session_state.debug_tools.get_hardware_info()
+            
+            if hw_info.device_found:
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.success("✅ HackRF One Detected")
+                    st.metric("Serial Number", hw_info.serial_number)
+                    st.metric("Board ID", hw_info.board_id)
+                with col2:
+                    st.metric("Firmware Version", hw_info.firmware_version)
+                    st.metric("Part ID", hw_info.part_id)
+                    if hw_info.operacake_detected:
+                        st.info("🎛️ Opera Cake detected")
+            else:
+                st.error("❌ HackRF not found or not responding")
+    
+    st.divider()
+    
+    # Spectrum Scan Section
+    st.subheader("📊 Spectrum Scanner")
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        scan_start = st.number_input("Start Freq (MHz)", value=310.0, step=1.0)
+    with col2:
+        scan_end = st.number_input("End Freq (MHz)", value=320.0, step=1.0)
+    with col3:
+        scan_step = st.number_input("Step (MHz)", value=0.5, step=0.1, min_value=0.1)
+    
+    if st.button("🔍 Run Spectrum Scan"):
+        # Stop any active scanning
+        if st.session_state.is_scanning:
+            st.session_state.hackrf.stop()
+            st.session_state.is_scanning = False
+            time.sleep(1)
+        
+        with st.spinner(f"Scanning {scan_start} - {scan_end} MHz..."):
+            peaks = st.session_state.debug_tools.spectrum_scan(
+                scan_start, scan_end, step=scan_step, duration=0.5
+            )
+            
+            if peaks:
+                st.success(f"✅ Found {len(peaks)} signals")
+                
+                # Display results
+                peaks_df = pd.DataFrame([
+                    {
+                        'Frequency (MHz)': f"{p.frequency:.2f}",
+                        'Power (dBm)': f"{p.power:.1f}",
+                        'SNR (dB)': f"{p.snr:.1f}",
+                        'Bandwidth (MHz)': f"{p.bandwidth:.2f}"
+                    }
+                    for p in peaks
+                ])
+                
+                st.dataframe(peaks_df, use_container_width=True, hide_index=True)
+                
+                # Plot spectrum
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=[p.frequency for p in peaks],
+                    y=[p.power for p in peaks],
+                    mode='markers+lines',
+                    marker=dict(size=10, color=[p.snr for p in peaks], colorscale='Viridis', showscale=True),
+                    name='Signal Power'
+                ))
+                fig.update_layout(
+                    title='Spectrum Scan Results',
+                    xaxis_title='Frequency (MHz)',
+                    yaxis_title='Power (dBm)',
+                    height=400
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No significant signals detected")
+    
+    st.divider()
+    
+    # Modulation Analysis Section
+    st.subheader("🔬 Modulation Analyzer")
+    
+    analyze_freq = st.number_input("Frequency to Analyze (MHz)", value=314.9, step=0.1)
+    analyze_duration = st.slider("Capture Duration (seconds)", 0.5, 5.0, 2.0, 0.5)
+    
+    if st.button("🔬 Analyze Modulation"):
+        # Stop any active scanning
+        if st.session_state.is_scanning:
+            st.session_state.hackrf.stop()
+            st.session_state.is_scanning = False
+            time.sleep(1)
+        
+        with st.spinner(f"Analyzing {analyze_freq} MHz..."):
+            analysis = st.session_state.debug_tools.analyze_modulation(
+                analyze_freq, duration=analyze_duration
+            )
+            
+            st.success("✅ Analysis complete")
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Modulation Type", analysis.modulation_type)
+                st.metric("Confidence", f"{analysis.confidence*100:.0f}%")
+            with col2:
+                st.metric("Baud Rate", f"{analysis.baud_rate:,} bps" if analysis.baud_rate > 0 else "Unknown")
+                st.metric("Bandwidth", f"{analysis.bandwidth:.2f} MHz")
+            with col3:
+                st.metric("Frequency", f"{analysis.frequency:.2f} MHz")
+            
+            # Show characteristics
+            if analysis.characteristics:
+                with st.expander("📈 Signal Characteristics"):
+                    char_df = pd.DataFrame([
+                        {'Parameter': k, 'Value': f"{v:.4f}"}
+                        for k, v in analysis.characteristics.items()
+                    ])
+                    st.dataframe(char_df, use_container_width=True, hide_index=True)
+    
+    st.divider()
+    
+    # Full Diagnostic Suite
+    st.subheader("🚀 Full Diagnostic Suite")
+    
+    st.info("This will run a complete diagnostic including hardware check, spectrum scan, and modulation analysis on all detected signals.")
+    
+    if st.button("🚀 Run Full Diagnostic", type="primary"):
+        # Stop any active scanning
+        if st.session_state.is_scanning:
+            st.session_state.hackrf.stop()
+            st.session_state.is_scanning = False
+            time.sleep(1)
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        status_text.text("Starting diagnostic...")
+        progress_bar.progress(10)
+        
+        results = st.session_state.debug_tools.run_full_diagnostic()
+        
+        progress_bar.progress(100)
+        status_text.text("Complete!")
+        
+        # Display results
+        st.success("✅ Full diagnostic complete!")
+        
+        # Hardware
+        with st.expander("📡 Hardware Info", expanded=True):
+            hw = results['hardware']
+            if hw.device_found:
+                st.write(f"**Serial:** {hw.serial_number}")
+                st.write(f"**Board ID:** {hw.board_id}")
+                st.write(f"**Firmware:** {hw.firmware_version}")
+            else:
+                st.error("Hardware not detected")
+        
+        # Spectrum
+        if results['spectrum_scan']:
+            with st.expander(f"📊 Spectrum Scan ({len(results['spectrum_scan'])} signals)", expanded=True):
+                spectrum_df = pd.DataFrame([
+                    {
+                        'Frequency': f"{p.frequency:.2f} MHz",
+                        'Power': f"{p.power:.1f} dBm",
+                        'SNR': f"{p.snr:.1f} dB"
+                    }
+                    for p in results['spectrum_scan'][:10]
+                ])
+                st.dataframe(spectrum_df, use_container_width=True, hide_index=True)
+        
+        # Modulation
+        if results['modulation_analysis']:
+            with st.expander(f"🔬 Modulation Analysis ({len(results['modulation_analysis'])} signals)", expanded=True):
+                for analysis in results['modulation_analysis']:
+                    st.write(f"**{analysis.frequency:.2f} MHz:** {analysis.modulation_type} "
+                            f"({analysis.confidence*100:.0f}% confidence, {analysis.baud_rate:,} baud)")
 
 
 def main():
@@ -720,13 +910,15 @@ def main():
         recent_signals = st.session_state.db.get_recent_signals(3600)
         st.metric("Signals (1hr)", len(recent_signals))
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "🎯 Live Detection",
         "🚗 Vehicle Database",
         "📈 Analytics",
         "🔧 Maintenance",
-        "🤖 ML Insights"
+        "🤖 ML Insights",
+        "🔧 Debug Tools"
     ])
+
 
     with tab1:
         show_live_detection()
@@ -742,6 +934,10 @@ def main():
 
     with tab5:
         show_ml_insights()
+    
+    with tab6:
+        show_debug_tools()
+
 
 
 if __name__ == "__main__":
