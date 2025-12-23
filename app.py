@@ -704,16 +704,76 @@ def show_debug_tools():
             st.session_state.hackrf.stop()
             st.session_state.is_scanning = False
             time.sleep(1)
-        
+    
         with st.spinner(f"Scanning {scan_start} - {scan_end} MHz..."):
-            peaks = st.session_state.debug_tools.spectrum_scan(
+            peaks, raw_spectrum = st.session_state.debug_tools.spectrum_scan(
                 scan_start, scan_end, step=scan_step, duration=0.5
             )
+        
+            # Always show the full spectrum plot
+            st.subheader("📊 Full Spectrum")
+        
+            if raw_spectrum:
+                freqs = [f for f, p in raw_spectrum]
+                powers = [p for f, p in raw_spectrum]
             
+                fig = go.Figure()
+            
+                # Plot all measurements
+                fig.add_trace(go.Scatter(
+                    x=freqs,
+                    y=powers,
+                    mode='lines+markers',
+                    name='Measured Power',
+                    line=dict(color='lightblue', width=2),
+                    marker=dict(size=4)
+                ))
+            
+                # Add threshold line
+                fig.add_hline(
+                    y=-80, 
+                    line_dash="dash", 
+                    line_color="red",
+                    annotation_text="Detection Threshold (-80 dBm)"
+                )
+            
+                # Highlight peaks
+                if peaks:
+                    peak_freqs = [p.frequency for p in peaks]
+                    peak_powers = [p.power for p in peaks]
+                    fig.add_trace(go.Scatter(
+                        x=peak_freqs,
+                        y=peak_powers,
+                        mode='markers',
+                        name='Detected Peaks',
+                        marker=dict(size=12, color='red', symbol='star')
+                    ))
+            
+                fig.update_layout(
+                    title=f'Spectrum Scan: {scan_start} - {scan_end} MHz',
+                    xaxis_title='Frequency (MHz)',
+                    yaxis_title='Power (dBm)',
+                    height=500,
+                    showlegend=True,
+                    hovermode='x unified'
+                )
+            
+                st.plotly_chart(fig, use_container_width=True)
+            
+                # Statistics
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Frequencies Scanned", len(raw_spectrum))
+                with col2:
+                    st.metric("Peaks Found", len(peaks))
+                with col3:
+                    st.metric("Avg Power", f"{np.mean(powers):.1f} dBm")
+                with col4:
+                st.    metric("Max Power", f"{np.max(powers):.1f} dBm")
+        
+            # Show peaks table if any
             if peaks:
-                st.success(f"✅ Found {len(peaks)} signals")
-                
-                # Display results
+                st.subheader("🎯 Detected Peaks")
                 peaks_df = pd.DataFrame([
                     {
                         'Frequency (MHz)': f"{p.frequency:.2f}",
@@ -723,27 +783,11 @@ def show_debug_tools():
                     }
                     for p in peaks
                 ])
-                
+            
                 st.dataframe(peaks_df, use_container_width=True, hide_index=True)
-                
-                # Plot spectrum
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=[p.frequency for p in peaks],
-                    y=[p.power for p in peaks],
-                    mode='markers+lines',
-                    marker=dict(size=10, color=[p.snr for p in peaks], colorscale='Viridis', showscale=True),
-                    name='Signal Power'
-                ))
-                fig.update_layout(
-                    title='Spectrum Scan Results',
-                    xaxis_title='Frequency (MHz)',
-                    yaxis_title='Power (dBm)',
-                    height=400
-                )
-                st.plotly_chart(fig, use_container_width=True)
             else:
-                st.info("No significant signals detected")
+                st.info("ℹ️ No peaks detected above -80 dBm threshold")
+
     
     st.divider()
     
@@ -825,17 +869,57 @@ def show_debug_tools():
                 st.error("Hardware not detected")
         
         # Spectrum
-        if results['spectrum_scan']:
-            with st.expander(f"📊 Spectrum Scan ({len(results['spectrum_scan'])} signals)", expanded=True):
-                spectrum_df = pd.DataFrame([
-                    {
-                        'Frequency': f"{p.frequency:.2f} MHz",
-                        'Power': f"{p.power:.1f} dBm",
-                        'SNR': f"{p.snr:.1f} dB"
-                    }
-                    for p in results['spectrum_scan'][:10]
-                ])
-                st.dataframe(spectrum_df, use_container_width=True, hide_index=True)
+        if results['raw_spectrum']:
+            with st.expander(f"📊 Spectrum Scan ({len(results['raw_spectrum'])} frequencies measured)", expanded=True):
+                # Plot full spectrum
+                freqs = [f for f, p in results['raw_spectrum']]
+                powers = [p for f, p in results['raw_spectrum']]
+        
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=freqs,
+                    y=powers,
+                    mode='lines+markers',
+                    name='Power',
+                    line=dict(color='lightblue', width=2),
+                    marker=dict(size=3)
+                ))
+        
+                # Mark TPMS frequencies
+                for tpms_freq in config.FREQUENCIES:
+                    fig.add_vline(
+                        x=tpms_freq,
+                        line_dash="dash",
+                        line_color="green",
+                        annotation_text=f"{tpms_freq} MHz"
+                    )
+        
+                fig.add_hline(y=-80, line_dash="dash", line_color="red", annotation_text="Threshold")
+        
+                fig.update_layout(
+                    title='Complete Spectrum Scan',
+                    xaxis_title='Frequency (MHz)',
+                    yaxis_title='Power (dBm)',
+                    height=400
+                )
+        
+                st.plotly_chart(fig, use_container_width=True)
+        
+                # Show top peaks
+                if results['spectrum_scan']:
+                    st.write("**Top Detected Peaks:**")
+                    spectrum_df = pd.DataFrame([
+                        {
+                            'Frequency': f"{p.frequency:.2f} MHz",
+                            'Power': f"{p.power:.1f} dBm",
+                            'SNR': f"{p.snr:.1f} dB"
+                        }
+                        for p in results['spectrum_scan'][:10]
+                    ])
+                    st.dataframe(spectrum_df, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No peaks above -80 dBm detected")
+
         
         # Modulation
         if results['modulation_analysis']:
