@@ -7,6 +7,10 @@ import time
 import threading
 from queue import Queue
 import numpy as np
+import plotly.graph_objects as go
+from collections import deque
+
+signal_history_queue = deque(maxlen=config.SIGNAL_HISTORY_SIZE)
 
 from config import config
 from database import TPMSDatabase
@@ -18,6 +22,7 @@ import queue
 
 # Global queue for thread-safe communication
 signal_queue = queue.Queue(maxsize=1000)
+signal_history_queue = deque(maxlen=config.SIGNAL_HISTORY_SIZE)
 
 # Page config
 st.set_page_config(
@@ -51,6 +56,55 @@ def signal_callback(iq_samples, signal_strength, frequency):
     except queue.Full:
         pass  # Drop samples if queue is full
 
+def show_signal_histogram():
+    """Display real-time signal strength histogram"""
+    st.subheader("📊 Signal Strength Distribution")
+    
+    if len(signal_history_queue) < 10:
+        st.info("Collecting signal data...")
+        return
+    
+    # Convert to numpy array
+    signal_data = np.array(list(signal_history_queue))
+    
+    # Create histogram
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(
+        x=signal_data,
+        nbinsx=config.HISTOGRAM_BINS,
+        name='Signal Strength',
+        marker_color='lightblue'
+    ))
+    
+    # Add threshold line
+    fig.add_vline(
+        x=config.SIGNAL_THRESHOLD,
+        line_dash="dash",
+        line_color="red",
+        annotation_text="Detection Threshold"
+    )
+    
+    fig.update_layout(
+        title='Signal Strength Distribution (dBm)',
+        xaxis_title='Signal Strength (dBm)',
+        yaxis_title='Count',
+        showlegend=True,
+        height=300
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Statistics
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Mean", f"{np.mean(signal_data):.1f} dBm")
+    with col2:
+        st.metric("Median", f"{np.median(signal_data):.1f} dBm")
+    with col3:
+        st.metric("Max", f"{np.max(signal_data):.1f} dBm")
+    with col4:
+        above_threshold = np.sum(signal_data > config.SIGNAL_THRESHOLD)
+        st.metric("Above Threshold", f"{above_threshold} ({above_threshold/len(signal_data)*100:.1f}%)")
 
 def show_live_detection():
     """Live detection tab"""
@@ -58,11 +112,27 @@ def show_live_detection():
         process_signal_queue()
     
     st.header("Live TPMS Detection")
+    
+    # Add frequency status at top
+    show_frequency_status()
+    
+    st.divider()
+    
+    # Signal histogram
+    show_signal_histogram()
+    
+    st.divider()
+    
+    # Protocol monitoring
+    show_protocol_monitoring()
+    
+    st.divider()
 
     col1, col2 = st.columns([2, 1])
 
     with col1:
         st.subheader("Recent Vehicle Detections")
+
 
         if st.session_state.recent_detections:
             recent = st.session_state.recent_detections[-10:][::-1]
@@ -111,6 +181,59 @@ def show_live_detection():
             time.sleep(1)
             st.rerun()
 
+def show_protocol_monitoring():
+    """Display detected protocols and unknown signals"""
+    st.subheader("🔍 Protocol Detection")
+    
+    if not hasattr(st.session_state, 'decoder'):
+        return
+    
+    # Get protocol statistics
+    stats = st.session_state.decoder.get_protocol_statistics()
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.write("**Unknown Signals Detected**")
+        st.metric("Total Unknown", stats['total_unknown'])
+        
+        if stats['modulation_types']:
+            st.write("**Modulation Types:**")
+            for mod_type, count in stats['modulation_types'].items():
+                st.write(f"- {mod_type}: {count}")
+        else:
+            st.info("No unknown signals detected yet")
+    
+    with col2:
+        st.write("**Signal Characteristics**")
+        
+        if stats['common_baud_rates']:
+            st.write("**Detected Baud Rates:**")
+            for rate in stats['common_baud_rates']:
+                st.write(f"- {rate:,} bps")
+        
+        if stats['avg_signal_strength'] > 0:
+            st.metric("Avg Signal Strength", f"{stats['avg_signal_strength']:.1f} dBm")
+    
+    # Show recent unknown signals
+    unknown_signals = st.session_state.decoder.get_unknown_signals(60)
+    
+    if unknown_signals:
+        st.write("**Recent Unknown Signals (last 60s):**")
+        
+        unknown_df = pd.DataFrame([
+            {
+                'Time': datetime.fromtimestamp(s.timestamp).strftime('%H:%M:%S'),
+                'Frequency': f"{s.frequency:.2f} MHz",
+                'Strength': f"{s.signal_strength:.1f} dBm",
+                'Modulation': s.modulation_type,
+                'Baud Rate': f"{s.baud_rate:,}" if s.baud_rate else "Unknown",
+                'Length': s.packet_length
+            }
+            for s in unknown_signals[-10:]
+        ])
+        
+        st.dataframe(unknown_df, use_container_width=True, hide_index=True)
 
 def show_vehicle_database():
     """Vehicle database tab"""
@@ -186,6 +309,76 @@ def show_vehicle_database():
                     st.progress(prediction['confidence'])
                     st.caption(f"Confidence: {prediction['confidence'] * 100:.0f}%")
 
+def show_frequency_status():
+    """Display frequency hopping status and statistics"""
+    st.subheader("📡 Frequency Status")
+    
+    if not st.session_state.is_scanning:
+        st.info("Start scanning to see frequency statistics")
+        return
+    
+    status = st.session_state.hackrf.get_status()
+    freq_stats = status.get('frequency_stats', {})
+    
+    # Current frequency
+    st.write(f"**Current Frequency:** {status['frequency']:.2f} MHz")
+    
+    # Frequency hopping control
+    col1, col2 = st.columns(2)
+    with col1:
+        hop_enabled = st.checkbox(
+            "Enable Frequency Hopping",
+            value=status.get('frequency_hopping', True),
+            key="freq_hop_toggle"
+        )
+        if hop_enabled != status.get('frequency_hopping'):
+            st.session_state.hackrf.set_frequency_hopping(hop_enabled)
+    
+    with col2:
+        if hop_enabled:
+            hop_interval = st.slider(
+                "Hop Interval (seconds)",
+                min_value=1.0,
+                max_value=30.0,
+                value=status.get('hop_interval', 5.0),
+                step=1.0,
+                key="hop_interval_slider"
+            )
+            if hop_interval != status.get('hop_interval'):
+                st.session_state.hackrf.set_hop_interval(hop_interval)
+    
+    # Frequency statistics table
+    if freq_stats:
+        st.write("**Frequency Statistics:**")
+        
+        freq_df = pd.DataFrame([
+            {
+                'Frequency': f"{freq:.2f} MHz",
+                'Samples': stats['samples'],
+                'Avg Strength': f"{stats['avg_strength']:.1f} dBm",
+                'Detections': stats['detections']
+            }
+            for freq, stats in freq_stats.items()
+        ])
+        
+        st.dataframe(freq_df, use_container_width=True, hide_index=True)
+        
+        # Bar chart of detections per frequency
+        if any(stats['detections'] > 0 for stats in freq_stats.values()):
+            fig = go.Figure(data=[
+                go.Bar(
+                    x=[f"{freq:.2f}" for freq in freq_stats.keys()],
+                    y=[stats['detections'] for stats in freq_stats.values()],
+                    marker_color='lightgreen'
+                )
+            ])
+            fig.update_layout(
+                title='TPMS Detections by Frequency',
+                xaxis_title='Frequency (MHz)',
+                yaxis_title='Detections',
+                height=300
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
 def show_analytics():
     """Analytics tab"""
@@ -393,13 +586,16 @@ def show_ml_insights():
 def process_signal_queue():
     """Process signals from the queue - runs in main Streamlit thread"""
     processed = 0
-    max_batch = 10  # Process up to 10 signals per call
+    max_batch = 10
     
     while not signal_queue.empty() and processed < max_batch:
         try:
             data = signal_queue.get_nowait()
             
-            # Now we're in the main thread, safe to access session_state
+            # Add to signal history for histogram
+            signal_history_queue.append(data['signal_strength'])
+            
+            # Process with decoder
             signals = st.session_state.decoder.process_samples(
                 data['iq_samples'], 
                 data['frequency']
@@ -407,6 +603,9 @@ def process_signal_queue():
 
             for signal in signals:
                 signal.signal_strength = data['signal_strength']
+                
+                # Increment detection count for this frequency
+                st.session_state.hackrf.increment_detection(data['frequency'])
 
                 signal_dict = {
                     'tpms_id': signal.tpms_id,
@@ -445,6 +644,7 @@ def process_signal_queue():
         except Exception as e:
             print(f"Error processing signal: {e}")
             continue
+
 
 
 def main():
