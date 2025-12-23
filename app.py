@@ -667,6 +667,26 @@ def main():
             config.FREQUENCIES,
             index=0
         )
+        # In the sidebar, after frequency selection
+        if st.session_state.is_scanning:
+            st.divider()
+    
+            # Manual gain control
+            with st.expander("⚙️ Advanced Settings"):
+                current_gain = st.session_state.hackrf.current_gain
+                new_gain = st.slider(
+                    "Manual Gain (dB)",
+                    min_value=0,
+                    max_value=47,
+                    value=current_gain,
+                    step=2,
+                    help="Adjust receiver gain (must be even number)"
+                )
+        
+                if new_gain != current_gain and st.button("Apply Gain"):
+                    st.session_state.hackrf.current_gain = new_gain
+                    st.success(f"Gain set to {new_gain} dB (will apply on next hop)")
+
 
         col1, col2 = st.columns(2)
         with col1:
