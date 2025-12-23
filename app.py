@@ -1042,10 +1042,10 @@ def show_debug_tools():
 
                 # Add threshold line
                 fig.add_hline(
-                    y=-80,
+                    y=-85,
                     line_dash="dash",
                     line_color="red",
-                    annotation_text="Detection Threshold (-80 dBm)"
+                    annotation_text="Detection Threshold (-85 dBm)"
                 )
 
                 # Highlight peaks
