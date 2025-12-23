@@ -319,28 +319,39 @@ def show_frequency_status():
     # Current frequency
     st.write(f"**Current Frequency:** {status['frequency']:.2f} MHz")
     
+    # Initialize session state for controls if not exists
+    if 'freq_hop_enabled' not in st.session_state:
+        st.session_state.freq_hop_enabled = status.get('frequency_hopping', True)
+    if 'hop_interval' not in st.session_state:
+        st.session_state.hop_interval = status.get('hop_interval', 30.0)
+    
     # Frequency hopping control
     col1, col2 = st.columns(2)
     with col1:
         hop_enabled = st.checkbox(
             "Enable Frequency Hopping",
-            value=status.get('frequency_hopping', True),
+            value=st.session_state.freq_hop_enabled,
             key="freq_hop_toggle"
         )
-        if hop_enabled != status.get('frequency_hopping'):
+        # Only update if changed
+        if hop_enabled != st.session_state.freq_hop_enabled:
+            st.session_state.freq_hop_enabled = hop_enabled
             st.session_state.hackrf.set_frequency_hopping(hop_enabled)
+            st.rerun()
     
     with col2:
-        if hop_enabled:
+        if st.session_state.freq_hop_enabled:
             hop_interval = st.slider(
                 "Hop Interval (seconds)",
-                min_value=1.0,
-                max_value=30.0,
-                value=status.get('hop_interval', 5.0),
-                step=1.0,
+                min_value=10.0,
+                max_value=60.0,
+                value=st.session_state.hop_interval,
+                step=5.0,
                 key="hop_interval_slider"
             )
-            if hop_interval != status.get('hop_interval'):
+            # Only update if changed
+            if abs(hop_interval - st.session_state.hop_interval) > 0.1:
+                st.session_state.hop_interval = hop_interval
                 st.session_state.hackrf.set_hop_interval(hop_interval)
     
     # Frequency statistics table
@@ -375,6 +386,7 @@ def show_frequency_status():
                 height=300
             )
             st.plotly_chart(fig, use_container_width=True)
+
 
 def show_analytics():
     """Analytics tab"""
