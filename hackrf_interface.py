@@ -4,7 +4,6 @@ from typing import Optional, Callable
 import threading
 import time
 from queue import Queue
-from collections import deque
 from config import config
 import os
 import shutil
@@ -15,13 +14,6 @@ class HackRFInterface:
         self.current_frequency = config.FREQUENCIES[0]
         self.current_gain = config.DEFAULT_GAIN
         self.is_running = False
-        # stderr drain (prevents hackrf_transfer from blocking if stderr pipe fills)
-        self.stderr_tail = deque(maxlen=80)
-        self._stderr_thread = None
-
-        # Throttle callbacks so the UI/decoder can keep up
-        self._last_callback_time = 0.0
-        self._min_callback_interval = 0.08  # seconds
         self.is_hopping = False  # NEW: separate flag for hopping
         self.data_queue = Queue(maxsize=1000)
         self.callback: Optional[Callable] = None
@@ -174,9 +166,6 @@ class HackRFInterface:
                 # Start reading thread
                 self.read_thread = threading.Thread(target=self._read_samples, daemon=True)
                 self.read_thread.start()
-                # Drain stderr to prevent pipe backpressure stalls
-                self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
-                self._stderr_thread.start()
                 
                 # Start frequency hopping thread (only once)
                 if self.frequency_hop_enabled and not hasattr(self, 'hop_thread_started'):
@@ -200,28 +189,6 @@ class HackRFInterface:
                 print(f"❌ Failed to start HackRF: {e}")
                 return False
     
-
-def _drain_stderr(self):
-    """Continuously drain stderr so hackrf_transfer can't block."""
-    try:
-        proc = self.process
-        if not proc or not proc.stderr:
-            return
-        while self.is_running and self.process is proc and proc.poll() is None:
-            line = proc.stderr.readline()
-            if not line:
-                break
-            try:
-                if isinstance(line, bytes):
-                    line = line.decode(errors="ignore")
-                line = line.strip()
-                if line:
-                    self.stderr_tail.append(line)
-            except Exception:
-                pass
-    except Exception:
-        return
-
     def _stop_process_only(self):
         """Stop only the HackRF process, keep threads running"""
         if self.process:
@@ -343,9 +310,6 @@ def _drain_stderr(self):
                         # Restart reading thread
                         self.read_thread = threading.Thread(target=self._read_samples, daemon=True)
                         self.read_thread.start()
-                        # Drain stderr to prevent pipe backpressure stalls
-                        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
-                        self._stderr_thread.start()
                     
                         print(f"✅ Now scanning {new_frequency} MHz")
                     
@@ -365,7 +329,7 @@ def _drain_stderr(self):
     
     def _read_samples(self):
         """Read IQ samples from HackRF"""
-        buffer_size = 65536  # smaller blocks -> better burst detection
+        buffer_size = 262144
     
         while self.is_running and self.process:
             try:
@@ -394,12 +358,11 @@ def _drain_stderr(self):
                 complex_samples = i_samples + 1j * q_samples
             
                 # Calculate signal metrics
-                pwr = (np.abs(complex_samples) ** 2)
-                # TPMS bursts are short; percentile is more sensitive than mean
-                pwr95 = np.percentile(pwr, 95)
-                signal_strength_dbm = 10 * np.log10(pwr95 + 1e-12) - 60
+                power = np.mean(np.abs(complex_samples) ** 2)
+                signal_strength_dbm = 10 * np.log10(power + 1e-10) - 60
             
                 # Store metrics
+                self.signal_history.append(signal_strength_dbm)
                 if len(self.signal_history) > self.max_history_size:
                     self.signal_history.pop(0)
             
@@ -411,12 +374,9 @@ def _drain_stderr(self):
                     # Running average
                     stats['avg_strength'] = (stats['avg_strength'] * (stats['samples'] - 1) + signal_strength_dbm) / stats['samples']
             
-                # Pass to callback (only when likely signal present, and throttled)
-                if self.callback and signal_strength_dbm >= config.DETECTION_THRESHOLD:
-                    now = time.time()
-                    if (now - self._last_callback_time) >= self._min_callback_interval:
-                        self._last_callback_time = now
-                        self.callback(complex_samples, signal_strength_dbm, self.current_frequency)
+                # Pass to callback
+                if self.callback:
+                    self.callback(complex_samples, signal_strength_dbm, self.current_frequency)
             
             except Exception as e:
                 if self.is_running:
@@ -498,8 +458,7 @@ def _drain_stderr(self):
             'sample_rate': config.SAMPLE_RATE,
             'frequency_hopping': self.frequency_hop_enabled,
             'hop_interval': self.hop_interval,
-            'frequency_stats': self.frequency_stats,
-            'stderr_tail': list(self.stderr_tail)[-10:],
+            'frequency_stats': self.frequency_stats
         }
 
 

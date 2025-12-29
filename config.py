@@ -20,8 +20,7 @@ class Config:
     
     # Signal Detection
     MIN_SIGNAL_STRENGTH = -70  # dBm
-    SIGNAL_THRESHOLD = -90  # dBm for detection
-    DETECTION_THRESHOLD = -90  # dBm - minimum power to consider as potential signal
+    SIGNAL_THRESHOLD = -60  # dBm for detection
     
     # Gain Settings
     GAIN_MIN = 0
@@ -33,9 +32,16 @@ class Config:
     FFT_SIZE = 2048
     DECIMATION = 4
     
+    # Vehicle Clustering
+    MIN_SENSORS_FOR_VEHICLE = 1  # Lowered from 4 for testing
+    CLUSTER_TIME_WINDOW = 30  # seconds
+    MIN_SIGNALS_PER_VEHICLE = 1  # Lowered from 4
+    MAX_SIGNAL_AGE = 300  # seconds
+
+    
     # Protocol Detection
     PROTOCOL_DETECTION_ENABLED = True
-    PROTOCOL_MIN_SAMPLES = 100  # Minimum samples before attempting protocol detection
+    PROTOCOL_MIN_SAMPLES = 10  # Minimum samples before attempting protocol detection
     KNOWN_PROTOCOLS = [
         'Toyota/Lexus',
         'Schrader',
@@ -62,5 +68,4 @@ class Config:
     PREDICTION_CONFIDENCE_THRESHOLD = 0.6
 
 config = Config()
-
 
