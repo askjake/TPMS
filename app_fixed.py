@@ -12,7 +12,7 @@ from collections import deque
 # Import config and modules
 from config import config
 from database import TPMSDatabase
-from hackrf_interface import HackRFInterface
+from hackrf_interface_patched import HackRFInterface
 from tpms_decoder import TPMSDecoder
 from ml_engine import VehicleClusteringEngine
 from debug_tools import DebugTools, SpectrumPeak, ModulationAnalysis
@@ -46,31 +46,52 @@ if 'db' not in st.session_state:
     st.session_state.signal_buffer = []
     st.session_state.recent_detections = []
 
+    # Persistent queues/callbacks for cross-rerun thread safety
+    if 'signal_queue' not in st.session_state:
+        st.session_state.signal_queue = queue.Queue(maxsize=1000)
 
-def signal_callback(iq_samples, signal_strength, frequency):
-    """Callback for processing HackRF samples - queue-based"""
-    try:
-        # Put data in queue instead of processing directly
-        signal_queue.put({
-            'iq_samples': iq_samples,
-            'signal_strength': signal_strength,
-            'frequency': frequency,
-            'timestamp': time.time()
-        }, block=False)
-    except queue.Full:
-        pass  # Drop samples if queue is full
+    if 'signal_history_queue' not in st.session_state:
+        st.session_state.signal_history_queue = deque(maxlen=config.SIGNAL_HISTORY_SIZE)
+
+    if 'signal_callback' not in st.session_state:
+        st.session_state.signal_callback = make_signal_callback(st.session_state.signal_queue)
+
+
+
+def make_signal_callback(q: queue.Queue):
+    """Create a HackRF sample callback bound to a *stable* queue.
+
+    Streamlit re-runs the script often. If the HackRF reading thread keeps a reference to a
+    callback function created in a prior run, that callback can end up writing into an old
+    module's globals, while the UI reads from a new queue. Binding the Queue via a closure
+    keeps producer and consumer aligned.
+    """
+
+    def _cb(iq_samples, signal_strength, frequency):
+        try:
+            q.put({
+                'iq_samples': iq_samples,
+                'signal_strength': signal_strength,
+                'frequency': frequency,
+                'timestamp': time.time()
+            }, block=False)
+        except queue.Full:
+            # Drop samples if queue is full
+            pass
+
+    return _cb
 
 
 def show_signal_histogram():
     """Display real-time signal strength histogram"""
     st.subheader("📊 Signal Strength Distribution")
 
-    if len(signal_history_queue) < 10:
+    if len(st.session_state.signal_history_queue) < 10:
         st.info("Collecting signal data...")
         return
 
     # Convert to numpy array
-    signal_data = np.array(list(signal_history_queue))
+    signal_data = np.array(list(st.session_state.signal_history_queue))
 
     # Create histogram
     fig = go.Figure()
@@ -894,17 +915,21 @@ def process_signal_queue():
     processed = 0
     max_batch = 10
 
-    while not signal_queue.empty() and processed < max_batch:
+    q = st.session_state.signal_queue
+    hist = st.session_state.signal_history_queue
+
+    while not q.empty() and processed < max_batch:
         try:
-            data = signal_queue.get_nowait()
+            data = q.get_nowait()
 
             # Add to signal history for histogram
-            signal_history_queue.append(data['signal_strength'])
+            hist.append(data['signal_strength'])
 
             # Process with decoder
             signals = st.session_state.decoder.process_samples(
                 data['iq_samples'],
-                data['frequency']
+                data['frequency'],
+                signal_strength_dbm=data.get('signal_strength')
             )
 
             for signal in signals:
@@ -1303,7 +1328,7 @@ def main():
         with col1:
             if st.button("▶️ Start Scan", disabled=st.session_state.is_scanning):
                 st.session_state.is_scanning = True
-                st.session_state.hackrf.start(frequency, signal_callback)
+                st.session_state.hackrf.start(frequency, st.session_state.signal_callback)
                 st.success("Scanning started!")
 
         with col2:

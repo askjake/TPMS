@@ -12,15 +12,63 @@ from collections import deque
 # Import config and modules
 from config import config
 from database import TPMSDatabase
-from hackrf_interface import HackRFInterface
+from hackrf_interface_fixed import HackRFInterface
 from tpms_decoder import TPMSDecoder
 from ml_engine import VehicleClusteringEngine
 from debug_tools import DebugTools, SpectrumPeak, ModulationAnalysis
 from ml_signal_learning import SignalLearningEngine
 
 # Global queues for thread-safe communication
-signal_queue = queue.Queue(maxsize=1000)
+signal_queue = queue.Queue(maxsize=50)
 signal_history_queue = deque(maxlen=config.SIGNAL_HISTORY_SIZE)
+
+
+
+
+def make_signal_callback(q: queue.Queue, hist: deque):
+    """Create a HackRF sample callback bound to stable queue + history buffer.
+
+    Streamlit reruns the script often. The HackRF reading thread may keep a callback
+    from a prior run, so we bind the queue/deque via closure to avoid split-brain.
+
+    Also: keep the *most recent* IQ blocks (drop oldest when full) so detection doesn't
+    go silent after the first burst.
+    """
+
+    def _cb(iq_samples, signal_strength, frequency):
+        try:
+            # Feed histogram continuously
+            try:
+                hist.append(signal_strength)
+            except Exception:
+                pass
+
+            # Only ship IQ to decoder when signal looks interesting
+            if signal_strength < config.DETECTION_THRESHOLD:
+                return
+
+            payload = {
+                'iq_samples': iq_samples,
+                'signal_strength': signal_strength,
+                'frequency': frequency,
+                'timestamp': time.time()
+            }
+
+            try:
+                q.put(payload, block=False)
+            except queue.Full:
+                try:
+                    q.get_nowait()  # drop oldest
+                except queue.Empty:
+                    pass
+                try:
+                    q.put(payload, block=False)
+                except queue.Full:
+                    pass
+        except Exception:
+            return
+
+    return _cb
 
 # Page config
 st.set_page_config(
@@ -46,31 +94,28 @@ if 'db' not in st.session_state:
     st.session_state.signal_buffer = []
     st.session_state.recent_detections = []
 
+    # Persistent queues/callbacks for cross-rerun thread safety
+    if 'signal_queue' not in st.session_state:
+        st.session_state.signal_queue = queue.Queue(maxsize=50)
 
-def signal_callback(iq_samples, signal_strength, frequency):
-    """Callback for processing HackRF samples - queue-based"""
-    try:
-        # Put data in queue instead of processing directly
-        signal_queue.put({
-            'iq_samples': iq_samples,
-            'signal_strength': signal_strength,
-            'frequency': frequency,
-            'timestamp': time.time()
-        }, block=False)
-    except queue.Full:
-        pass  # Drop samples if queue is full
+    if 'signal_history_queue' not in st.session_state:
+        st.session_state.signal_history_queue = deque(maxlen=config.SIGNAL_HISTORY_SIZE)
+
+    if 'signal_callback' not in st.session_state:
+        st.session_state.signal_callback = make_signal_callback(st.session_state.signal_queue, st.session_state.signal_history_queue)
+
 
 
 def show_signal_histogram():
     """Display real-time signal strength histogram"""
     st.subheader("📊 Signal Strength Distribution")
 
-    if len(signal_history_queue) < 10:
+    if len(st.session_state.signal_history_queue) < 10:
         st.info("Collecting signal data...")
         return
 
     # Convert to numpy array
-    signal_data = np.array(list(signal_history_queue))
+    signal_data = np.array(list(st.session_state.signal_history_queue))
 
     # Create histogram
     fig = go.Figure()
@@ -894,17 +939,21 @@ def process_signal_queue():
     processed = 0
     max_batch = 10
 
-    while not signal_queue.empty() and processed < max_batch:
+    q = st.session_state.signal_queue
+    hist = st.session_state.signal_history_queue
+
+    while not q.empty() and processed < max_batch:
         try:
-            data = signal_queue.get_nowait()
+            data = q.get_nowait()
 
             # Add to signal history for histogram
-            signal_history_queue.append(data['signal_strength'])
+            hist.append(data['signal_strength'])
 
             # Process with decoder
             signals = st.session_state.decoder.process_samples(
                 data['iq_samples'],
-                data['frequency']
+                data['frequency'],
+                signal_strength_dbm=data.get('signal_strength')
             )
 
             for signal in signals:
@@ -1303,7 +1352,7 @@ def main():
         with col1:
             if st.button("▶️ Start Scan", disabled=st.session_state.is_scanning):
                 st.session_state.is_scanning = True
-                st.session_state.hackrf.start(frequency, signal_callback)
+                st.session_state.hackrf.start(frequency, st.session_state.signal_callback)
                 st.success("Scanning started!")
 
         with col2:

@@ -104,8 +104,7 @@ def start_streamlit():
         # Launch streamlit
         subprocess.run([
             'streamlit', 'run', 'app.py',
-            '--server.address', 'localhost',
-            '--server.port', '8501',
+            '--server.address', '0.0.0.0',
             '--browser.serverAddress', 'localhost'
         ])
     except KeyboardInterrupt:
@@ -114,6 +113,7 @@ def start_streamlit():
     except Exception as e:
         print(f"\n❌ Error starting application: {e}")
         sys.exit(1)
+
 
 def main():
     """Main startup sequence"""

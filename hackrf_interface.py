@@ -41,6 +41,66 @@ class HackRFInterface:
         self.auto_tune_enabled = False
         self.last_tune_time = 0
         self.tune_interval = 60
+
+    # Add to HackRFInterface class after __init__
+
+    def set_learning_engine(self, learning_engine):
+        """Set reference to learning engine for adaptive hopping"""
+        self.learning_engine = learning_engine
+        self.adaptive_hopping = True
+
+    def _get_adaptive_hop_schedule(self):
+        """Calculate optimal frequency hopping schedule based on learning"""
+        if not hasattr(self, 'learning_engine') or not self.learning_engine:
+            # No learning engine, use default schedule
+            return [(freq, self.hop_interval) for freq in config.FREQUENCIES]
+    
+        # Get statistics for each frequency
+        schedule = []
+    
+        for freq in config.FREQUENCIES:
+            stats = self.frequency_stats.get(freq, {'samples': 0, 'detections': 0})
+        
+            # Calculate detection rate
+            if stats['samples'] > 100:
+                detection_rate = stats['detections'] / stats['samples']
+            else:
+                detection_rate = 0.1  # Default for new frequencies
+        
+            # Get learned profile confidence
+            optimal_params = self.learning_engine.get_optimal_scan_parameters(freq)
+            profile_confidence = 0.5  # Default
+        
+            # Check if we have a learned profile
+            for key, profile in self.learning_engine.signal_profiles.items():
+                if abs(profile.frequency - freq) < 0.5:
+                    profile_confidence = profile.confidence
+                    break
+            
+            # Calculate dwell time based on detection rate and confidence
+            # Higher detection rate = more time
+            # Higher confidence = less time needed (we know what to look for)
+            base_time = self.hop_interval
+        
+            if detection_rate > 0.05:  # Active frequency
+                # Spend more time on productive frequencies
+                multiplier = 1.0 + (detection_rate * 2.0)
+                # But reduce if we're confident (know what we're looking for)
+                multiplier = multiplier * (1.0 - (profile_confidence * 0.3))
+                dwell_time = base_time * multiplier
+            elif stats['samples'] > 500 and detection_rate < 0.001:
+                # Dead frequency - skip or minimize time
+                dwell_time = base_time * 0.2  # Only 20% of normal time
+            else:
+                dwell_time = base_time
+        
+            # Clamp to reasonable range
+            dwell_time = max(5.0, min(60.0, dwell_time))
+        
+            schedule.append((freq, dwell_time))
+    
+        return schedule
+
     
     def _find_hackrf_transfer(self):
         """Find hackrf_transfer executable"""
@@ -154,35 +214,53 @@ class HackRFInterface:
         print("⏹️  HackRF stopped")
     
     def _frequency_hopper(self):
-        """Automatically hop between frequencies"""
-        print(f"🔄 Frequency hopper started (interval: {self.hop_interval}s)")
-        
-        while self.is_hopping:  # Use is_hopping instead of is_running
+        """Automatically hop between frequencies with adaptive timing"""
+        print(f"🔄 Frequency hopper started (adaptive mode: {hasattr(self, 'adaptive_hopping')})")
+    
+        while self.is_hopping:
             time.sleep(1.0)  # Check every second
-            
+        
             if not self.is_hopping:
                 break
-            
+        
             current_time = time.time()
-            
+        
+            # Get current frequency's dwell time
+            if hasattr(self, 'adaptive_hopping') and self.adaptive_hopping:
+                schedule = self._get_adaptive_hop_schedule()
+                current_dwell = next((dwell for freq, dwell in schedule 
+                                    if abs(freq - self.current_frequency) < 0.01), 
+                                   self.hop_interval)
+            else:
+                current_dwell = self.hop_interval
+        
             # Check if it's time to hop
-            if current_time - self.last_hop_time >= self.hop_interval:
+            if current_time - self.last_hop_time >= current_dwell:
                 # Try to acquire lock with timeout
                 if self.restart_lock.acquire(timeout=2.0):
                     try:
-                        # Move to next frequency
-                        self.frequency_index = (self.frequency_index + 1) % len(config.FREQUENCIES)
-                        new_frequency = config.FREQUENCIES[self.frequency_index]
+                        # Get next frequency from schedule
+                        if hasattr(self, 'adaptive_hopping') and self.adaptive_hopping:
+                            schedule = self._get_adaptive_hop_schedule()
+                            # Find current index
+                            current_idx = next((i for i, (freq, _) in enumerate(schedule) 
+                                              if abs(freq - self.current_frequency) < 0.01), 0)
+                            next_idx = (current_idx + 1) % len(schedule)
+                            new_frequency, next_dwell = schedule[next_idx]
                         
-                        print(f"🔄 Hopping to {new_frequency} MHz (from {self.current_frequency} MHz)")
-                        
-                        # Stop current process only
+                            print(f"🔄 Adaptive hop to {new_frequency} MHz (dwell: {next_dwell:.1f}s)")
+                        else:
+                            # Standard hopping
+                            self.frequency_index = (self.frequency_index + 1) % len(config.FREQUENCIES)
+                            new_frequency = config.FREQUENCIES[self.frequency_index]
+                            print(f"🔄 Hopping to {new_frequency} MHz (from {self.current_frequency} MHz)")
+                    
+                        # Stop current reception
                         self._stop_process_only()
-                        
+                    
                         # Wait for settling
-                        print(f"⏳ Settling for {config.FREQUENCY_HOP_DWELL_TIME}s...")
                         time.sleep(config.FREQUENCY_HOP_DWELL_TIME)
-                        
+                    
                         if not self.is_hopping:
                             print("⏹️  Hopping cancelled (disabled)")
                             break
@@ -190,9 +268,14 @@ class HackRFInterface:
                         # Update frequency
                         self.current_frequency = new_frequency
                         self.last_hop_time = current_time
-                        
-                        # Ensure gain is valid
-                        self.current_gain = (self.current_gain // 2) * 2
+                    
+                        # Get optimal gain from learning engine if available
+                        if hasattr(self, 'learning_engine') and self.learning_engine:
+                            optimal_params = self.learning_engine.get_optimal_scan_parameters(new_frequency)
+                            self.current_gain = optimal_params['gain']
+                        else:
+                            # Ensure gain is valid
+                            self.current_gain = (self.current_gain // 2) * 2
                         
                         # Build command
                         cmd = [
@@ -204,9 +287,9 @@ class HackRFInterface:
                             '-l', '32',
                             '-a', '1'
                         ]
-                        
-                        print(f"▶️  Starting on {self.current_frequency} MHz...")
-                        
+                    
+                        print(f"▶️  Starting on {self.current_frequency} MHz (gain: {self.current_gain} dB)...")
+                    
                         # Start new process
                         self.process = subprocess.Popen(
                             cmd,
@@ -214,7 +297,7 @@ class HackRFInterface:
                             stderr=subprocess.PIPE,
                             bufsize=0
                         )
-                        
+                    
                         # Check if started successfully
                         time.sleep(0.5)
                         if self.process.poll() is not None:
@@ -223,13 +306,13 @@ class HackRFInterface:
                             self.is_running = False
                             self.is_hopping = False
                             break
-                        
+                    
                         # Restart reading thread
                         self.read_thread = threading.Thread(target=self._read_samples, daemon=True)
                         self.read_thread.start()
-                        
-                        print(f"✅ Now scanning {new_frequency} MHz (gain: {self.current_gain} dB)")
-                        
+                    
+                        print(f"✅ Now scanning {new_frequency} MHz")
+                    
                     except Exception as e:
                         print(f"❌ Error during frequency hop: {e}")
                         import traceback
@@ -240,8 +323,9 @@ class HackRFInterface:
                     # Lock timeout
                     print("⏭️  Skipping hop (device busy, lock timeout)")
                     self.last_hop_time = current_time  # Reset timer to avoid rapid retries
-        
+    
         print("🛑 Frequency hopper stopped")
+
     
     def _read_samples(self):
         """Read IQ samples from HackRF"""
@@ -376,4 +460,5 @@ class HackRFInterface:
             'hop_interval': self.hop_interval,
             'frequency_stats': self.frequency_stats
         }
+
 

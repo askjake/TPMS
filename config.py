@@ -18,9 +18,17 @@ class Config:
     FREQUENCY_HOP_INTERVAL = 30.0  # seconds per frequency
     FREQUENCY_HOP_DWELL_TIME = 1.1  # settling time after hop
     
-    # Signal Detection
-    MIN_SIGNAL_STRENGTH = -70  # dBm
-    SIGNAL_THRESHOLD = -60  # dBm for detection
+    # Signal Detection - Based on successful captures
+    MIN_SIGNAL_STRENGTH = -90  # dBm (lowered from -70)
+    SIGNAL_THRESHOLD = -90  # dBm for detection
+    DETECTION_THRESHOLD = -90  # dBm - captures worked at -86 dBm
+    PEAK_POWER_THRESHOLD = -90  # dBm (lowered from -85)
+
+    # Vehicle Clustering - Allow single sensor detection
+    MIN_SENSORS_FOR_VEHICLE = 1  # Show even single sensors
+    CLUSTER_TIME_WINDOW = 30  # seconds
+    MIN_SIGNALS_PER_VEHICLE = 1
+
     
     # Gain Settings
     GAIN_MIN = 0
@@ -61,4 +69,3 @@ class Config:
     PREDICTION_CONFIDENCE_THRESHOLD = 0.6
 
 config = Config()
-

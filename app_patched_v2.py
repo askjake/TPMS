@@ -12,14 +12,14 @@ from collections import deque
 # Import config and modules
 from config import config
 from database import TPMSDatabase
-from hackrf_interface import HackRFInterface
+from hackrf_interface_fixed_v2 import HackRFInterface
 from tpms_decoder import TPMSDecoder
 from ml_engine import VehicleClusteringEngine
 from debug_tools import DebugTools, SpectrumPeak, ModulationAnalysis
 from ml_signal_learning import SignalLearningEngine
 
 # Global queues for thread-safe communication
-signal_queue = queue.Queue(maxsize=1000)
+signal_queue = queue.Queue(maxsize=50)  # keep most-recent blocks; avoid RAM blowups
 signal_history_queue = deque(maxlen=config.SIGNAL_HISTORY_SIZE)
 
 # Page config
@@ -47,18 +47,47 @@ if 'db' not in st.session_state:
     st.session_state.recent_detections = []
 
 
+
 def signal_callback(iq_samples, signal_strength, frequency):
-    """Callback for processing HackRF samples - queue-based"""
+    """Callback for processing HackRF samples.
+
+    Fixes:
+      - Record strength for histogram even if we drop IQ.
+      - Keep MOST RECENT IQ blocks (drop oldest when full) instead of going silent.
+      - Only enqueue IQ when above detection threshold.
+    """
     try:
-        # Put data in queue instead of processing directly
-        signal_queue.put({
+        # Keep histogram fed regardless of IQ throttling
+        try:
+            signal_history_queue.append(signal_strength)
+        except Exception:
+            pass
+
+        if signal_strength < config.DETECTION_THRESHOLD:
+            return
+
+        payload = {
             'iq_samples': iq_samples,
             'signal_strength': signal_strength,
             'frequency': frequency,
             'timestamp': time.time()
-        }, block=False)
-    except queue.Full:
-        pass  # Drop samples if queue is full
+        }
+
+        try:
+            signal_queue.put(payload, block=False)
+        except queue.Full:
+            # Drop oldest, keep newest
+            try:
+                signal_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                signal_queue.put(payload, block=False)
+            except queue.Full:
+                pass
+    except Exception:
+        return
+
 
 
 def show_signal_histogram():
@@ -892,15 +921,11 @@ def show_ml_learning():
 def process_signal_queue():
     """Process signals from the queue - runs in main Streamlit thread"""
     processed = 0
-    max_batch = 10
+    max_batch = 50
 
     while not signal_queue.empty() and processed < max_batch:
         try:
             data = signal_queue.get_nowait()
-
-            # Add to signal history for histogram
-            signal_history_queue.append(data['signal_strength'])
-
             # Process with decoder
             signals = st.session_state.decoder.process_samples(
                 data['iq_samples'],
