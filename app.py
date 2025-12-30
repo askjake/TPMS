@@ -101,6 +101,42 @@ def show_signal_histogram():
     with col4:
         above_threshold = np.sum(signal_data > config.SIGNAL_THRESHOLD)
         st.metric("Above Threshold", f"{above_threshold} ({above_threshold/len(signal_data)*100:.1f}%)")
+        
+def show_reference_signals():
+    """Display reference 'happy path' signals"""
+    from reference_signals import REFERENCE_SIGNALS, get_reference_characteristics
+    
+    st.subheader("📌 Reference Signals (Happy Path)")
+    st.caption("These known-good captures anchor the ML learning system")
+    
+    for ref_name, ref_data in REFERENCE_SIGNALS.items():
+        with st.expander(f"🎯 {ref_data['protocol']} - {ref_data['tpms_id']}"):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Frequency", f"{ref_data['frequency']} MHz")
+                st.metric("Signal Strength", f"{ref_data['signal_strength']} dBm")
+            with col2:
+                st.metric("Protocol", ref_data['protocol'])
+                st.metric("Modulation", ref_data['modulation'])
+            with col3:
+                st.metric("TPMS ID", ref_data['tpms_id'])
+                st.caption(ref_data['timestamp'])
+            
+            st.info(f"📝 {ref_data['notes']}")
+    
+    # Show reference characteristics
+    ref_chars = get_reference_characteristics()
+    st.divider()
+    st.subheader("🎯 Detection Parameters (from references)")
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Frequency Range", f"{ref_chars['frequency_range'][0]}-{ref_chars['frequency_range'][1]} MHz")
+    with col2:
+        st.metric("Min Signal Strength", f"{ref_chars['min_signal_strength']} dBm")
+    with col3:
+        st.metric("Typical Strength", f"{ref_chars['typical_strength']} dBm")
+
 
 def show_live_detection():
     """Live detection tab"""
@@ -720,16 +756,20 @@ def main():
         recent_signals = st.session_state.db.get_recent_signals(3600)
         st.metric("Signals (1hr)", len(recent_signals))
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "🎯 Live Detection",
+        "📌 Reference Signals",
         "🚗 Vehicle Database",
         "📈 Analytics",
         "🔧 Maintenance",
         "🤖 ML Insights"
     ])
 
-    with tab1:
+    with tab0:
         show_live_detection()
+    
+    with tab1:
+        show_reference_signals()  # NEW
 
     with tab2:
         show_vehicle_database()
