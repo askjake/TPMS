@@ -700,7 +700,7 @@ def main():
 
         frequency = st.selectbox(
             "Frequency (MHz)",
-            config.config.FREQUENCIES,
+            config.FREQUENCIES,
             index=0
         )
         
@@ -725,9 +725,9 @@ def main():
         if st.session_state.is_scanning:
             st.divider()
             st.metric("Status", "🟢 Active")
-            st.metric("Frequency", f"{config.config.DEFAULT_FREQUENCY / 1e6:.1f} MHz")
-            st.metric("Sample Rate", f"{config.config.SAMPLE_RATE / 1e6:.2f} MS/s")
-            st.metric("Bandwidth", f"{config.config.BANDWIDTH / 1e6:.2f} MHz")
+            st.metric("Frequency", f"{config.DEFAULT_FREQUENCY / 1e6:.1f} MHz")
+            st.metric("Sample Rate", f"{config.SAMPLE_RATE / 1e6:.2f} MS/s")
+            st.metric("Bandwidth", f"{config.BANDWIDTH / 1e6:.2f} MHz")
             st.caption("🔒 Continuous reception mode (no hopping)")
             
             # Advanced settings
@@ -736,7 +736,7 @@ def main():
                     "LNA Gain (dB)",
                     min_value=0,
                     max_value=40,
-                    value=config.config.DEFAULT_GAIN,
+                    value=config.DEFAULT_GAIN,
                     step=8,
                     help="Adjust receiver gain"
                 )
@@ -745,7 +745,7 @@ def main():
                     "VGA Gain (dB)",
                     min_value=0,
                     max_value=62,
-                    value=config.config.VGA_GAIN,
+                    value=config.VGA_GAIN,
                     step=2,
                     help="Adjust VGA gain"
                 )
@@ -804,6 +804,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 if __name__ == "__main__":
