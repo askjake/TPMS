@@ -10,16 +10,23 @@ import shutil
 
 class HackRFInterface:
     def __init__(self, frequency: float = 314.9e6, sample_rate: int = 2_457_600, gain: int = 20):
-        """Initialize HackRF with settings matching native TPMS app"""
-        self.frequency = frequency
+        """Initialize HackRF with multi-frequency scanning"""
+        self.frequencies = [314.9e6, 315.0e6, 433.92e6]  # All TPMS frequencies
+        self.current_freq_index = 0
+        self.frequency = self.frequencies[self.current_freq_index]
         self.sample_rate = sample_rate
         self.gain = gain
         self.vga_gain = 20
         self.bandwidth = 1_750_000
         self.process = None
-        self.running = False  # This is the correct attribute name
+        self.running = False
         self.callback = None
         self.read_thread = None
+    
+        # Frequency hopping
+        self.enable_freq_hopping = True
+        self.hop_interval = 10.0  # seconds per frequency
+        self.last_hop_time = time.time()
         
         # Signal tracking
         self.signal_history = []
@@ -104,12 +111,20 @@ class HackRFInterface:
         print("✅ HackRF stopped")
 
     def _read_samples(self):
-        """Read samples continuously without interruption"""
+        """Read samples with frequency hopping"""
         print("📡 Sample reader thread started")
         buffer_size = config.SIGNAL_BUFFER_SIZE
-        
+    
         while self.running and self.process:
             try:
+                # Check if it's time to hop frequencies
+                if self.enable_freq_hopping:
+                    current_time = time.time()
+                    if current_time - self.last_hop_time >= self.hop_interval:
+                        self._hop_frequency()
+                        self.last_hop_time = current_time
+            
+                # Read samples
                 data = self.process.stdout.read(buffer_size)
                 if not data:
                     break
@@ -163,6 +178,19 @@ class HackRFInterface:
         
         print("📡 Sample reader thread stopped")
 
+    def _hop_frequency(self):
+        """Hop to next frequency"""
+        self.current_freq_index = (self.current_freq_index + 1) % len(self.frequencies)
+        new_freq = self.frequencies[self.current_freq_index]
+    
+        print(f"🔄 Hopping to {new_freq / 1e6:.1f} MHz")
+    
+        # Restart HackRF on new frequency
+        self.stop()
+        time.sleep(0.5)
+        self.frequency = new_freq
+        self.start(self.callback)
+
     def increment_detection(self, frequency: float):
         """Increment detection count for a frequency"""
         if frequency in self.frequency_stats:
@@ -182,3 +210,4 @@ class HackRFInterface:
                 freq / 1e6: stats for freq, stats in self.frequency_stats.items()
             }
         }
+
