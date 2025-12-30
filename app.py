@@ -16,6 +16,7 @@ from database import TPMSDatabase
 from hackrf_interface import HackRFInterface
 from tpms_decoder import TPMSDecoder
 from ml_engine import VehicleClusteringEngine
+from esp32_trigger_controller import ESP32TriggerController
 
 # Global queues for thread-safe communication
 signal_queue = queue.Queue(maxsize=1000)
@@ -43,6 +44,9 @@ if 'db' not in st.session_state:
 if 'trigger' not in st.session_state:
     st.session_state.trigger = TPMSTrigger()
     st.session_state.dual_mode = DualModeTPMS(st.session_state.hackrf)
+
+if 'esp32_trigger' not in st.session_state:
+    st.session_state.esp32_trigger = ESP32TriggerController("192.168.4.1")
 
 
 def signal_callback(iq_samples, signal_strength, frequency):
@@ -695,9 +699,23 @@ def process_signal_queue():
             print(f"Error processing signal: {e}")
             continue
 
+# Update show_trigger_controls()
 def show_trigger_controls():
-    """Sensor triggering and programming controls"""
-    st.header("📡 TPMS Sensor Trigger & Programming")
+    """ESP32 LF Trigger Controls"""
+    st.header("📡 ESP32 LF Trigger Control")
+    
+    # Connection status
+    if st.session_state.esp32_trigger.connected:
+        st.success("✅ ESP32 Connected")
+    else:
+        st.error("❌ ESP32 Not Connected")
+        if st.button("🔄 Reconnect"):
+            st.session_state.esp32_trigger.check_connection()
+            st.rerun()
+    
+    if not st.session_state.esp32_trigger.connected:
+        st.info("Connect to WiFi network: **TPMS_Trigger** (password: tpms12345)")
+        return
     
     st.info("⚠️  **Warning:** Transmitting requires proper licensing and should only be used in controlled environments.")
     
