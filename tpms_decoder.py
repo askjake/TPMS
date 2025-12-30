@@ -41,6 +41,92 @@ class TPMSDecoder:
         self._init_protocol_patterns()
 
     # Add to TPMSDecoder class after __init__
+    def _demodulate_fsk(self, iq_samples, symbol_rate=19200):
+    """
+    FSK demodulation matching HackRF native app
+    Used for Schrader sensors (most common)
+    """
+    # Calculate instantaneous frequency
+    phase = np.angle(iq_samples)
+    freq = np.diff(np.unwrap(phase)) * self.sample_rate / (2 * np.pi)
+    
+    # Detect frequency shifts (FSK modulation)
+    # Positive freq = '1', negative freq = '0'
+    threshold = 0
+    bits = (freq > threshold).astype(int)
+    
+    return bits
+
+def _demodulate_ook(self, iq_samples, symbol_rate=8192):
+    """
+    OOK (On-Off Keying) demodulation
+    Used for some Schrader sensors
+    """
+    # Calculate amplitude (envelope detection)
+    amplitude = np.abs(iq_samples)
+    
+    # Smooth the amplitude
+    window_size = int(self.sample_rate / symbol_rate / 4)
+    if window_size < 1:
+        window_size = 1
+    
+    smoothed = np.convolve(amplitude, np.ones(window_size)/window_size, mode='same')
+    
+    # Threshold detection
+    threshold = np.mean(smoothed) + 0.5 * np.std(smoothed)
+    bits = (smoothed > threshold).astype(int)
+    
+    return bits
+
+def decode_packet(self, data: dict) -> Optional[dict]:
+    """
+    Decode TPMS packet using both FSK and OOK demodulation
+    Matches HackRF native app logic
+    """
+    try:
+        iq_samples = data['samples']
+        
+        if len(iq_samples) < 1000:
+            return None
+        
+        # Try FSK demodulation first (most common)
+        fsk_bits = self._demodulate_fsk(iq_samples, symbol_rate=config.SYMBOL_RATE_FSK)
+        fsk_result = self._try_decode_protocols(fsk_bits, 'FSK')
+        
+        if fsk_result:
+            return fsk_result
+        
+        # Try OOK demodulation
+        ook_bits = self._demodulate_ook(iq_samples, symbol_rate=config.SYMBOL_RATE_OOK)
+        ook_result = self._try_decode_protocols(ook_bits, 'OOK')
+        
+        if ook_result:
+            return ook_result
+        
+        return None
+        
+    except Exception as e:
+        print(f"⚠️  Decode error: {e}")
+        return None
+
+def _try_decode_protocols(self, bits, modulation_type):
+    """Try all known protocols on the bit stream"""
+    # Look for preamble patterns
+    # Schrader: 0x55 0x55 (alternating pattern)
+    # Toyota: specific preamble
+    
+    # Convert bits to bytes
+    if len(bits) < 64:
+        return None
+    
+    # Try to find sync pattern
+    for protocol in ['Schrader', 'Toyota/Lexus', 'Continental', 'TRW']:
+        result = self._decode_protocol(bits, protocol, modulation_type)
+        if result:
+            return result
+    
+    return None
+
 
     def set_learning_engine(self, learning_engine):
         """Set reference to learning engine for adaptive decoding"""
@@ -466,4 +552,5 @@ class TPMSDecoder:
             'common_baud_rates': list(set(baud_rates)) if baud_rates else [],
             'avg_signal_strength': np.mean([s.signal_strength for s in recent_unknown]) if recent_unknown else 0
         }
+
 
