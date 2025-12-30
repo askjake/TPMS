@@ -1,3 +1,4 @@
+
 """
 Configuration for TPMS Tracker
 Optimized to match native HackRF TPMS app performance
@@ -83,6 +84,13 @@ class Config:
     # ML Settings
     MIN_ENCOUNTERS_FOR_PREDICTION = 5
     PREDICTION_CONFIDENCE_THRESHOLD = 0.6
+    
+    # Trigger Settings
+    LF_TRIGGER_FREQUENCY = 125000  # 125 kHz
+    TRIGGER_PULSE_WIDTH = 0.1      # 100ms
+    TRIGGER_TX_GAIN = 47           # Maximum TX gain
+    ENABLE_TRIGGER = True          # Enable trigger functionality
+
 
 # Create singleton instance
 config = Config()
