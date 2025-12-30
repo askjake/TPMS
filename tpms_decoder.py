@@ -6,7 +6,7 @@ from scipy import signal as scipy_signal
 from dataclasses import dataclass
 from typing import List, Optional, Dict
 import time
-from config import config
+import config
 
 @dataclass
 class TPMSSignal:
@@ -552,6 +552,7 @@ class TPMSDecoder:
             'common_baud_rates': list(set(baud_rates)) if baud_rates else [],
             'avg_signal_strength': np.mean([s.signal_strength for s in recent_unknown]) if recent_unknown else 0
         }
+
 
 
 
