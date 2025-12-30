@@ -8,7 +8,31 @@ import threading
 import queue
 import numpy as np
 from collections import deque
-from tpms_trigger import TPMSTrigger, DualModeTPMS
+from esp32_trigger_controller import ESP32TriggerController
+
+# Add to session state
+if 'esp32_trigger' not in st.session_state:
+    st.session_state.esp32_trigger = ESP32TriggerController("192.168.4.1")
+
+# Update show_trigger_controls()
+def show_trigger_controls():
+    """ESP32 LF Trigger Controls"""
+    st.header("📡 ESP32 LF Trigger Control")
+    
+    # Connection status
+    if st.session_state.esp32_trigger.connected:
+        st.success("✅ ESP32 Connected")
+    else:
+        st.error("❌ ESP32 Not Connected")
+        if st.button("🔄 Reconnect"):
+            st.session_state.esp32_trigger.check_connection()
+            st.rerun()
+    
+    if not st.session_state.esp32_trigger.connected:
+        st.info("Connect to WiFi network: **TPMS_Trigger** (password: tpms12345)")
+        return
+    
+    # Rest of trigger controls...
 
 # Import config and modules
 from config import config
