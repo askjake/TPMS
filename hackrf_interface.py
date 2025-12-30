@@ -4,7 +4,7 @@ from typing import Optional, Callable
 import threading
 import time
 from queue import Queue
-from config import config
+import config
 import os
 import shutil
 
@@ -244,5 +244,6 @@ def _read_samples(self):
             'hop_interval': self.hop_interval,
             'frequency_stats': self.frequency_stats
         }
+
 
 
