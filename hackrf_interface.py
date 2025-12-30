@@ -30,85 +30,85 @@ class HackRFInterface:
         print(f"   Bandwidth: {self.bandwidth:,} Hz")
         print(f"   Frequency: {self.frequency / 1e6:.1f} MHz (FIXED)")
 
-def start(self, callback):
-    """Start HackRF with continuous reception (no hopping)"""
-    if self.running:
-        print("⚠️  HackRF already running")
-        return False
+    def start(self, callback):
+        """Start HackRF with continuous reception (no hopping)"""
+        if self.running:
+            print("⚠️  HackRF already running")
+            return False
     
-    self.callback = callback
+        self.callback = callback
     
-    # Build command with optimized parameters
-    cmd = [
-        'hackrf_transfer',
-        '-r', '-',  # Read to stdout
-        '-f', str(int(self.frequency)),
-        '-s', str(self.sample_rate),
-        '-g', str(self.gain),
-        '-l', str(self.vga_gain),
-        '-a', '1',  # Enable RF amp
-        '-b', str(self.bandwidth),  # Set bandwidth explicitly
-    ]
+        # Build command with optimized parameters
+        cmd = [
+            'hackrf_transfer',
+            '-r', '-',  # Read to stdout
+            '-f', str(int(self.frequency)),
+            '-s', str(self.sample_rate),
+            '-g', str(self.gain),
+            '-l', str(self.vga_gain),
+            '-a', '1',  # Enable RF amp
+            '-b', str(self.bandwidth),  # Set bandwidth explicitly
+        ]
     
-    print(f"🚀 Starting continuous reception on {self.frequency / 1e6:.1f} MHz")
-    print(f"   Command: {' '.join(cmd)}")
+        print(f"🚀 Starting continuous reception on {self.frequency / 1e6:.1f} MHz")
+        print(f"   Command: {' '.join(cmd)}")
     
-    try:
-        self.process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=config.SIGNAL_BUFFER_SIZE  # Larger buffer
-        )
-        
-        self.running = True
-        
-        # Start reading thread
-        self.read_thread = threading.Thread(target=self._read_samples, daemon=True)
-        self.read_thread.start()
-        
-        print("✅ HackRF started in continuous mode")
-        return True
-        
-    except Exception as e:
-        print(f"❌ Failed to start HackRF: {e}")
-        return False
-
-def _read_samples(self):
-    """Read samples continuously without interruption"""
-    print("📡 Sample reader thread started")
-    
-    while self.running and self.process:
         try:
-            # Read larger chunks for efficiency
-            chunk = self.process.stdout.read(config.SIGNAL_BUFFER_SIZE)
-            
-            if not chunk:
-                break
-            
-            if self.callback:
-                # Convert to complex samples
-                samples = np.frombuffer(chunk, dtype=np.uint8).astype(np.float32)
-                samples = (samples - 127.5) / 127.5
-                
-                # Create I/Q pairs
-                if len(samples) % 2 == 0:
-                    iq_samples = samples[::2] + 1j * samples[1::2]
-                    
-                    # Call decoder callback
-                    self.callback({
-                        'samples': iq_samples,
-                        'frequency': self.frequency,
-                        'sample_rate': self.sample_rate,
-                        'timestamp': time.time()
-                    })
-                    
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=config.SIGNAL_BUFFER_SIZE  # Larger buffer
+            )
+        
+            self.running = True
+        
+            # Start reading thread
+            self.read_thread = threading.Thread(target=self._read_samples, daemon=True)
+            self.read_thread.start()
+        
+            print("✅ HackRF started in continuous mode")
+            return True
+        
         except Exception as e:
-            if self.running:
-                print(f"⚠️  Error reading samples: {e}")
-            break
+            print(f"❌ Failed to start HackRF: {e}")
+            return False
+
+    def _read_samples(self):
+        """Read samples continuously without interruption"""
+        print("📡 Sample reader thread started")
     
-    print("📡 Sample reader thread stopped")
+        while self.running and self.process:
+            try:
+                # Read larger chunks for efficiency
+                chunk = self.process.stdout.read(config.SIGNAL_BUFFER_SIZE)
+            
+                if not chunk:
+                    break
+            
+                if self.callback:
+                    # Convert to complex samples
+                    samples = np.frombuffer(chunk, dtype=np.uint8).astype(np.float32)
+                    samples = (samples - 127.5) / 127.5
+                
+                    # Create I/Q pairs
+                    if len(samples) % 2 == 0:
+                        iq_samples = samples[::2] + 1j * samples[1::2]
+                    
+                        # Call decoder callback
+                        self.callback({
+                            'samples': iq_samples,
+                            'frequency': self.frequency,
+                            'sample_rate': self.sample_rate,
+                            'timestamp': time.time()
+                        })
+                    
+            except Exception as e:
+                if self.running:
+                    print(f"⚠️  Error reading samples: {e}")
+                break
+    
+        print("📡 Sample reader thread stopped")
 
     
     def _read_samples(self):
@@ -244,6 +244,7 @@ def _read_samples(self):
             'hop_interval': self.hop_interval,
             'frequency_stats': self.frequency_stats
         }
+
 
 
 
