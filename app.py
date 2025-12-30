@@ -922,7 +922,7 @@ def main():
             st.metric("Signals/Hour", len(recent_signals))
 
     # Main tabs
-    tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "🎯 Live Detection",
         "📌 Reference Signals",
         "🚗 Vehicle Database",
