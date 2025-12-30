@@ -8,31 +8,6 @@ import threading
 import queue
 import numpy as np
 from collections import deque
-from esp32_trigger_controller import ESP32TriggerController
-
-# Add to session state
-if 'esp32_trigger' not in st.session_state:
-    st.session_state.esp32_trigger = ESP32TriggerController("192.168.4.1")
-
-# Update show_trigger_controls()
-def show_trigger_controls():
-    """ESP32 LF Trigger Controls"""
-    st.header("📡 ESP32 LF Trigger Control")
-    
-    # Connection status
-    if st.session_state.esp32_trigger.connected:
-        st.success("✅ ESP32 Connected")
-    else:
-        st.error("❌ ESP32 Not Connected")
-        if st.button("🔄 Reconnect"):
-            st.session_state.esp32_trigger.check_connection()
-            st.rerun()
-    
-    if not st.session_state.esp32_trigger.connected:
-        st.info("Connect to WiFi network: **TPMS_Trigger** (password: tpms12345)")
-        return
-    
-    # Rest of trigger controls...
 
 # Import config and modules
 from config import config
@@ -63,12 +38,8 @@ if 'db' not in st.session_state:
     st.session_state.is_scanning = False
     st.session_state.signal_buffer = []
     st.session_state.recent_detections = []
-    
-# In the session state initialization section
-if 'trigger' not in st.session_state:
-    st.session_state.trigger = TPMSTrigger()
-    st.session_state.dual_mode = DualModeTPMS(st.session_state.hackrf)
 
+# Initialize ESP32 trigger
 if 'esp32_trigger' not in st.session_state:
     st.session_state.esp32_trigger = ESP32TriggerController("192.168.4.1")
 
@@ -76,7 +47,6 @@ if 'esp32_trigger' not in st.session_state:
 def signal_callback(iq_samples, signal_strength, frequency):
     """Callback for processing HackRF samples - queue-based"""
     try:
-        # Put data in queue instead of processing directly
         signal_queue.put({
             'iq_samples': iq_samples,
             'signal_strength': signal_strength,
@@ -84,7 +54,8 @@ def signal_callback(iq_samples, signal_strength, frequency):
             'timestamp': time.time()
         }, block=False)
     except queue.Full:
-        pass  # Drop samples if queue is full
+        pass
+
 
 def show_signal_histogram():
     """Display real-time signal strength histogram"""
@@ -94,10 +65,8 @@ def show_signal_histogram():
         st.info("Collecting signal data...")
         return
     
-    # Convert to numpy array
     signal_data = np.array(list(signal_history_queue))
     
-    # Create histogram
     fig = go.Figure()
     fig.add_trace(go.Histogram(
         x=signal_data,
@@ -106,7 +75,6 @@ def show_signal_histogram():
         marker_color='lightblue'
     ))
     
-    # Add threshold line
     fig.add_vline(
         x=config.SIGNAL_THRESHOLD,
         line_dash="dash",
@@ -124,7 +92,6 @@ def show_signal_histogram():
     
     st.plotly_chart(fig, use_container_width=True)
     
-    # Statistics
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Mean", f"{np.mean(signal_data):.1f} dBm")
@@ -135,7 +102,8 @@ def show_signal_histogram():
     with col4:
         above_threshold = np.sum(signal_data > config.SIGNAL_THRESHOLD)
         st.metric("Above Threshold", f"{above_threshold} ({above_threshold/len(signal_data)*100:.1f}%)")
-        
+
+
 def show_reference_signals():
     """Display reference 'happy path' signals"""
     from reference_signals import REFERENCE_SIGNALS, get_reference_characteristics
@@ -158,7 +126,6 @@ def show_reference_signals():
             
             st.info(f"📝 {ref_data['notes']}")
     
-    # Show reference characteristics
     ref_chars = get_reference_characteristics()
     st.divider()
     st.subheader("🎯 Detection Parameters (from references)")
@@ -178,27 +145,17 @@ def show_live_detection():
         process_signal_queue()
     
     st.header("Live TPMS Detection")
-    
-    # Add frequency status at top
     show_frequency_status()
-    
     st.divider()
-    
-    # Signal histogram
     show_signal_histogram()
-    
     st.divider()
-    
-    # Protocol monitoring
     show_protocol_monitoring()
-    
     st.divider()
 
     col1, col2 = st.columns([2, 1])
 
     with col1:
         st.subheader("Recent Vehicle Detections")
-
 
         if st.session_state.recent_detections:
             recent = st.session_state.recent_detections[-10:][::-1]
@@ -247,6 +204,7 @@ def show_live_detection():
             time.sleep(1)
             st.rerun()
 
+
 def show_protocol_monitoring():
     """Display detected protocols and unknown signals"""
     st.subheader("🔍 Protocol Detection")
@@ -254,7 +212,6 @@ def show_protocol_monitoring():
     if not hasattr(st.session_state, 'decoder'):
         return
     
-    # Get protocol statistics
     stats = st.session_state.decoder.get_protocol_statistics()
     
     col1, col2 = st.columns(2)
@@ -281,7 +238,6 @@ def show_protocol_monitoring():
         if stats['avg_signal_strength'] > 0:
             st.metric("Avg Signal Strength", f"{stats['avg_signal_strength']:.1f} dBm")
     
-    # Show recent unknown signals
     unknown_signals = st.session_state.decoder.get_unknown_signals(60)
     
     if unknown_signals:
@@ -301,6 +257,7 @@ def show_protocol_monitoring():
         
         st.dataframe(unknown_df, use_container_width=True, hide_index=True)
 
+
 def show_vehicle_database():
     """Vehicle database tab"""
     st.header("Vehicle Database")
@@ -313,11 +270,11 @@ def show_vehicle_database():
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        min_encounters = st.slider("Min Encounters", 1, 50, 1)
+        min_encounters = st.slider("Min Encounters", 1, 50, 1, key="vdb_min_encounters")
     with col2:
-        sort_by = st.selectbox("Sort By", ["Last Seen", "First Seen", "Encounter Count"])
+        sort_by = st.selectbox("Sort By", ["Last Seen", "First Seen", "Encounter Count"], key="vdb_sort")
     with col3:
-        search = st.text_input("Search TPMS ID")
+        search = st.text_input("Search TPMS ID", key="vdb_search")
 
     filtered = [v for v in vehicles if v['encounter_count'] >= min_encounters]
 
@@ -375,6 +332,7 @@ def show_vehicle_database():
                     st.progress(prediction['confidence'])
                     st.caption(f"Confidence: {prediction['confidence'] * 100:.0f}%")
 
+
 def show_frequency_status():
     """Display frequency hopping status and statistics"""
     st.subheader("📡 Frequency Status")
@@ -386,16 +344,13 @@ def show_frequency_status():
     status = st.session_state.hackrf.get_status()
     freq_stats = status.get('frequency_stats', {})
     
-    # Current frequency
     st.write(f"**Current Frequency:** {status['frequency']:.2f} MHz")
     
-    # Initialize session state for controls if not exists
     if 'freq_hop_enabled' not in st.session_state:
-        st.session_state.freq_hop_enabled = status.get('frequency_hopping', True)
+        st.session_state.freq_hop_enabled = status.get('frequency_hopping', False)
     if 'hop_interval' not in st.session_state:
         st.session_state.hop_interval = status.get('hop_interval', 30.0)
     
-    # Frequency hopping control
     col1, col2 = st.columns(2)
     with col1:
         hop_enabled = st.checkbox(
@@ -403,10 +358,10 @@ def show_frequency_status():
             value=st.session_state.freq_hop_enabled,
             key="freq_hop_toggle"
         )
-        # Only update if changed
         if hop_enabled != st.session_state.freq_hop_enabled:
             st.session_state.freq_hop_enabled = hop_enabled
-            st.session_state.hackrf.set_frequency_hopping(hop_enabled)
+            if hasattr(st.session_state.hackrf, 'set_frequency_hopping'):
+                st.session_state.hackrf.set_frequency_hopping(hop_enabled)
             st.rerun()
     
     with col2:
@@ -419,12 +374,11 @@ def show_frequency_status():
                 step=5.0,
                 key="hop_interval_slider"
             )
-            # Only update if changed
             if abs(hop_interval - st.session_state.hop_interval) > 0.1:
                 st.session_state.hop_interval = hop_interval
-                st.session_state.hackrf.set_hop_interval(hop_interval)
+                if hasattr(st.session_state.hackrf, 'set_hop_interval'):
+                    st.session_state.hackrf.set_hop_interval(hop_interval)
     
-    # Frequency statistics table
     if freq_stats:
         st.write("**Frequency Statistics:**")
         
@@ -440,7 +394,6 @@ def show_frequency_status():
         
         st.dataframe(freq_df, use_container_width=True, hide_index=True)
         
-        # Bar chart of detections per frequency
         if any(stats['detections'] > 0 for stats in freq_stats.values()):
             fig = go.Figure(data=[
                 go.Bar(
@@ -468,7 +421,7 @@ def show_analytics():
         st.info("Not enough data for analytics yet. Keep scanning!")
         return
 
-    days = st.slider("Analysis Period (days)", 1, 90, 30)
+    days = st.slider("Analysis Period (days)", 1, 90, 30, key="analytics_days")
 
     col1, col2 = st.columns(2)
 
@@ -582,7 +535,7 @@ def show_maintenance():
         for v in vehicles
     }
 
-    selected_name = st.selectbox("Select Vehicle", list(vehicle_options.keys()))
+    selected_name = st.selectbox("Select Vehicle", list(vehicle_options.keys()), key="maint_vehicle_select")
     vehicle_id = vehicle_options[selected_name]
 
     days = st.slider("Analysis Period (days)", 7, 90, 30, key="maintenance_days")
@@ -661,6 +614,7 @@ def show_ml_insights():
         st.subheader("Detection Patterns")
         st.info("Pattern analysis will appear here as data accumulates.")
 
+
 def process_signal_queue():
     """Process signals from the queue - runs in main Streamlit thread"""
     processed = 0
@@ -670,10 +624,8 @@ def process_signal_queue():
         try:
             data = signal_queue.get_nowait()
             
-            # Add to signal history for histogram
             signal_history_queue.append(data['signal_strength'])
             
-            # Process with decoder
             signals = st.session_state.decoder.process_samples(
                 data['iq_samples'], 
                 data['frequency']
@@ -682,7 +634,6 @@ def process_signal_queue():
             for signal in signals:
                 signal.signal_strength = data['signal_strength']
                 
-                # Increment detection count for this frequency
                 st.session_state.hackrf.increment_detection(data['frequency'])
 
                 signal_dict = {
@@ -701,7 +652,6 @@ def process_signal_queue():
                 st.session_state.db.insert_signal(signal_dict)
                 st.session_state.signal_buffer.append(signal_dict)
 
-            # Process for vehicle clustering
             if len(st.session_state.signal_buffer) > 10:
                 vehicle_ids = st.session_state.ml_engine.process_signals(st.session_state.signal_buffer)
 
@@ -723,17 +673,16 @@ def process_signal_queue():
             print(f"Error processing signal: {e}")
             continue
 
-# Update show_trigger_controls()
+
 def show_trigger_controls():
     """ESP32 LF Trigger Controls"""
     st.header("📡 ESP32 LF Trigger Control")
     
-    # Connection status
     if st.session_state.esp32_trigger.connected:
         st.success("✅ ESP32 Connected")
     else:
         st.error("❌ ESP32 Not Connected")
-        if st.button("🔄 Reconnect"):
+        if st.button("🔄 Reconnect", key="esp32_reconnect_btn"):
             st.session_state.esp32_trigger.check_connection()
             st.rerun()
     
@@ -741,7 +690,7 @@ def show_trigger_controls():
         st.info("Connect to WiFi network: **TPMS_Trigger** (password: tpms12345)")
         return
     
-    st.info("⚠️  **Warning:** Transmitting requires proper licensing and should only be used in controlled environments.")
+    st.info("⚠️  **Warning:** Transmitting requires proper licensing.")
     
     col1, col2 = st.columns(2)
     
@@ -750,13 +699,13 @@ def show_trigger_controls():
         
         protocol = st.selectbox(
             "Trigger Protocol",
-            list(st.session_state.trigger.trigger_patterns.keys()),
+            ["schrader", "toyota", "continental", "generic"],
             key="trigger_protocol_select"
         )
         
         if st.button("📡 Send Single Trigger", key="send_trigger_btn"):
             with st.spinner("Sending trigger..."):
-                st.session_state.trigger.send_trigger(protocol)
+                st.session_state.esp32_trigger.send_trigger(protocol)
                 st.success(f"✅ {protocol.title()} trigger sent!")
         
         st.divider()
@@ -776,75 +725,31 @@ def show_trigger_controls():
         
         with col_a:
             if st.button("▶️ Start Continuous", 
-                        disabled=st.session_state.trigger.is_transmitting,
+                        disabled=st.session_state.esp32_trigger.is_triggering,
                         key="start_continuous_trigger_btn"):
-                st.session_state.trigger.start_continuous_trigger(protocol, trigger_interval)
+                st.session_state.esp32_trigger.start_continuous(protocol, trigger_interval)
                 st.success("Continuous trigger started!")
         
         with col_b:
             if st.button("⏹️ Stop Continuous",
-                        disabled=not st.session_state.trigger.is_transmitting,
+                        disabled=not st.session_state.esp32_trigger.is_triggering,
                         key="stop_continuous_trigger_btn"):
-                st.session_state.trigger.stop_continuous_trigger()
+                st.session_state.esp32_trigger.stop_continuous()
                 st.info("Continuous trigger stopped")
     
     with col2:
-        st.subheader("🎯 Active Scan")
+        st.subheader("📊 Trigger Status")
         
-        st.write("**Trigger and Listen Mode**")
-        st.caption("Send trigger, then listen for sensor responses")
+        status = st.session_state.esp32_trigger.get_status()
         
-        listen_duration = st.slider(
-            "Listen Duration (seconds)",
-            min_value=1.0,
-            max_value=10.0,
-            value=5.0,
-            step=1.0,
-            key="listen_duration_slider"
-        )
-        
-        if st.button("🔍 Trigger & Listen", key="trigger_listen_btn"):
-            with st.spinner(f"Triggering and listening for {listen_duration}s..."):
-                st.session_state.dual_mode.trigger_and_listen(protocol, listen_duration)
-                st.success("Scan complete! Check Live Detection tab for results.")
-        
-        st.divider()
-        
-        st.write("**Multi-Protocol Scan**")
-        st.caption("Try all protocols sequentially")
-        
-        if st.button("🔍 Scan All Protocols", key="scan_all_btn"):
-            with st.spinner("Scanning all protocols..."):
-                st.session_state.dual_mode.scan_and_activate()
-                st.success("Multi-protocol scan complete!")
-    
-    st.divider()
-    
-    # Trigger status
-    st.subheader("📊 Trigger Status")
-    
-    status = st.session_state.trigger.get_status()
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.metric("LF Frequency", f"{status['lf_frequency'] / 1000:.1f} kHz")
-    
-    with col2:
-        st.metric("Status", "🟢 Active" if status['transmitting'] else "🔴 Idle")
-    
-    with col3:
-        if status['transmitting']:
-            st.metric("Trigger Interval", f"{status['trigger_interval']:.1f}s")
-    
-    # Protocol details
-    with st.expander("📋 Available Trigger Protocols"):
-        for proto_name, proto_config in st.session_state.trigger.trigger_patterns.items():
-            st.write(f"**{proto_name.title()}**")
-            st.write(f"- Frequency: {proto_config['frequency'] / 1000:.1f} kHz")
-            st.write(f"- Pulse Width: {proto_config['pulse_width'] * 1000:.0f}ms")
-            st.write(f"- Pulse Count: {proto_config['pulse_count']}")
-            st.divider()
+        if status:
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.metric("LF Frequency", f"{status['lf_frequency'] / 1000:.1f} kHz")
+            
+            with col2:
+                st.metric("Status", "🟢 Active" if status['is_triggering'] else "🔴 Idle")
 
 
 def main():
@@ -854,13 +759,10 @@ def main():
         st.header("⚙️ Control Panel")
         st.subheader("Scanner Control")
 
-
-
         col1, col2 = st.columns(2)
         with col1:
             if st.button("▶️ Start Scan", disabled=st.session_state.is_scanning, key="main_start_btn"):
                 st.session_state.is_scanning = True
-                # Use the correct start() method signature
                 st.session_state.hackrf.start(signal_callback)
                 st.success("Scanning started!")
 
@@ -870,16 +772,14 @@ def main():
                 st.session_state.hackrf.stop()
                 st.info("Scanning stopped")
 
-        # Scanner status display
         if st.session_state.is_scanning:
             st.divider()
             st.metric("Status", "🟢 Active")
             st.metric("Frequency", f"{config.DEFAULT_FREQUENCY / 1e6:.1f} MHz")
             st.metric("Sample Rate", f"{config.SAMPLE_RATE / 1e6:.2f} MS/s")
             st.metric("Bandwidth", f"{config.BANDWIDTH / 1e6:.2f} MHz")
-            st.caption("🔒 Continuous reception mode (no hopping)")
+            st.caption("🔒 Continuous reception mode")
             
-            # Advanced settings
             with st.expander("⚙️ Advanced Settings"):
                 new_gain = st.slider(
                     "LNA Gain (dB)",
@@ -888,7 +788,7 @@ def main():
                     value=config.DEFAULT_GAIN,
                     step=8,
                     help="Adjust receiver gain",
-                    key="main_lna_gain_slider"  # ADD THIS
+                    key="main_lna_gain_slider"
                 )
                 
                 new_vga = st.slider(
@@ -898,11 +798,10 @@ def main():
                     value=config.VGA_GAIN,
                     step=2,
                     help="Adjust VGA gain",
-                    key="main_vga_gain_slider"  # ADD THIS
+                    key="main_vga_gain_slider"
                 )
                 
                 if st.button("Apply Settings", key="main_apply_settings_btn"):
-                    # Restart with new settings
                     st.session_state.hackrf.stop()
                     st.session_state.hackrf.gain = new_gain
                     st.session_state.hackrf.vga_gain = new_vga
@@ -919,20 +818,16 @@ def main():
 
         recent_signals = st.session_state.db.get_recent_signals(3600)
         st.metric("Signals (1hr)", len(recent_signals))
-        
-        # Signals per hour
-        if recent_signals:
-            st.metric("Signals/Hour", len(recent_signals))
 
-    # Main tabs
-    tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    # Main tabs - FIXED: 7 tabs defined, 7 tabs used
+    tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "🎯 Live Detection",
         "📌 Reference Signals",
         "🚗 Vehicle Database",
         "📈 Analytics",
         "🔧 Maintenance",
         "🤖 ML Insights",
-        "📡 Sensor Trigger" 
+        "📡 Sensor Trigger"
     ])
 
     with tab0:
