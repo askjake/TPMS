@@ -54,34 +54,34 @@ class VehicleClusteringEngine:
 
 
     def process_signals(self, signals: List[dict], time_window: float = 30.0) -> List[dict]:
-    """
-    Process signals with minimal filtering (match HackRF behavior)
-    """
-    if not signals:
-        return []
+        """
+            Process signals with minimal filtering (match HackRF behavior)
+        """
+        if not signals:
+            return []
     
-    # Group by TPMS ID only (no complex clustering)
-    vehicles = {}
+        # Group by TPMS ID only (no complex clustering)
+        vehicles = {}
     
-    for signal in signals:
-        tpms_id = signal.get('tpms_id')
-        if not tpms_id:
-            continue
+        for signal in signals:
+            tpms_id = signal.get('tpms_id')
+            if not tpms_id:
+                continue
         
-        # Simple grouping by ID
-        if tpms_id not in vehicles:
-            vehicles[tpms_id] = {
-                'tpms_ids': [tpms_id],
-                'signals': [],
-                'first_seen': signal['timestamp'],
-                'last_seen': signal['timestamp']
-            }
+            # Simple grouping by ID
+            if tpms_id not in vehicles:
+                vehicles[tpms_id] = {
+                    'tpms_ids': [tpms_id],
+                    'signals': [],
+                    'first_seen': signal['timestamp'],
+                    'last_seen': signal['timestamp']
+                }
         
-        vehicles[tpms_id]['signals'].append(signal)
-        vehicles[tpms_id]['last_seen'] = signal['timestamp']
+            vehicles[tpms_id]['signals'].append(signal)
+            vehicles[tpms_id]['last_seen'] = signal['timestamp']
     
-    # Convert to list (accept ALL valid IDs)
-    return list(vehicles.values())
+        # Convert to list (accept ALL valid IDs)
+        return list(vehicles.values())
 
 
     def _cluster_by_time(self, signals: List[Dict], time_window: float = 5.0) -> List[List[Dict]]:
@@ -257,4 +257,5 @@ class VehicleClusteringEngine:
             }
 
         return {'prediction': 'insufficient_data'}
+
 
