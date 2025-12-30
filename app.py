@@ -702,7 +702,7 @@ def main():
             "Frequency (MHz)",
             config.FREQUENCIES,
             index=0,
-            key="main_frequency_select"  # ADD THIS
+            #key="main_frequency_select"  # ADD THIS
         )
         
         # Convert MHz to Hz for HackRF
