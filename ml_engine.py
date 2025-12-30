@@ -6,7 +6,13 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 import time
 
-
+try:
+    from reference_signals import REFERENCE_SIGNALS, get_reference_characteristics
+    HAS_REFERENCES = True
+except ImportError:
+    HAS_REFERENCES = False
+    print("⚠️  reference_signals.py not found - running without reference anchors")
+    
 class VehicleClusteringEngine:
     """ML engine for identifying and tracking vehicles"""
 
@@ -14,6 +20,38 @@ class VehicleClusteringEngine:
         self.db = db
         self.active_clusters = {}  # Current detection window
         self.cluster_timeout = 60  # seconds
+        self.reference_patterns = {}
+        self.load_reference_signals()
+        
+    def load_reference_signals(self):
+        """Load reference 'happy path' signals to anchor learning"""
+        if not HAS_REFERENCES:
+            return
+    
+        print("📌 Loading reference signals...")
+    
+        ref_chars = get_reference_characteristics()
+    
+        for ref_name, ref_data in REFERENCE_SIGNALS.items():
+            # Store reference characteristics
+            pattern_key = f"ref_{ref_data['protocol']}_{ref_data['frequency']}"
+        
+            if not hasattr(self, 'reference_patterns'):
+                self.reference_patterns = {}
+        
+            self.reference_patterns[pattern_key] = {
+                'frequency': ref_data['frequency'],
+                'protocol': ref_data['protocol'],
+                'signal_strength': ref_data['signal_strength'],
+                'modulation': ref_data['modulation'],
+                'weight': 10.0,  # High weight for references
+                'is_reference': True
+            }
+        
+            print(f"   ✅ Loaded reference: {ref_name}")
+    
+        print(f"📊 Loaded {len(self.reference_patterns)} reference patterns")
+
 
     def process_signals(self, signals: List[Dict]) -> List[int]:
         """Process new signals and identify vehicles"""
