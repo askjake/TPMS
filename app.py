@@ -8,6 +8,7 @@ import threading
 import queue
 import numpy as np
 from collections import deque
+from tpms_trigger import TPMSTrigger, DualModeTPMS
 
 # Import config and modules
 from config import config
@@ -37,6 +38,11 @@ if 'db' not in st.session_state:
     st.session_state.is_scanning = False
     st.session_state.signal_buffer = []
     st.session_state.recent_detections = []
+    
+# In the session state initialization section
+if 'trigger' not in st.session_state:
+    st.session_state.trigger = TPMSTrigger()
+    st.session_state.dual_mode = DualModeTPMS(st.session_state.hackrf)
 
 
 def signal_callback(iq_samples, signal_strength, frequency):
@@ -689,6 +695,114 @@ def process_signal_queue():
             print(f"Error processing signal: {e}")
             continue
 
+def show_trigger_controls():
+    """Sensor triggering and programming controls"""
+    st.header("📡 TPMS Sensor Trigger & Programming")
+    
+    st.info("⚠️  **Warning:** Transmitting requires proper licensing and should only be used in controlled environments.")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("🔧 Sensor Activation")
+        
+        protocol = st.selectbox(
+            "Trigger Protocol",
+            list(st.session_state.trigger.trigger_patterns.keys()),
+            key="trigger_protocol_select"
+        )
+        
+        if st.button("📡 Send Single Trigger", key="send_trigger_btn"):
+            with st.spinner("Sending trigger..."):
+                st.session_state.trigger.send_trigger(protocol)
+                st.success(f"✅ {protocol.title()} trigger sent!")
+        
+        st.divider()
+        
+        st.subheader("🔄 Continuous Triggering")
+        
+        trigger_interval = st.slider(
+            "Trigger Interval (seconds)",
+            min_value=0.5,
+            max_value=5.0,
+            value=1.0,
+            step=0.5,
+            key="trigger_interval_slider"
+        )
+        
+        col_a, col_b = st.columns(2)
+        
+        with col_a:
+            if st.button("▶️ Start Continuous", 
+                        disabled=st.session_state.trigger.is_transmitting,
+                        key="start_continuous_trigger_btn"):
+                st.session_state.trigger.start_continuous_trigger(protocol, trigger_interval)
+                st.success("Continuous trigger started!")
+        
+        with col_b:
+            if st.button("⏹️ Stop Continuous",
+                        disabled=not st.session_state.trigger.is_transmitting,
+                        key="stop_continuous_trigger_btn"):
+                st.session_state.trigger.stop_continuous_trigger()
+                st.info("Continuous trigger stopped")
+    
+    with col2:
+        st.subheader("🎯 Active Scan")
+        
+        st.write("**Trigger and Listen Mode**")
+        st.caption("Send trigger, then listen for sensor responses")
+        
+        listen_duration = st.slider(
+            "Listen Duration (seconds)",
+            min_value=1.0,
+            max_value=10.0,
+            value=5.0,
+            step=1.0,
+            key="listen_duration_slider"
+        )
+        
+        if st.button("🔍 Trigger & Listen", key="trigger_listen_btn"):
+            with st.spinner(f"Triggering and listening for {listen_duration}s..."):
+                st.session_state.dual_mode.trigger_and_listen(protocol, listen_duration)
+                st.success("Scan complete! Check Live Detection tab for results.")
+        
+        st.divider()
+        
+        st.write("**Multi-Protocol Scan**")
+        st.caption("Try all protocols sequentially")
+        
+        if st.button("🔍 Scan All Protocols", key="scan_all_btn"):
+            with st.spinner("Scanning all protocols..."):
+                st.session_state.dual_mode.scan_and_activate()
+                st.success("Multi-protocol scan complete!")
+    
+    st.divider()
+    
+    # Trigger status
+    st.subheader("📊 Trigger Status")
+    
+    status = st.session_state.trigger.get_status()
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.metric("LF Frequency", f"{status['lf_frequency'] / 1000:.1f} kHz")
+    
+    with col2:
+        st.metric("Status", "🟢 Active" if status['transmitting'] else "🔴 Idle")
+    
+    with col3:
+        if status['transmitting']:
+            st.metric("Trigger Interval", f"{status['trigger_interval']:.1f}s")
+    
+    # Protocol details
+    with st.expander("📋 Available Trigger Protocols"):
+        for proto_name, proto_config in st.session_state.trigger.trigger_patterns.items():
+            st.write(f"**{proto_name.title()}**")
+            st.write(f"- Frequency: {proto_config['frequency'] / 1000:.1f} kHz")
+            st.write(f"- Pulse Width: {proto_config['pulse_width'] * 1000:.0f}ms")
+            st.write(f"- Pulse Count: {proto_config['pulse_count']}")
+            st.divider()
 
 
 def main():
@@ -775,7 +889,8 @@ def main():
         "🚗 Vehicle Database",
         "📈 Analytics",
         "🔧 Maintenance",
-        "🤖 ML Insights"
+        "🤖 ML Insights",
+        "📡 Sensor Trigger" 
     ])
 
     with tab0:
@@ -795,8 +910,10 @@ def main():
 
     with tab5:
         show_ml_insights()
+        
+    with tab6:
+        show_trigger_controls()
 
 
 if __name__ == "__main__":
     main()
-
