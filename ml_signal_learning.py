@@ -11,6 +11,8 @@ import time
 from dataclasses import dataclass
 from collections import deque
 
+from reference_signals import REFERENCE_SIGNALS, get_reference_characteristics
+
 
 @dataclass
 class SignalProfile:
