@@ -10,25 +10,25 @@ import shutil
 
 class HackRFInterface:
     def __init__(self, frequency: float = 314.9e6, sample_rate: int = 2_457_600, gain: int = 20):
-    """Initialize HackRF with settings matching native TPMS app"""
-    self.frequency = frequency
-    self.sample_rate = sample_rate  # Match native: 2,457,600 Hz
-    self.gain = gain
-    self.vga_gain = 20
-    self.bandwidth = 1_750_000  # Match native: 1.75 MHz
-    self.process = None
-    self.running = False
-    self.callback = None
+        """Initialize HackRF with settings matching native TPMS app"""
+        self.frequency = frequency
+        self.sample_rate = sample_rate  # Match native: 2,457,600 Hz
+        self.gain = gain
+        self.vga_gain = 20
+        self.bandwidth = 1_750_000  # Match native: 1.75 MHz
+        self.process = None
+        self.running = False
+        self.callback = None
     
-    # DISABLE frequency hopping for continuous reception
-    self.frequencies = [314.9e6]  # Stay on primary frequency
-    self.current_freq_index = 0
-    self.adaptive_hopping = False  # Disabled
+        # DISABLE frequency hopping for continuous reception
+        self.frequencies = [314.9e6]  # Stay on primary frequency
+        self.current_freq_index = 0
+        self.adaptive_hopping = False  # Disabled
     
-    print(f"🔧 HackRF configured to match native TPMS app:")
-    print(f"   Sample Rate: {self.sample_rate:,} Hz")
-    print(f"   Bandwidth: {self.bandwidth:,} Hz")
-    print(f"   Frequency: {self.frequency / 1e6:.1f} MHz (FIXED)")
+        print(f"🔧 HackRF configured to match native TPMS app:")
+        print(f"   Sample Rate: {self.sample_rate:,} Hz")
+        print(f"   Bandwidth: {self.bandwidth:,} Hz")
+        print(f"   Frequency: {self.frequency / 1e6:.1f} MHz (FIXED)")
 
 def start(self, callback):
     """Start HackRF with continuous reception (no hopping)"""
@@ -244,4 +244,5 @@ def _read_samples(self):
             'hop_interval': self.hop_interval,
             'frequency_stats': self.frequency_stats
         }
+
 
