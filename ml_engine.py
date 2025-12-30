@@ -53,31 +53,36 @@ class VehicleClusteringEngine:
         print(f"📊 Loaded {len(self.reference_patterns)} reference patterns")
 
 
-    def process_signals(self, signals: List[Dict]) -> List[int]:
-        """Process new signals and identify vehicles"""
-        if not signals:
-            return []
+    def process_signals(self, signals: List[dict], time_window: float = 30.0) -> List[dict]:
+    """
+    Process signals with minimal filtering (match HackRF behavior)
+    """
+    if not signals:
+        return []
+    
+    # Group by TPMS ID only (no complex clustering)
+    vehicles = {}
+    
+    for signal in signals:
+        tpms_id = signal.get('tpms_id')
+        if not tpms_id:
+            continue
+        
+        # Simple grouping by ID
+        if tpms_id not in vehicles:
+            vehicles[tpms_id] = {
+                'tpms_ids': [tpms_id],
+                'signals': [],
+                'first_seen': signal['timestamp'],
+                'last_seen': signal['timestamp']
+            }
+        
+        vehicles[tpms_id]['signals'].append(signal)
+        vehicles[tpms_id]['last_seen'] = signal['timestamp']
+    
+    # Convert to list (accept ALL valid IDs)
+    return list(vehicles.values())
 
-        current_time = time.time()
-        vehicle_ids = []
-
-        # Group signals by time proximity
-        time_clusters = self._cluster_by_time(signals)
-
-        for cluster in time_clusters:
-            # Check if this could be a vehicle (4 TPMS)
-            tpms_ids = list(set([s['tpms_id'] for s in cluster]))
-
-            if len(tpms_ids) >= 3:  # At least 3 sensors (allow for missed signals)
-                # Check if this matches an existing active cluster
-                vehicle_id = self._match_or_create_vehicle(tpms_ids, current_time, cluster)
-                if vehicle_id:
-                    vehicle_ids.append(vehicle_id)
-
-        # Clean up old active clusters
-        self._cleanup_active_clusters(current_time)
-
-        return vehicle_ids
 
     def _cluster_by_time(self, signals: List[Dict], time_window: float = 5.0) -> List[List[Dict]]:
         """Cluster signals that appear close in time"""
@@ -252,3 +257,4 @@ class VehicleClusteringEngine:
             }
 
         return {'prediction': 'insufficient_data'}
+
