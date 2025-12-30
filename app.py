@@ -701,7 +701,8 @@ def main():
         frequency = st.selectbox(
             "Frequency (MHz)",
             config.FREQUENCIES,
-            index=0
+            index=0,
+            key="main_frequency_select"  # ADD THIS
         )
         
         # Convert MHz to Hz for HackRF
@@ -709,14 +710,14 @@ def main():
 
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("▶️ Start Scan", disabled=st.session_state.is_scanning):
+            if st.button("▶️ Start Scan", disabled=st.session_state.is_scanning, key="main_start_btn"):
                 st.session_state.is_scanning = True
                 # Use the correct start() method signature
                 st.session_state.hackrf.start(signal_callback)
                 st.success("Scanning started!")
 
         with col2:
-            if st.button("⏹️ Stop Scan", disabled=not st.session_state.is_scanning):
+            if st.button("⏹️ Stop Scan", disabled=not st.session_state.is_scanning, key="main_stop_btn"):
                 st.session_state.is_scanning = False
                 st.session_state.hackrf.stop()
                 st.info("Scanning stopped")
@@ -738,7 +739,8 @@ def main():
                     max_value=40,
                     value=config.DEFAULT_GAIN,
                     step=8,
-                    help="Adjust receiver gain"
+                    help="Adjust receiver gain",
+                    key="main_lna_gain_slider"  # ADD THIS
                 )
                 
                 new_vga = st.slider(
@@ -747,10 +749,11 @@ def main():
                     max_value=62,
                     value=config.VGA_GAIN,
                     step=2,
-                    help="Adjust VGA gain"
+                    help="Adjust VGA gain",
+                    key="main_vga_gain_slider"  # ADD THIS
                 )
                 
-                if st.button("Apply Settings"):
+                if st.button("Apply Settings", key="main_apply_settings_btn"):
                     # Restart with new settings
                     st.session_state.hackrf.stop()
                     st.session_state.hackrf.gain = new_gain
@@ -804,7 +807,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 if __name__ == "__main__":
