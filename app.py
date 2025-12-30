@@ -10,7 +10,7 @@ import numpy as np
 from collections import deque
 
 # Import config and modules
-import config
+from config import config
 from database import TPMSDatabase
 from hackrf_interface import HackRFInterface
 from tpms_decoder import TPMSDecoder
