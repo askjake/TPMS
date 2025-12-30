@@ -698,15 +698,7 @@ def main():
         st.header("⚙️ Control Panel")
         st.subheader("Scanner Control")
 
-        frequency = st.selectbox(
-            "Frequency (MHz)",
-            config.FREQUENCIES,
-            index=0,
-            #key="main_frequency_select"  # ADD THIS
-        )
-        
-        # Convert MHz to Hz for HackRF
-        frequency_hz = frequency * 1e6
+
 
         col1, col2 = st.columns(2)
         with col1:
