@@ -700,35 +700,19 @@ def main():
 
         frequency = st.selectbox(
             "Frequency (MHz)",
-            config.FREQUENCIES,
+            config.config.FREQUENCIES,
             index=0
         )
-        # In the sidebar, after frequency selection
-        if st.session_state.is_scanning:
-            st.divider()
-    
-            # Manual gain control
-            with st.expander("⚙️ Advanced Settings"):
-                current_gain = st.session_state.hackrf.current_gain
-                new_gain = st.slider(
-                    "Manual Gain (dB)",
-                    min_value=0,
-                    max_value=47,
-                    value=current_gain,
-                    step=2,
-                    help="Adjust receiver gain (must be even number)"
-                )
         
-                if new_gain != current_gain and st.button("Apply Gain"):
-                    st.session_state.hackrf.current_gain = new_gain
-                    st.success(f"Gain set to {new_gain} dB (will apply on next hop)")
-
+        # Convert MHz to Hz for HackRF
+        frequency_hz = frequency * 1e6
 
         col1, col2 = st.columns(2)
         with col1:
             if st.button("▶️ Start Scan", disabled=st.session_state.is_scanning):
                 st.session_state.is_scanning = True
-                st.session_state.hackrf.start(frequency, signal_callback)
+                # Use the correct start() method signature
+                st.session_state.hackrf.start(signal_callback)
                 st.success("Scanning started!")
 
         with col2:
@@ -737,13 +721,42 @@ def main():
                 st.session_state.hackrf.stop()
                 st.info("Scanning stopped")
 
+        # Scanner status display
         if st.session_state.is_scanning:
-            status = st.session_state.hackrf.get_status()
+            st.divider()
             st.metric("Status", "🟢 Active")
-            st.metric("Frequency", f"{status['frequency']:.2f} MHz")
-            st.metric("Gain", f"{status['gain']} dB")
-            if status['avg_signal_strength']:
-                st.metric("Signal", f"{status['avg_signal_strength']:.1f} dBm")
+            st.metric("Frequency", f"{config.config.DEFAULT_FREQUENCY / 1e6:.1f} MHz")
+            st.metric("Sample Rate", f"{config.config.SAMPLE_RATE / 1e6:.2f} MS/s")
+            st.metric("Bandwidth", f"{config.config.BANDWIDTH / 1e6:.2f} MHz")
+            st.caption("🔒 Continuous reception mode (no hopping)")
+            
+            # Advanced settings
+            with st.expander("⚙️ Advanced Settings"):
+                new_gain = st.slider(
+                    "LNA Gain (dB)",
+                    min_value=0,
+                    max_value=40,
+                    value=config.config.DEFAULT_GAIN,
+                    step=8,
+                    help="Adjust receiver gain"
+                )
+                
+                new_vga = st.slider(
+                    "VGA Gain (dB)",
+                    min_value=0,
+                    max_value=62,
+                    value=config.config.VGA_GAIN,
+                    step=2,
+                    help="Adjust VGA gain"
+                )
+                
+                if st.button("Apply Settings"):
+                    # Restart with new settings
+                    st.session_state.hackrf.stop()
+                    st.session_state.hackrf.gain = new_gain
+                    st.session_state.hackrf.vga_gain = new_vga
+                    st.session_state.hackrf.start(signal_callback)
+                    st.success("Settings applied!")
         else:
             st.metric("Status", "🔴 Inactive")
 
@@ -755,7 +768,12 @@ def main():
 
         recent_signals = st.session_state.db.get_recent_signals(3600)
         st.metric("Signals (1hr)", len(recent_signals))
+        
+        # Signals per hour
+        if recent_signals:
+            st.metric("Signals/Hour", len(recent_signals))
 
+    # Main tabs
     tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "🎯 Live Detection",
         "📌 Reference Signals",
@@ -769,7 +787,7 @@ def main():
         show_live_detection()
     
     with tab1:
-        show_reference_signals()  # NEW
+        show_reference_signals()
 
     with tab2:
         show_vehicle_database()
@@ -782,6 +800,10 @@ def main():
 
     with tab5:
         show_ml_insights()
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
