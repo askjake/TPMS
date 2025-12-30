@@ -69,4 +69,3 @@ class Config:
     PREDICTION_CONFIDENCE_THRESHOLD = 0.6
 
 config = Config()
-

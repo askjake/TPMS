@@ -376,4 +376,3 @@ class HackRFInterface:
             'hop_interval': self.hop_interval,
             'frequency_stats': self.frequency_stats
         }
-
