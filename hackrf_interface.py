@@ -1,19 +1,26 @@
+"""
+HackRF Interface - Continuous Reception Mode
+No frequency hopping - uses fixed frequency or manual switching
+ESP32 handles LF triggering separately
+"""
+
 import subprocess
 import numpy as np
-from typing import Optional, Callable
 import threading
 import time
-from queue import Queue
 from config import config
-import os
-import shutil
 
 class HackRFInterface:
     def __init__(self, frequency: float = 314.9e6, sample_rate: int = 2_457_600, gain: int = 20):
-        """Initialize HackRF with multi-frequency scanning"""
-        self.frequencies = [314.9e6, 315.0e6, 433.92e6]  # All TPMS frequencies
-        self.current_freq_index = 0
-        self.frequency = self.frequencies[self.current_freq_index]
+        """
+        Initialize HackRF for continuous reception on a single frequency
+        
+        Args:
+            frequency: Reception frequency in Hz (default 314.9 MHz)
+            sample_rate: Sample rate in Hz (default 2.4576 MS/s)
+            gain: LNA gain in dB (default 20)
+        """
+        self.frequency = frequency
         self.sample_rate = sample_rate
         self.gain = gain
         self.vga_gain = 20
@@ -22,17 +29,12 @@ class HackRFInterface:
         self.running = False
         self.callback = None
         self.read_thread = None
-    
-        # Frequency hopping
-        self.enable_freq_hopping = True
-        self.hop_interval = 10.0  # seconds per frequency
-        self.last_hop_time = time.time()
         
         # Signal tracking
         self.signal_history = []
         self.max_history_size = 100
         
-        # Frequency stats
+        # Frequency stats (single frequency)
         self.current_frequency = frequency
         self.frequency_stats = {
             frequency: {
@@ -42,13 +44,18 @@ class HackRFInterface:
             }
         }
         
-        print(f"🔧 HackRF configured to match native TPMS app:")
+        print(f"🔧 HackRF configured for continuous reception:")
         print(f"   Sample Rate: {self.sample_rate:,} Hz")
         print(f"   Bandwidth: {self.bandwidth:,} Hz")
         print(f"   Frequency: {self.frequency / 1e6:.1f} MHz (FIXED)")
 
     def start(self, callback):
-        """Start HackRF with continuous reception"""
+        """
+        Start HackRF continuous reception
+        
+        Args:
+            callback: Function to call with (iq_samples, signal_strength, frequency)
+        """
         if self.running:
             print("⚠️  HackRF already running")
             return False
@@ -57,12 +64,12 @@ class HackRFInterface:
         
         cmd = [
             'hackrf_transfer',
-            '-r', '-',
+            '-r', '-',  # Read from stdout
             '-f', str(int(self.frequency)),
             '-s', str(self.sample_rate),
             '-g', str(self.gain),
             '-l', str(self.vga_gain),
-            '-a', '1',
+            '-a', '1',  # Enable RF amp
             '-b', str(self.bandwidth),
         ]
         
@@ -110,21 +117,42 @@ class HackRFInterface:
         
         print("✅ HackRF stopped")
 
+    def change_frequency(self, new_frequency: float):
+        """
+        Change reception frequency (requires restart)
+        
+        Args:
+            new_frequency: New frequency in Hz
+        """
+        if self.running:
+            print(f"🔄 Changing frequency to {new_frequency / 1e6:.1f} MHz...")
+            callback_backup = self.callback
+            self.stop()
+            time.sleep(0.5)
+            self.frequency = new_frequency
+            self.current_frequency = new_frequency
+            
+            # Add to stats if not exists
+            if new_frequency not in self.frequency_stats:
+                self.frequency_stats[new_frequency] = {
+                    'samples': 0,
+                    'avg_strength': 0.0,
+                    'detections': 0
+                }
+            
+            self.start(callback_backup)
+        else:
+            self.frequency = new_frequency
+            self.current_frequency = new_frequency
+            print(f"✅ Frequency set to {new_frequency / 1e6:.1f} MHz (will apply on next start)")
+
     def _read_samples(self):
-        """Read samples with frequency hopping"""
+        """Read samples continuously"""
         print("📡 Sample reader thread started")
         buffer_size = config.SIGNAL_BUFFER_SIZE
-    
+        
         while self.running and self.process:
             try:
-                # Check if it's time to hop frequencies
-                if self.enable_freq_hopping:
-                    current_time = time.time()
-                    if current_time - self.last_hop_time >= self.hop_interval:
-                        self._hop_frequency()
-                        self.last_hop_time = current_time
-            
-                # Read samples
                 data = self.process.stdout.read(buffer_size)
                 if not data:
                     break
@@ -178,19 +206,6 @@ class HackRFInterface:
         
         print("📡 Sample reader thread stopped")
 
-    def _hop_frequency(self):
-        """Hop to next frequency"""
-        self.current_freq_index = (self.current_freq_index + 1) % len(self.frequencies)
-        new_freq = self.frequencies[self.current_freq_index]
-    
-        print(f"🔄 Hopping to {new_freq / 1e6:.1f} MHz")
-    
-        # Restart HackRF on new frequency
-        self.stop()
-        time.sleep(0.5)
-        self.frequency = new_freq
-        self.start(self.callback)
-
     def increment_detection(self, frequency: float):
         """Increment detection count for a frequency"""
         if frequency in self.frequency_stats:
@@ -200,14 +215,14 @@ class HackRFInterface:
         """Get current receiver status"""
         return {
             'running': self.running,
-            'frequency': self.current_frequency / 1e6,  # Convert to MHz
+            'frequency': self.current_frequency / 1e6,  # MHz
             'gain': self.gain,
+            'vga_gain': self.vga_gain,
             'avg_signal_strength': np.mean(self.signal_history[-10:]) if self.signal_history else None,
             'sample_rate': self.sample_rate,
-            'frequency_hopping': False,  # Disabled
+            'frequency_hopping': False,  # Always False now
             'hop_interval': 0,
             'frequency_stats': {
                 freq / 1e6: stats for freq, stats in self.frequency_stats.items()
             }
         }
-
