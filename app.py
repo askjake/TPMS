@@ -9,6 +9,34 @@ import queue
 import numpy as np
 from collections import deque
 from esp32_trigger_controller import ESP32TriggerController
+import pytz
+
+# Timezone configuration
+MOUNTAIN_TZ = pytz.timezone('America/Denver')  # Mountain Time with DST support
+
+def format_timestamp(timestamp, format_str="%Y-%m-%d %H:%M:%S", include_timezone=False):
+    """Convert Unix timestamp to Mountain Time formatted string"""
+    if timestamp is None:
+        return "Never"
+    
+    # Convert from UTC to Mountain Time
+    utc_dt = datetime.fromtimestamp(timestamp, tz=pytz.UTC)
+    mountain_dt = utc_dt.astimezone(MOUNTAIN_TZ)
+    
+    if include_timezone:
+        return mountain_dt.strftime(format_str + " %Z")
+    return mountain_dt.strftime(format_str)
+
+def timestamp_to_mountain(timestamp):
+    """Convert Unix timestamp to Mountain Time datetime object"""
+    if timestamp is None:
+        return None
+    utc_dt = datetime.fromtimestamp(timestamp, tz=pytz.UTC)
+    return utc_dt.astimezone(MOUNTAIN_TZ)
+
+def pandas_timestamp_to_mountain(series):
+    """Convert pandas timestamp series to Mountain Time"""
+    return pd.to_datetime(series, unit='s', utc=True).dt.tz_convert(MOUNTAIN_TZ)
 
 # Add to session state
 if 'esp32_trigger' not in st.session_state:
@@ -41,6 +69,34 @@ from hackrf_interface import HackRFInterface
 from tpms_decoder import TPMSDecoder
 from ml_engine import VehicleClusteringEngine
 from esp32_trigger_controller import ESP32TriggerController
+import pytz
+
+# Timezone configuration
+MOUNTAIN_TZ = pytz.timezone('America/Denver')  # Mountain Time with DST support
+
+def format_timestamp(timestamp, format_str="%Y-%m-%d %H:%M:%S", include_timezone=False):
+    """Convert Unix timestamp to Mountain Time formatted string"""
+    if timestamp is None:
+        return "Never"
+    
+    # Convert from UTC to Mountain Time
+    utc_dt = datetime.fromtimestamp(timestamp, tz=pytz.UTC)
+    mountain_dt = utc_dt.astimezone(MOUNTAIN_TZ)
+    
+    if include_timezone:
+        return mountain_dt.strftime(format_str + " %Z")
+    return mountain_dt.strftime(format_str)
+
+def timestamp_to_mountain(timestamp):
+    """Convert Unix timestamp to Mountain Time datetime object"""
+    if timestamp is None:
+        return None
+    utc_dt = datetime.fromtimestamp(timestamp, tz=pytz.UTC)
+    return utc_dt.astimezone(MOUNTAIN_TZ)
+
+def pandas_timestamp_to_mountain(series):
+    """Convert pandas timestamp series to Mountain Time"""
+    return pd.to_datetime(series, unit='s', utc=True).dt.tz_convert(MOUNTAIN_TZ)
 
 # Global queues for thread-safe communication
 signal_queue = queue.Queue(maxsize=1000)
@@ -202,7 +258,7 @@ def show_live_detection():
 
             for detection in recent:
                 vehicle = detection['vehicle']
-                dt = datetime.fromtimestamp(detection['timestamp'])
+                dt = timestamp_to_mountain(detection['timestamp'])
 
                 with st.container():
                     col_a, col_b, col_c = st.columns([2, 2, 1])
@@ -230,7 +286,7 @@ def show_live_detection():
 
         if recent_signals:
             signal_df = pd.DataFrame(recent_signals)
-            signal_df['timestamp'] = pd.to_datetime(signal_df['timestamp'], unit='s')
+            signal_df['timestamp'] = pandas_timestamp_to_mountain(signal_df['timestamp'])
 
             st.dataframe(
                 signal_df[['tpms_id', 'timestamp', 'signal_strength', 'frequency']],
@@ -341,8 +397,8 @@ def show_vehicle_database():
                     st.code(tpms_id, language=None)
 
                 st.write("**Timeline:**")
-                st.write(f"First seen: {datetime.fromtimestamp(vehicle['first_seen']).strftime('%Y-%m-%d %H:%M')}")
-                st.write(f"Last seen: {datetime.fromtimestamp(vehicle['last_seen']).strftime('%Y-%m-%d %H:%M')}")
+                st.write(f"First seen: {format_timestamp(vehicle['first_seen'], '%Y-%m-%d %H:%M')}")
+                st.write(f"Last seen: {format_timestamp(vehicle['last_seen'], '%Y-%m-%d %H:%M')}")
 
                 current_nickname = vehicle.get('nickname', '')
                 new_nickname = st.text_input(
@@ -409,8 +465,8 @@ def render_sensor_database_tab(db):
 
         # Format the dataframe
         display_df = sensors_df.copy()
-        display_df['first_seen'] = pd.to_datetime(display_df['first_seen'], unit='s')
-        display_df['last_seen'] = pd.to_datetime(display_df['last_seen'], unit='s')
+        display_df['first_seen'] = pandas_timestamp_to_mountain(display_df['first_seen'])
+        display_df['last_seen'] = pandas_timestamp_to_mountain(display_df['last_seen'])
         display_df['avg_rssi'] = display_df['avg_rssi'].round(1)
         display_df['avg_pressure'] = display_df['avg_pressure'].round(1)
         display_df['avg_temperature'] = display_df['avg_temperature'].round(1)
@@ -467,8 +523,7 @@ def render_sensor_database_tab(db):
             with stat_col1:
                 st.metric("Total Signals", stats['total_signals'])
                 st.metric("Protocol", stats['protocol'])
-                first_seen = datetime.fromtimestamp(stats['first_seen'])
-                st.metric("First Seen", first_seen.strftime("%Y-%m-%d %H:%M"))
+                st.metric("First Seen", format_timestamp(stats['first_seen'], "%Y-%m-%d %H:%M"))
 
             with stat_col2:
                 st.metric("Avg RSSI", f"{stats['avg_rssi']:.1f} dBm")
@@ -477,8 +532,7 @@ def render_sensor_database_tab(db):
                     st.metric("Avg Pressure", f"{stats['avg_pressure']:.1f} PSI")
 
             with stat_col3:
-                last_seen = datetime.fromtimestamp(stats['last_seen'])
-                st.metric("Last Seen", last_seen.strftime("%Y-%m-%d %H:%M"))
+                st.metric("Last Seen", format_timestamp(stats['last_seen'], "%Y-%m-%d %H:%M"))
                 age_minutes = (time.time() - stats['last_seen']) / 60
                 st.metric("Last Seen", f"{age_minutes:.0f} min ago")
                 if stats['avg_temp']:
@@ -488,7 +542,7 @@ def render_sensor_database_tab(db):
             st.markdown("### Signal Strength History")
             if not history_df.empty:
                 chart_df = history_df[['timestamp', 'signal_strength']].copy()
-                chart_df['timestamp'] = pd.to_datetime(chart_df['timestamp'], unit='s')
+                chart_df['timestamp'] = pandas_timestamp_to_mountain(chart_df['timestamp'])
 
                 fig = px.line(
                     chart_df,
@@ -503,7 +557,7 @@ def render_sensor_database_tab(db):
             if 'pressure_psi' in history_df.columns and history_df['pressure_psi'].notna().any():
                 st.markdown("### Pressure History")
                 pressure_df = history_df[history_df['pressure_psi'].notna()][['timestamp', 'pressure_psi']].copy()
-                pressure_df['timestamp'] = pd.to_datetime(pressure_df['timestamp'], unit='s')
+                pressure_df['timestamp'] = pandas_timestamp_to_mountain(pressure_df['timestamp'])
 
                 fig = px.line(
                     pressure_df,
@@ -517,7 +571,7 @@ def render_sensor_database_tab(db):
             # Raw signal history table
             with st.expander("📊 View Raw Signal History"):
                 display_history = history_df.copy()
-                display_history['timestamp'] = pd.to_datetime(display_history['timestamp'], unit='s')
+                display_history['timestamp'] = pandas_timestamp_to_mountain(display_history['timestamp'])
                 st.dataframe(display_history, use_container_width=True)
 
     with sensor_tab3:
@@ -531,7 +585,7 @@ def render_sensor_database_tab(db):
         else:
             # Display orphaned sensors
             display_orphaned = orphaned_df.copy()
-            display_orphaned['last_seen'] = pd.to_datetime(display_orphaned['last_seen'], unit='s')
+            display_orphaned['last_seen'] = pandas_timestamp_to_mountain(display_orphaned['last_seen'])
             st.dataframe(display_orphaned, use_container_width=True)
 
             # Manual assignment interface
@@ -569,7 +623,7 @@ def render_sensor_database_tab(db):
                         else:
                             st.error("Assignment failed")
             else:
-                st.info("No vehicles in database yet. Vehicles will appear here once detected.")
+                st.info("📝 No vehicles in database yet. Vehicles will appear here once detected during scanning.")
 
 
 def show_frequency_status():
@@ -676,11 +730,12 @@ def show_analytics():
         for vehicle in vehicles:
             history = st.session_state.db.get_vehicle_history(vehicle['id'])
             for encounter in history['encounters']:
+                mt_timestamp = timestamp_to_mountain(encounter['timestamp'])
                 encounter_data.append({
                     'vehicle_id': vehicle['id'],
                     'nickname': vehicle.get('nickname', 'Vehicle ' + str(vehicle['id'])),
-                    'timestamp': datetime.fromtimestamp(encounter['timestamp']),
-                    'date': datetime.fromtimestamp(encounter['timestamp']).date()
+                    'timestamp': mt_timestamp,
+                    'date': mt_timestamp.date()
                 })
 
         if encounter_data:
@@ -730,7 +785,7 @@ def show_analytics():
             {
                 'Vehicle': v.get('nickname', 'Vehicle ' + str(v['id'])),
                 'Encounters': v['encounter_count'],
-                'Last Seen': datetime.fromtimestamp(v['last_seen']).strftime('%Y-%m-%d')
+                'Last Seen': format_timestamp(v['last_seen'], '%Y-%m-%d')
             }
             for v in top_vehicles
         ])
@@ -750,7 +805,9 @@ def show_analytics():
         recent_vehicles = sorted(vehicles, key=lambda x: x['last_seen'], reverse=True)[:5]
 
         for v in recent_vehicles:
-            time_ago = datetime.now() - datetime.fromtimestamp(v['last_seen'])
+            now_mountain = datetime.now(MOUNTAIN_TZ)
+            last_seen_mountain = timestamp_to_mountain(v['last_seen'])
+            time_ago = now_mountain - last_seen_mountain
             hours_ago = time_ago.total_seconds() / 3600
 
             if hours_ago < 1:
@@ -1046,6 +1103,7 @@ def show_trigger_controls():
 
 def main():
     st.title("🚗 TPMS Tracker - Intelligent Vehicle Pattern Recognition")
+    st.caption(f"🕐 Displaying times in Mountain Time (MT)")
 
     with st.sidebar:
         st.header("⚙️ Control Panel")
