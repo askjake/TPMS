@@ -8,59 +8,7 @@ import threading
 import queue
 import numpy as np
 from collections import deque
-from esp32_trigger_controller import ESP32TriggerController
-import pytz
-
-# Timezone configuration
-MOUNTAIN_TZ = pytz.timezone('America/Denver')  # Mountain Time with DST support
-
-def format_timestamp(timestamp, format_str="%Y-%m-%d %H:%M:%S", include_timezone=False):
-    """Convert Unix timestamp to Mountain Time formatted string"""
-    if timestamp is None:
-        return "Never"
-    
-    # Convert from UTC to Mountain Time
-    utc_dt = datetime.fromtimestamp(timestamp, tz=pytz.UTC)
-    mountain_dt = utc_dt.astimezone(MOUNTAIN_TZ)
-    
-    if include_timezone:
-        return mountain_dt.strftime(format_str + " %Z")
-    return mountain_dt.strftime(format_str)
-
-def timestamp_to_mountain(timestamp):
-    """Convert Unix timestamp to Mountain Time datetime object"""
-    if timestamp is None:
-        return None
-    utc_dt = datetime.fromtimestamp(timestamp, tz=pytz.UTC)
-    return utc_dt.astimezone(MOUNTAIN_TZ)
-
-def pandas_timestamp_to_mountain(series):
-    """Convert pandas timestamp series to Mountain Time"""
-    return pd.to_datetime(series, unit='s', utc=True).dt.tz_convert(MOUNTAIN_TZ)
-
-# Add to session state
-if 'esp32_trigger' not in st.session_state:
-    st.session_state.esp32_trigger = ESP32TriggerController("192.168.4.1")
-
-# Update show_trigger_controls()
-def show_trigger_controls():
-    """ESP32 LF Trigger Controls"""
-    st.header("📡 ESP32 LF Trigger Control")
-    
-    # Connection status
-    if st.session_state.esp32_trigger.connected:
-        st.success("✅ ESP32 Connected")
-    else:
-        st.error("❌ ESP32 Not Connected")
-        if st.button("🔄 Reconnect"):
-            st.session_state.esp32_trigger.check_connection()
-            st.rerun()
-    
-    if not st.session_state.esp32_trigger.connected:
-        st.info("Connect to WiFi network: **TPMS_Trigger** (password: tpms12345)")
-        return
-    
-    # Rest of trigger controls...
+from tpms_trigger import TPMSTrigger, DualModeTPMS
 
 # Import config and modules
 from config import config
@@ -68,35 +16,6 @@ from database import TPMSDatabase
 from hackrf_interface import HackRFInterface
 from tpms_decoder import TPMSDecoder
 from ml_engine import VehicleClusteringEngine
-from esp32_trigger_controller import ESP32TriggerController
-import pytz
-
-# Timezone configuration
-MOUNTAIN_TZ = pytz.timezone('America/Denver')  # Mountain Time with DST support
-
-def format_timestamp(timestamp, format_str="%Y-%m-%d %H:%M:%S", include_timezone=False):
-    """Convert Unix timestamp to Mountain Time formatted string"""
-    if timestamp is None:
-        return "Never"
-    
-    # Convert from UTC to Mountain Time
-    utc_dt = datetime.fromtimestamp(timestamp, tz=pytz.UTC)
-    mountain_dt = utc_dt.astimezone(MOUNTAIN_TZ)
-    
-    if include_timezone:
-        return mountain_dt.strftime(format_str + " %Z")
-    return mountain_dt.strftime(format_str)
-
-def timestamp_to_mountain(timestamp):
-    """Convert Unix timestamp to Mountain Time datetime object"""
-    if timestamp is None:
-        return None
-    utc_dt = datetime.fromtimestamp(timestamp, tz=pytz.UTC)
-    return utc_dt.astimezone(MOUNTAIN_TZ)
-
-def pandas_timestamp_to_mountain(series):
-    """Convert pandas timestamp series to Mountain Time"""
-    return pd.to_datetime(series, unit='s', utc=True).dt.tz_convert(MOUNTAIN_TZ)
 
 # Global queues for thread-safe communication
 signal_queue = queue.Queue(maxsize=1000)
@@ -120,10 +39,10 @@ if 'db' not in st.session_state:
     st.session_state.signal_buffer = []
     st.session_state.recent_detections = []
     
-
-
-if 'esp32_trigger' not in st.session_state:
-    st.session_state.esp32_trigger = ESP32TriggerController("192.168.4.1")
+# In the session state initialization section
+if 'trigger' not in st.session_state:
+    st.session_state.trigger = TPMSTrigger()
+    st.session_state.dual_mode = DualModeTPMS(st.session_state.hackrf)
 
 
 def signal_callback(iq_samples, signal_strength, frequency):
@@ -258,7 +177,7 @@ def show_live_detection():
 
             for detection in recent:
                 vehicle = detection['vehicle']
-                dt = timestamp_to_mountain(detection['timestamp'])
+                dt = datetime.fromtimestamp(detection['timestamp'])
 
                 with st.container():
                     col_a, col_b, col_c = st.columns([2, 2, 1])
@@ -286,7 +205,7 @@ def show_live_detection():
 
         if recent_signals:
             signal_df = pd.DataFrame(recent_signals)
-            signal_df['timestamp'] = pandas_timestamp_to_mountain(signal_df['timestamp'])
+            signal_df['timestamp'] = pd.to_datetime(signal_df['timestamp'], unit='s')
 
             st.dataframe(
                 signal_df[['tpms_id', 'timestamp', 'signal_strength', 'frequency']],
@@ -397,8 +316,8 @@ def show_vehicle_database():
                     st.code(tpms_id, language=None)
 
                 st.write("**Timeline:**")
-                st.write(f"First seen: {format_timestamp(vehicle['first_seen'], '%Y-%m-%d %H:%M')}")
-                st.write(f"Last seen: {format_timestamp(vehicle['last_seen'], '%Y-%m-%d %H:%M')}")
+                st.write(f"First seen: {datetime.fromtimestamp(vehicle['first_seen']).strftime('%Y-%m-%d %H:%M')}")
+                st.write(f"Last seen: {datetime.fromtimestamp(vehicle['last_seen']).strftime('%Y-%m-%d %H:%M')}")
 
                 current_nickname = vehicle.get('nickname', '')
                 new_nickname = st.text_input(
@@ -427,204 +346,6 @@ def show_vehicle_database():
                     st.write(prediction['predicted_datetime'].strftime('%Y-%m-%d %H:%M'))
                     st.progress(prediction['confidence'])
                     st.caption(f"Confidence: {prediction['confidence'] * 100:.0f}%")
-
-
-def render_sensor_database_tab(db):
-    """Render the sensor database and management interface"""
-    st.header("🔍 TPMS Sensor Database")
-
-    # Get all sensors
-    sensors_df = db.get_all_unique_sensors()
-
-    if sensors_df.empty:
-        st.warning("No TPMS sensors detected yet. Start scanning to collect sensor data.")
-        return
-
-    # Summary metrics
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Total Sensors", len(sensors_df))
-    with col2:
-        st.metric("Total Signals", sensors_df['signal_count'].sum())
-    with col3:
-        active_sensors = len(sensors_df[sensors_df['last_seen'] > time.time() - 3600])
-        st.metric("Active (1hr)", active_sensors)
-    with col4:
-        orphaned = db.get_orphaned_sensors()
-        st.metric("Unassigned", len(orphaned))
-
-    # Tabs for different views
-    sensor_tab1, sensor_tab2, sensor_tab3 = st.tabs([
-        "📋 All Sensors",
-        "🔍 Sensor Details",
-        "⚠️ Unassigned Sensors"
-    ])
-
-    with sensor_tab1:
-        st.subheader("All Detected Sensors")
-
-        # Format the dataframe
-        display_df = sensors_df.copy()
-        display_df['first_seen'] = pandas_timestamp_to_mountain(display_df['first_seen'])
-        display_df['last_seen'] = pandas_timestamp_to_mountain(display_df['last_seen'])
-        display_df['avg_rssi'] = display_df['avg_rssi'].round(1)
-        display_df['avg_pressure'] = display_df['avg_pressure'].round(1)
-        display_df['avg_temperature'] = display_df['avg_temperature'].round(1)
-        display_df['frequency'] = (display_df['frequency'] / 1e6).round(2)
-
-        # Rename columns for display
-        display_df = display_df.rename(columns={
-            'tpms_id': 'Sensor ID',
-            'protocol': 'Protocol',
-            'signal_count': 'Signals',
-            'first_seen': 'First Seen',
-            'last_seen': 'Last Seen',
-            'avg_rssi': 'Avg RSSI (dBm)',
-            'avg_pressure': 'Avg Pressure (PSI)',
-            'avg_temperature': 'Avg Temp (°C)',
-            'frequency': 'Frequency (MHz)'
-        })
-
-        st.dataframe(
-            display_df,
-            use_container_width=True,
-            hide_index=True
-        )
-
-        # Export option
-        csv = display_df.to_csv(index=False)
-        st.download_button(
-            label="📥 Export Sensor List (CSV)",
-            data=csv,
-            file_name=f"tpms_sensors_{int(time.time())}.csv",
-            mime="text/csv"
-        )
-
-    with sensor_tab2:
-        st.subheader("Detailed Sensor Analysis")
-
-        # Sensor selector
-        sensor_ids = sensors_df['tpms_id'].tolist()
-        selected_sensor = st.selectbox(
-            "Select Sensor ID",
-            options=sensor_ids,
-            format_func=lambda x: f"{x} ({sensors_df[sensors_df['tpms_id'] == x]['protocol'].iloc[0]})"
-        )
-
-        if selected_sensor:
-            # Get statistics
-            stats = db.get_sensor_statistics(selected_sensor)
-            history_df = db.get_sensor_history(selected_sensor)
-
-            # Display statistics
-            st.markdown("### Sensor Statistics")
-            stat_col1, stat_col2, stat_col3 = st.columns(3)
-
-            with stat_col1:
-                st.metric("Total Signals", stats['total_signals'])
-                st.metric("Protocol", stats['protocol'])
-                st.metric("First Seen", format_timestamp(stats['first_seen'], "%Y-%m-%d %H:%M"))
-
-            with stat_col2:
-                st.metric("Avg RSSI", f"{stats['avg_rssi']:.1f} dBm")
-                st.metric("RSSI Range", f"{stats['min_rssi']:.1f} to {stats['max_rssi']:.1f}")
-                if stats['avg_pressure']:
-                    st.metric("Avg Pressure", f"{stats['avg_pressure']:.1f} PSI")
-
-            with stat_col3:
-                st.metric("Last Seen", format_timestamp(stats['last_seen'], "%Y-%m-%d %H:%M"))
-                age_minutes = (time.time() - stats['last_seen']) / 60
-                st.metric("Last Seen", f"{age_minutes:.0f} min ago")
-                if stats['avg_temp']:
-                    st.metric("Avg Temperature", f"{stats['avg_temp']:.1f} °C")
-
-            # Signal strength over time
-            st.markdown("### Signal Strength History")
-            if not history_df.empty:
-                chart_df = history_df[['timestamp', 'signal_strength']].copy()
-                chart_df['timestamp'] = pandas_timestamp_to_mountain(chart_df['timestamp'])
-
-                fig = px.line(
-                    chart_df,
-                    x='timestamp',
-                    y='signal_strength',
-                    title=f"RSSI Over Time - {selected_sensor}",
-                    labels={'timestamp': 'Time', 'signal_strength': 'RSSI (dBm)'}
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
-            # Pressure/Temperature over time (if available)
-            if 'pressure_psi' in history_df.columns and history_df['pressure_psi'].notna().any():
-                st.markdown("### Pressure History")
-                pressure_df = history_df[history_df['pressure_psi'].notna()][['timestamp', 'pressure_psi']].copy()
-                pressure_df['timestamp'] = pandas_timestamp_to_mountain(pressure_df['timestamp'])
-
-                fig = px.line(
-                    pressure_df,
-                    x='timestamp',
-                    y='pressure_psi',
-                    title=f"Tire Pressure Over Time - {selected_sensor}",
-                    labels={'timestamp': 'Time', 'pressure_psi': 'Pressure (PSI)'}
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
-            # Raw signal history table
-            with st.expander("📊 View Raw Signal History"):
-                display_history = history_df.copy()
-                display_history['timestamp'] = pandas_timestamp_to_mountain(display_history['timestamp'])
-                st.dataframe(display_history, use_container_width=True)
-
-    with sensor_tab3:
-        st.subheader("Unassigned Sensors")
-        st.info("These sensors have been detected but are not assigned to any vehicle.")
-
-        orphaned_df = db.get_orphaned_sensors()
-
-        if orphaned_df.empty:
-            st.success("All sensors are assigned to vehicles!")
-        else:
-            # Display orphaned sensors
-            display_orphaned = orphaned_df.copy()
-            display_orphaned['last_seen'] = pandas_timestamp_to_mountain(display_orphaned['last_seen'])
-            st.dataframe(display_orphaned, use_container_width=True)
-
-            # Manual assignment interface
-            st.markdown("### Assign Sensor to Vehicle")
-            vehicles_list = db.get_all_vehicles()  # FIXED: This returns a list, not DataFrame
-
-            if vehicles_list:  # FIXED: Check if list is not empty
-                # Convert to DataFrame for easier handling
-                vehicles_df = pd.DataFrame(vehicles_list)
-
-                assign_col1, assign_col2, assign_col3 = st.columns([2, 2, 1])
-
-                with assign_col1:
-                    sensor_to_assign = st.selectbox(
-                        "Select Sensor",
-                        options=orphaned_df['tpms_id'].tolist()
-                    )
-
-                with assign_col2:
-                    vehicle_to_assign = st.selectbox(
-                        "Select Vehicle",
-                        options=vehicles_df['id'].tolist(),
-                        format_func=lambda x: (
-                            vehicles_df[vehicles_df['id'] == x]['nickname'].iloc[0]
-                            if vehicles_df[vehicles_df['id'] == x]['nickname'].iloc[0]
-                            else f"Vehicle {x}"
-                        )
-                    )
-
-                with assign_col3:
-                    if st.button("Assign", type="primary"):
-                        if db.assign_sensor_to_vehicle(sensor_to_assign, vehicle_to_assign):
-                            st.success(f"Assigned {sensor_to_assign} to vehicle!")
-                            st.rerun()
-                        else:
-                            st.error("Assignment failed")
-            else:
-                st.info("📝 No vehicles in database yet. Vehicles will appear here once detected during scanning.")
-
 
 def show_frequency_status():
     """Display frequency hopping status and statistics"""
@@ -730,12 +451,11 @@ def show_analytics():
         for vehicle in vehicles:
             history = st.session_state.db.get_vehicle_history(vehicle['id'])
             for encounter in history['encounters']:
-                mt_timestamp = timestamp_to_mountain(encounter['timestamp'])
                 encounter_data.append({
                     'vehicle_id': vehicle['id'],
                     'nickname': vehicle.get('nickname', 'Vehicle ' + str(vehicle['id'])),
-                    'timestamp': mt_timestamp,
-                    'date': mt_timestamp.date()
+                    'timestamp': datetime.fromtimestamp(encounter['timestamp']),
+                    'date': datetime.fromtimestamp(encounter['timestamp']).date()
                 })
 
         if encounter_data:
@@ -785,7 +505,7 @@ def show_analytics():
             {
                 'Vehicle': v.get('nickname', 'Vehicle ' + str(v['id'])),
                 'Encounters': v['encounter_count'],
-                'Last Seen': format_timestamp(v['last_seen'], '%Y-%m-%d')
+                'Last Seen': datetime.fromtimestamp(v['last_seen']).strftime('%Y-%m-%d')
             }
             for v in top_vehicles
         ])
@@ -805,9 +525,7 @@ def show_analytics():
         recent_vehicles = sorted(vehicles, key=lambda x: x['last_seen'], reverse=True)[:5]
 
         for v in recent_vehicles:
-            now_mountain = datetime.now(MOUNTAIN_TZ)
-            last_seen_mountain = timestamp_to_mountain(v['last_seen'])
-            time_ago = now_mountain - last_seen_mountain
+            time_ago = datetime.now() - datetime.fromtimestamp(v['last_seen'])
             hours_ago = time_ago.total_seconds() / 3600
 
             if hours_ago < 1:
@@ -977,23 +695,9 @@ def process_signal_queue():
             print(f"Error processing signal: {e}")
             continue
 
-# Update show_trigger_controls()
 def show_trigger_controls():
-    """ESP32 LF Trigger Controls"""
-    st.header("📡 ESP32 LF Trigger Control")
-    
-    # Connection status
-    if st.session_state.esp32_trigger.connected:
-        st.success("✅ ESP32 Connected")
-    else:
-        st.error("❌ ESP32 Not Connected")
-        if st.button("🔄 Reconnect"):
-            st.session_state.esp32_trigger.check_connection()
-            st.rerun()
-    
-    if not st.session_state.esp32_trigger.connected:
-        st.info("Connect to WiFi network: **TPMS_Trigger** (password: tpms12345)")
-        return
+    """Sensor triggering and programming controls"""
+    st.header("📡 TPMS Sensor Trigger & Programming")
     
     st.info("⚠️  **Warning:** Transmitting requires proper licensing and should only be used in controlled environments.")
     
@@ -1103,69 +807,26 @@ def show_trigger_controls():
 
 def main():
     st.title("🚗 TPMS Tracker - Intelligent Vehicle Pattern Recognition")
-    st.caption(f"🕐 Displaying times in Mountain Time (MT)")
 
     with st.sidebar:
         st.header("⚙️ Control Panel")
         st.subheader("Scanner Control")
 
-        # Manual frequency selection
-        if not st.session_state.is_scanning:
-            freq_mhz = st.selectbox(
-                "Select Frequency",
-                [314.9, 315.0, 433.92],
-                index=0,
-                key="freq_select"
-            )
-            
-            if st.button("Set Frequency", key="set_freq_btn"):
-                st.session_state.hackrf.change_frequency(freq_mhz * 1e6)
-                st.success(f"Frequency set to {freq_mhz} MHz")
-        else:
-            # Show current frequency when scanning
-            status = st.session_state.hackrf.get_status()
-            st.info(f"📡 Scanning: {status['frequency']:.1f} MHz")
-            
-            # Allow frequency change during scan
-            if st.button("Change Frequency", key="change_freq_btn"):
-                st.session_state.show_freq_change = True
-            
-            if st.session_state.get('show_freq_change', False):
-                new_freq = st.selectbox(
-                    "New Frequency",
-                    [314.9, 315.0, 433.92],
-                    key="new_freq_select"
-                )
-                
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    if st.button("Apply", key="apply_freq_btn"):
-                        st.session_state.hackrf.change_frequency(new_freq * 1e6)
-                        st.session_state.show_freq_change = False
-                        st.rerun()
-                with col_b:
-                    if st.button("Cancel", key="cancel_freq_btn"):
-                        st.session_state.show_freq_change = False
-                        st.rerun()
 
-        st.divider()
 
         col1, col2 = st.columns(2)
         with col1:
             if st.button("▶️ Start Scan", disabled=st.session_state.is_scanning, key="main_start_btn"):
                 st.session_state.is_scanning = True
+                # Use the correct start() method signature
                 st.session_state.hackrf.start(signal_callback)
                 st.success("Scanning started!")
-                st.rerun()
 
         with col2:
             if st.button("⏹️ Stop Scan", disabled=not st.session_state.is_scanning, key="main_stop_btn"):
                 st.session_state.is_scanning = False
                 st.session_state.hackrf.stop()
                 st.info("Scanning stopped")
-                st.rerun()
-
-
 
         # Scanner status display
         if st.session_state.is_scanning:
@@ -1222,37 +883,39 @@ def main():
             st.metric("Signals/Hour", len(recent_signals))
 
     # Main tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "🎯 Live Detection",
+        "📌 Reference Signals",
         "🚗 Vehicle Database",
-        "🔍 Sensor Database",
         "📈 Analytics",
         "🔧 Maintenance",
         "🤖 ML Insights",
         "📡 Sensor Trigger" 
     ])
 
-    with tab1:
+
+    with tab0:
         show_live_detection()
     
+    with tab1:
+        show_reference_signals()
+
     with tab2:
         show_vehicle_database()
 
     with tab3:
-        render_sensor_database_tab(st.session_state.db)
-
-    with tab4:
         show_analytics()
 
-    with tab5:
+    with tab4:
         show_maintenance()
 
-    with tab6:
+    with tab5:
         show_ml_insights()
         
-    with tab7:
+    with tab6:
         show_trigger_controls()
 
 
 if __name__ == "__main__":
     main()
+

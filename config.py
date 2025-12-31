@@ -12,8 +12,8 @@ class Config:
     # HackRF Settings - MATCH NATIVE APP
     SAMPLE_RATE = 2_457_600  # Match HackRF native (was 2_000_000)
     BANDWIDTH = 1_750_000    # Match HackRF native (was not set)
-    DEFAULT_GAIN = 20        # LNA gain
-    VGA_GAIN = 20           # VGA gain
+    DEFAULT_GAIN = 38        # LNA gain
+    VGA_GAIN = 40           # VGA gain
     RF_AMP = 0              # RF amp (0=off, 1=on)
     
     # Gain Settings
@@ -21,15 +21,16 @@ class Config:
     GAIN_MAX = 47
     GAIN_STEP = 4
     
+    SIGNAL_BUFFER_SIZE = 100000
     # Frequency Configuration - MATCH NATIVE APP
     DEFAULT_FREQUENCY = 314.9e6  # 314.9 MHz (primary)
     FREQUENCY_LIST = [
         314.9e6,  # 314.9 MHz - most common
-        315.0e6,  # 315.0 MHz - alternate
-        433.92e6  # 433.92 MHz - European
+        #315.0e6,  # 315.0 MHz - alternate
+        #433.92e6  # 433.92 MHz - European
     ]
-    FREQUENCIES = [314.9, 433.92, 315.0]  # MHz format for compatibility
-    
+    FREQUENCIES = [314.9]  # MHz format for compatibility
+    #FREQUENCIES = [314.9, 315.0]  # MHz format for compatibility
     # Frequency Hopping - DISABLED for better reception
     ENABLE_FREQUENCY_HOPPING = False  # Changed from True
     FREQUENCY_HOP_ENABLED = False     # Duplicate for compatibility
@@ -94,3 +95,4 @@ class Config:
 
 # Create singleton instance
 config = Config()
+

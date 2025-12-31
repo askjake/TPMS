@@ -3,7 +3,6 @@ import json
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 import numpy as np
-import pandas as pd  # ADDED
 
 
 class TPMSDatabase:
@@ -143,108 +142,6 @@ class TPMSDatabase:
 
         conn.close()
         return results
-
-    def get_all_unique_sensors(self):
-        """Get all unique TPMS sensors ever seen"""
-        query = """
-                SELECT tpms_id, \
-                       protocol, \
-                       COUNT(*)             as signal_count, \
-                       MIN(timestamp)       as first_seen, \
-                       MAX(timestamp)       as last_seen, \
-                       AVG(signal_strength) as avg_rssi, \
-                       AVG(pressure_psi)    as avg_pressure, \
-                       AVG(temperature_c)   as avg_temperature, \
-                       MAX(frequency)       as frequency
-                FROM tpms_signals
-                GROUP BY tpms_id
-                ORDER BY last_seen DESC \
-                """
-        conn = sqlite3.connect(self.db_path)
-        result = pd.read_sql_query(query, conn)
-        conn.close()
-        return result
-
-    def get_sensor_history(self, tpms_id):
-        """Get full history for a specific sensor"""
-        query = """
-                SELECT *
-                FROM tpms_signals
-                WHERE tpms_id = ?
-                ORDER BY timestamp DESC \
-                """
-        conn = sqlite3.connect(self.db_path)
-        result = pd.read_sql_query(query, conn, params=(tpms_id,))
-        conn.close()
-        return result
-
-    def get_sensor_statistics(self, tpms_id):
-        """Get detailed statistics for a sensor"""
-        query = """
-                SELECT COUNT(*)             as total_signals, \
-                       MIN(timestamp)       as first_seen, \
-                       MAX(timestamp)       as last_seen, \
-                       AVG(signal_strength) as avg_rssi, \
-                       MIN(signal_strength) as min_rssi, \
-                       MAX(signal_strength) as max_rssi, \
-                       AVG(pressure_psi)    as avg_pressure, \
-                       MIN(pressure_psi)    as min_pressure, \
-                       MAX(pressure_psi)    as max_pressure, \
-                       AVG(temperature_c)   as avg_temp, \
-                       MIN(temperature_c)   as min_temp, \
-                       MAX(temperature_c)   as max_temp, \
-                       protocol
-                FROM tpms_signals
-                WHERE tpms_id = ? \
-                """
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        result = conn.execute(query, (tpms_id,)).fetchone()
-        conn.close()
-        return dict(result) if result else None
-
-    def get_orphaned_sensors(self):
-        """Get sensors not assigned to any vehicle"""
-        query = """
-                SELECT DISTINCT ts.tpms_id, ts.protocol, MAX(ts.timestamp) as last_seen
-                FROM tpms_signals ts
-                         LEFT JOIN vehicles v ON ts.tpms_id IN (SELECT json_each.value \
-                                                                FROM vehicles, json_each(vehicles.tpms_ids) \
-                                                                WHERE vehicles.id = v.id)
-                WHERE v.id IS NULL
-                GROUP BY ts.tpms_id
-                ORDER BY last_seen DESC \
-                """
-        conn = sqlite3.connect(self.db_path)
-        result = pd.read_sql_query(query, conn)
-        conn.close()
-        return result
-
-    def assign_sensor_to_vehicle(self, tpms_id, vehicle_id):
-        """Manually assign a sensor to a vehicle"""
-        conn = sqlite3.connect(self.db_path)
-
-        # Get current tpms_ids for vehicle
-        vehicle = conn.execute(
-            "SELECT tpms_ids FROM vehicles WHERE id = ?",
-            (vehicle_id,)
-        ).fetchone()
-
-        if vehicle:
-            tpms_ids = json.loads(vehicle[0])
-            if tpms_id not in tpms_ids:
-                tpms_ids.append(tpms_id)
-                conn.execute(
-                    "UPDATE vehicles SET tpms_ids = ? WHERE id = ?",
-                    (json.dumps(tpms_ids), vehicle_id)
-                )
-                conn.commit()
-                conn.close()
-                return True
-
-        conn.close()
-        return False
-
 
     def upsert_vehicle(self, tpms_ids: List[str], timestamp: float,
                        location: Optional[Tuple[float, float]] = None) -> int:
