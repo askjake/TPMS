@@ -851,21 +851,63 @@ def main():
         st.header("⚙️ Control Panel")
         st.subheader("Scanner Control")
 
+        # Manual frequency selection
+        if not st.session_state.is_scanning:
+            freq_mhz = st.selectbox(
+                "Select Frequency",
+                [314.9, 315.0, 433.92],
+                index=0,
+                key="freq_select"
+            )
+            
+            if st.button("Set Frequency", key="set_freq_btn"):
+                st.session_state.hackrf.change_frequency(freq_mhz * 1e6)
+                st.success(f"Frequency set to {freq_mhz} MHz")
+        else:
+            # Show current frequency when scanning
+            status = st.session_state.hackrf.get_status()
+            st.info(f"📡 Scanning: {status['frequency']:.1f} MHz")
+            
+            # Allow frequency change during scan
+            if st.button("Change Frequency", key="change_freq_btn"):
+                st.session_state.show_freq_change = True
+            
+            if st.session_state.get('show_freq_change', False):
+                new_freq = st.selectbox(
+                    "New Frequency",
+                    [314.9, 315.0, 433.92],
+                    key="new_freq_select"
+                )
+                
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    if st.button("Apply", key="apply_freq_btn"):
+                        st.session_state.hackrf.change_frequency(new_freq * 1e6)
+                        st.session_state.show_freq_change = False
+                        st.rerun()
+                with col_b:
+                    if st.button("Cancel", key="cancel_freq_btn"):
+                        st.session_state.show_freq_change = False
+                        st.rerun()
 
+        st.divider()
 
         col1, col2 = st.columns(2)
         with col1:
             if st.button("▶️ Start Scan", disabled=st.session_state.is_scanning, key="main_start_btn"):
                 st.session_state.is_scanning = True
-                # Use the correct start() method signature
                 st.session_state.hackrf.start(signal_callback)
                 st.success("Scanning started!")
+                st.rerun()
 
         with col2:
             if st.button("⏹️ Stop Scan", disabled=not st.session_state.is_scanning, key="main_stop_btn"):
                 st.session_state.is_scanning = False
                 st.session_state.hackrf.stop()
                 st.info("Scanning stopped")
+                st.rerun()
+
+
 
         # Scanner status display
         if st.session_state.is_scanning:
