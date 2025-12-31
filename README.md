@@ -1,219 +1,214 @@
-TPMS Tracker - Intelligent Vehicle Pattern Recognition System
-<div align=“center”>
+# TPMS Tracker - Intelligent Vehicle Pattern Recognition System
 
-TPMS Tracker
-Python
-License
-Status
+<div align="center">
 
-A sophisticated software-defined radio (SDR) system for passive TPMS signal reception, decoding, and vehicle tracking with machine learning pattern recognition.
+![TPMS Tracker](https://img.shields.io/badge/TPMS-Tracker-blue)
+![Python](https://img.shields.io/badge/Python-3.8+-green)
+![License](https://img.shields.io/badge/License-MIT-yellow)
+![Status](https://img.shields.io/badge/Status-Active-success)
 
-Features • Hardware Requirements • Installation • Usage • Documentation • Troubleshooting
+**A sophisticated software-defined radio (SDR) system for passive TPMS signal reception, decoding, and vehicle tracking with machine learning pattern recognition.**
+
+[Features](#features) • [Hardware Requirements](#hardware-requirements) • [Installation](#installation) • [Usage](#usage) • [Documentation](#documentation) • [Troubleshooting](#troubleshooting)
 
 </div>
 
-📋 Table of Contents
-Overview
-Features
-System Architecture
-Hardware Requirements
-Software Requirements
-Installation
-Configuration
-Usage Guide
-Understanding TPMS Signals
-ESP32 LF Trigger Setup
-Database Schema
-Machine Learning Engine
-API Reference
-Troubleshooting
-Legal & Safety
-Contributing
-License
-🎯 Overview
+---
+
+## 📋 Table of Contents
+
+- [Overview](#overview)
+- [Features](#features)
+- [System Architecture](#system-architecture)
+- [Hardware Requirements](#hardware-requirements)
+- [Software Requirements](#software-requirements)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Usage Guide](#usage-guide)
+- [Understanding TPMS Signals](#understanding-tpms-signals)
+- [ESP32 LF Trigger Setup](#esp32-lf-trigger-setup)
+- [Database Schema](#database-schema)
+- [Machine Learning Engine](#machine-learning-engine)
+- [API Reference](#api-reference)
+- [Troubleshooting](#troubleshooting)
+- [Legal & Safety](#legal--safety)
+- [Contributing](#contributing)
+- [License](#license)
+
+---
+
+## 🎯 Overview
+
 TPMS Tracker is an advanced vehicle tracking and tire pressure monitoring system that uses software-defined radio (SDR) technology to passively receive, decode, and analyze Tire Pressure Monitoring System (TPMS) signals from nearby vehicles. The system employs machine learning algorithms to cluster sensors into vehicles, track encounter patterns, and predict future sightings.
 
-What Does It Do?
-Passive Signal Reception: Captures TPMS signals at 314.9, 315.0, and 433.92 MHz
-Multi-Protocol Decoding: Supports Toyota/Lexus, Schrader, Continental, and other TPMS protocols
-Vehicle Clustering: Automatically groups 4 sensors into vehicle profiles using ML
-Pattern Recognition: Learns commute patterns and predicts next encounters
-Tire Health Monitoring: Tracks pressure and temperature trends over time
-Active Sensor Triggering: Optional ESP32-based 125 kHz LF transmitter for sensor activation
-Use Cases
-Research: Study TPMS protocol implementations and signal characteristics
-Vehicle Tracking: Monitor recurring vehicles in parking lots or traffic patterns
-Tire Maintenance: Track tire pressure trends for fleet management
-Education: Learn about SDR, signal processing, and RF protocols
-Security Research: Analyze TPMS security and privacy implications
-✨ Features
-Core Functionality
-✅ Real-Time Signal Processing
+### What Does It Do?
 
-Continuous reception on selected frequency
-FSK/OOK demodulation
-Multi-protocol packet decoding
-Signal strength monitoring (-95 dBm sensitivity)
-✅ Protocol Support
+- **Passive Signal Reception**: Captures TPMS signals at 314.9, 315.0, and 433.92 MHz
+- **Multi-Protocol Decoding**: Supports Toyota/Lexus, Schrader, Continental, and other TPMS protocols
+- **Vehicle Clustering**: Automatically groups 4 sensors into vehicle profiles using ML
+- **Pattern Recognition**: Learns commute patterns and predicts next encounters
+- **Tire Health Monitoring**: Tracks pressure and temperature trends over time
+- **Active Sensor Triggering**: Optional ESP32-based 125 kHz LF transmitter for sensor activation
 
-Toyota/Lexus (proprietary protocol)
-Schrader EZ-Sensor family
-Continental
-Generic FSK/OOK protocols
-Extensible decoder architecture
-✅ Vehicle Database
+### Use Cases
 
-Automatic sensor-to-vehicle clustering
-Encounter history tracking
-GPS location support (optional)
-Custom vehicle nicknames and notes
-Export to CSV
-✅ Sensor Database
+- **Research**: Study TPMS protocol implementations and signal characteristics
+- **Vehicle Tracking**: Monitor recurring vehicles in parking lots or traffic patterns
+- **Tire Maintenance**: Track tire pressure trends for fleet management
+- **Education**: Learn about SDR, signal processing, and RF protocols
+- **Security Research**: Analyze TPMS security and privacy implications
 
-Individual sensor tracking
-Signal strength history
-Pressure/temperature trends
-Orphaned sensor detection
-Manual vehicle assignment
-✅ Machine Learning
+---
 
-DBSCAN clustering for vehicle identification
-Pattern recognition for commute analysis
-Next encounter prediction
-Anomaly detection
-✅ Analytics Dashboard
+## ✨ Features
 
-Daily encounter frequency charts
-Day/hour heatmaps
-Top vehicles ranking
-Recent activity feed
-Tire health monitoring
-✅ ESP32 LF Trigger (Optional)
+### Core Functionality
 
-125 kHz LF signal generation
-Multi-protocol trigger support
-WiFi control interface
-Continuous and single-shot modes
-Trigger-and-listen workflow
-User Interface
-Streamlit-based Web UI: Modern, responsive interface
-Live Signal Stream: Real-time detection feed
-Interactive Charts: Plotly visualizations
-Signal Histogram: Distribution analysis
-Protocol Monitoring: Unknown signal detection
-Timezone Support: Mountain Time (MT) display with DST handling
-🏗️ System Architecture
-┌─────────────────────────────────────────────────────────────┐
-│                      TPMS Tracker System                     │
-├─────────────────────────────────────────────────────────────┤
-│                                                               │
-│  ┌──────────────┐         ┌──────────────┐                  │
-│  │  HackRF One  │────────▶│   RF Front   │                  │
-│  │  (315 MHz)   │  IQ     │   End        │                  │
-│  └──────────────┘  Data   └──────┬───────┘                  │
-│                                   │                           │
-│                                   ▼                           │
-│                          ┌─────────────────┐                 │
-│                          │  TPMS Decoder   │                 │
-│                          │  (FSK/OOK)      │                 │
-│                          └────────┬────────┘                 │
-│                                   │                           │
-│                                   ▼                           │
-│                          ┌─────────────────┐                 │
-│                          │  ML Engine      │                 │
-│                          │  (Clustering)   │                 │
-│                          └────────┬────────┘                 │
-│                                   │                           │
-│                                   ▼                           │
-│                          ┌─────────────────┐                 │
-│                          │  SQLite DB      │                 │
-│                          └────────┬────────┘                 │
-│                                   │                           │
-│                                   ▼                           │
-│                          ┌─────────────────┐                 │
-│                          │  Streamlit UI   │                 │
-│                          └─────────────────┘                 │
-│                                                               │
-│  ┌──────────────┐         ┌──────────────┐                  │
-│  │  ESP32 Dev   │◀───────│   LF Trigger  │  (Optional)     │
-│  │  Board       │  WiFi  │   Controller  │                  │
-│  └──────────────┘         └──────────────┘                  │
-│       │                                                       │
-│       ▼ 125 kHz                                              │
-│  ┌──────────────┐                                            │
-│  │  LF Antenna  │────▶ Activate TPMS Sensors               │
-│  └──────────────┘                                            │
-│                                                               │
-└─────────────────────────────────────────────────────────────┘
+- ✅ **Real-Time Signal Processing**
+  - Continuous reception on selected frequency
+  - FSK/OOK demodulation
+  - Multi-protocol packet decoding
+  - Signal strength monitoring (-95 dBm sensitivity)
 
-Component Overview
-Component	Purpose	Technology
-HackRF One	RF reception	SDR hardware (1 MHz - 6 GHz)
-hackrf_interface.py	Hardware control	Python + libhackrf
-tpms_decoder.py	Signal processing	NumPy, SciPy, DSP algorithms
-ml_engine.py	Vehicle clustering	scikit-learn (DBSCAN)
-database.py	Data persistence	SQLite3
-app.py	User interface	Streamlit
-ESP32	LF triggering	Arduino firmware + WiFi
-🔧 Hardware Requirements
-Required Hardware
-1. HackRF One SDR
-Model: Great Scott Gadgets HackRF One
-Frequency Range: 1 MHz - 6 GHz
-Sample Rate: Up to 20 MS/s
-Interface: USB 2.0
-Antenna: 300-500 MHz antenna (included or aftermarket)
-Cost: ~$300 USD
-Purchase Links:
+- ✅ **Protocol Support**
+  - Toyota/Lexus (proprietary protocol)
+  - Schrader EZ-Sensor family
+  - Continental
+  - Generic FSK/OOK protocols
+  - Extensible decoder architecture
 
-Great Scott Gadgets
-Amazon
-Adafruit
-2. Computer
-OS: Ubuntu 20.04+ (recommended) or other Linux distro
-CPU: Intel i5 or better (for real-time processing)
-RAM: 4 GB minimum, 8 GB recommended
-USB: USB 2.0 or 3.0 port
-Storage: 10 GB free space
-Tested Configurations:
+- ✅ **Vehicle Database**
+  - Automatic sensor-to-vehicle clustering
+  - Encounter history tracking
+  - GPS location support (optional)
+  - Custom vehicle nicknames and notes
+  - Export to CSV
 
-HP EliteBook 840 G4 (Ubuntu 20.04)
-Dell XPS 13 (Ubuntu 22.04)
-Raspberry Pi 4 8GB (Ubuntu Server 22.04) - works but slower
-Optional Hardware
-3. ESP32 Development Board (for LF Triggering)
-Model: ESP32 DevKit with CP2102 USB chip
-Purpose: Generate 125 kHz LF signals to activate TPMS sensors
-Cost: ~$10 USD
-Specifications:
+- ✅ **Sensor Database**
+  - Individual sensor tracking
+  - Signal strength history
+  - Pressure/temperature trends
+  - Orphaned sensor detection
+  - Manual vehicle assignment
 
-ESP32-WROOM-32 module
-WiFi 802.11 b/g/n
-GPIO pins for antenna connection
-USB programming interface
-4. LF Antenna Components (for ESP32)
-24 AWG magnet wire (50-100 feet)
-10 cm diameter coil form (PVC pipe or 3D printed)
-1 µF film capacitor
-100 nF ceramic trimmer capacitor
-IRF540N or IRLZ44N MOSFET
-TC4420 or MCP1407 gate driver IC
-10Ω 2W resistor
-Perfboard or breadboard
-12V power supply (1A minimum)
-Total Cost: ~$20-30 USD for all components
+- ✅ **Machine Learning**
+  - DBSCAN clustering for vehicle identification
+  - Pattern recognition for commute analysis
+  - Next encounter prediction
+  - Anomaly detection
 
-💻 Software Requirements
-Operating System
-Linux: Ubuntu 20.04+ (recommended), Debian, Fedora, Arch
-macOS: 10.14+ (experimental, limited HackRF support)
-Windows: WSL2 with Ubuntu (not recommended for real-time performance)
-Python Environment
-Python: 3.8 - 3.10 (3.10 recommended)
-pip: Latest version
-venv: For virtual environment
-System Dependencies
-Ubuntu/Debian:
+- ✅ **Analytics Dashboard**
+  - Daily encounter frequency charts
+  - Day/hour heatmaps
+  - Top vehicles ranking
+  - Recent activity feed
+  - Tire health monitoring
+
+- ✅ **ESP32 LF Trigger (Optional)**
+  - 125 kHz LF signal generation
+  - Multi-protocol trigger support
+  - WiFi control interface
+  - Continuous and single-shot modes
+  - Trigger-and-listen workflow
+
+### User Interface
+
+- **Streamlit-based Web UI**: Modern, responsive interface
+- **Live Signal Stream**: Real-time detection feed
+- **Interactive Charts**: Plotly visualizations
+- **Signal Histogram**: Distribution analysis
+- **Protocol Monitoring**: Unknown signal detection
+- **Timezone Support**: Mountain Time (MT) display with DST handling
+
+---
+
+### Component Overview
+
+| Component | Purpose | Technology |
+|-----------|---------|------------|
+| **HackRF One** | RF reception | SDR hardware (1 MHz - 6 GHz) |
+| **hackrf_interface.py** | Hardware control | Python + libhackrf |
+| **tpms_decoder.py** | Signal processing | NumPy, SciPy, DSP algorithms |
+| **ml_engine.py** | Vehicle clustering | scikit-learn (DBSCAN) |
+| **database.py** | Data persistence | SQLite3 |
+| **app.py** | User interface | Streamlit |
+| **ESP32** | LF triggering | Arduino firmware + WiFi |
+
+---
+
+## 🔧 Hardware Requirements
+
+### Required Hardware
+
+#### 1. HackRF One SDR
+- **Model**: Great Scott Gadgets HackRF One
+- **Frequency Range**: 1 MHz - 6 GHz
+- **Sample Rate**: Up to 20 MS/s
+- **Interface**: USB 2.0
+- **Antenna**: 300-500 MHz antenna (included or aftermarket)
+- **Cost**: ~$300 USD
+
+**Purchase Links**:
+- [Great Scott Gadgets](https://greatscottgadgets.com/hackrf/)
+- [Amazon](https://www.amazon.com/s?k=hackrf+one)
+- [Adafruit](https://www.adafruit.com/product/3583)
+
+#### 2. Computer
+- **OS**: Ubuntu 20.04+ (recommended) or other Linux distro
+- **CPU**: Intel i5 or better (for real-time processing)
+- **RAM**: 4 GB minimum, 8 GB recommended
+- **USB**: USB 2.0 or 3.0 port
+- **Storage**: 10 GB free space
+
+**Tested Configurations**:
+- HP EliteBook 840 G4 (Ubuntu 20.04)
+- Dell XPS 13 (Ubuntu 22.04)
+- Raspberry Pi 4 8GB (Ubuntu Server 22.04) - works but slower
+
+### Optional Hardware
+
+#### 3. ESP32 Development Board (for LF Triggering)
+- **Model**: ESP32 DevKit with CP2102 USB chip
+- **Purpose**: Generate 125 kHz LF signals to activate TPMS sensors
+- **Cost**: ~$10 USD
+
+**Specifications**:
+- ESP32-WROOM-32 module
+- WiFi 802.11 b/g/n
+- GPIO pins for antenna connection
+- USB programming interface
+
+#### 4. LF Antenna Components (for ESP32)
+- 24 AWG magnet wire (50-100 feet)
+- 10 cm diameter coil form (PVC pipe or 3D printed)
+- 1 µF film capacitor
+- 100 nF ceramic trimmer capacitor
+- IRF540N or IRLZ44N MOSFET
+- TC4420 or MCP1407 gate driver IC
+- 10Ω 2W resistor
+- Perfboard or breadboard
+- 12V power supply (1A minimum)
+
+**Total Cost**: ~$20-30 USD for all components
+
+---
+
+## 💻 Software Requirements
+
+### Operating System
+- **Linux**: Ubuntu 20.04+ (recommended), Debian, Fedora, Arch
+- **macOS**: 10.14+ (experimental, limited HackRF support)
+- **Windows**: WSL2 with Ubuntu (not recommended for real-time performance)
+
+### Python Environment
+- **Python**: 3.8 - 3.10 (3.10 recommended)
+- **pip**: Latest version
+- **venv**: For virtual environment
+
+### System Dependencies
+
+#### Ubuntu/Debian:
+```bash
 sudo apt update
 sudo apt install -y \
     python3 python3-pip python3-venv \
@@ -221,7 +216,6 @@ sudo apt install -y \
     libusb-1.0-0-dev \
     pkg-config \
     git
-
 Fedora:
 sudo dnf install -y \
     python3 python3-pip \
@@ -245,7 +239,7 @@ pytz: Timezone support
 📦 Installation
 Step 1: Clone Repository
 cd ~
-git clone https://github.com/askjake/TPMS.git
+git clone git@git.dtc.dish.corp:montjac/TPMS_pattern_collector.git TPMS
 cd TPMS
 
 Step 2: Create Virtual Environment
@@ -661,134 +655,6 @@ CREATE TABLE maintenance_history (
     FOREIGN KEY (vehicle_id) REFERENCES vehicles(id)
 );
 
-Database Queries
-Get All Sensors
-sensors = db.get_all_unique_sensors()
-# Returns: DataFrame with sensor stats
-
-Get Vehicle History
-history = db.get_vehicle_history(vehicle_id)
-# Returns: Dict with vehicle info, encounters, maintenance data
-
-Get Recent Signals
-signals = db.get_recent_signals(time_window=3600)  # Last hour
-# Returns: List of signal dicts
-
-Analyze Maintenance
-analysis = db.analyze_maintenance(vehicle_id, days=30)
-# Returns: Dict with per-tire statistics
-
-🤖 Machine Learning Engine
-Vehicle Clustering Algorithm
-The ML engine uses DBSCAN (Density-Based Spatial Clustering) to group sensors into vehicles.
-
-Algorithm Overview
-Signal Collection: Gather signals within time window (default: 300 seconds)
-Feature Extraction: Extract TPMS IDs and timestamps
-Clustering: Apply DBSCAN to group co-occurring sensors
-Validation: Verify clusters have 4 sensors (typical vehicle)
-Vehicle Creation: Create or update vehicle record
-DBSCAN Parameters
-# config.py
-CLUSTERING_EPS = 300           # Maximum time between signals (seconds)
-CLUSTERING_MIN_SAMPLES = 3     # Minimum signals for valid cluster
-
-Tuning Guidelines:
-
-EPS: Increase if vehicles are missed (sensors too far apart in time)
-MIN_SAMPLES: Decrease for motorcycles/trailers (2-3 sensors)
-Pattern Recognition
-The ML engine learns temporal patterns:
-
-Commute Detection: Identifies regular encounter times
-Route Analysis: Detects common paths (with GPS)
-Prediction: Estimates next encounter time
-Anomaly Detection: Flags unusual patterns
-Example: Predicting Next Encounter
-prediction = ml_engine.predict_next_encounter(vehicle_id)
-
-# Returns:
-{
-    'prediction': 'estimated',
-    'predicted_datetime': datetime(2025, 1, 2, 8, 30),
-    'confidence': 0.85,
-    'pattern': 'weekday_morning_commute'
-}
-
-🔧 API Reference
-HackRFInterface
-from hackrf_interface import HackRFInterface
-
-# Initialize
-hackrf = HackRFInterface()
-
-# Start reception
-hackrf.start(callback_function)
-
-# Change frequency
-hackrf.change_frequency(315.0e6)  # 315 MHz
-
-# Get status
-status = hackrf.get_status()
-# Returns: {'frequency': 315.0, 'is_running': True, ...}
-
-# Stop reception
-hackrf.stop()
-
-TPMSDecoder
-from tpms_decoder import TPMSDecoder
-
-# Initialize
-decoder = TPMSDecoder(sample_rate=2457600)
-
-# Process IQ samples
-signals = decoder.process_samples(iq_data, frequency)
-
-# Returns list of TPMSSignal objects:
-for signal in signals:
-    print(f"ID: {signal.tpms_id}")
-    print(f"Pressure: {signal.pressure_psi} PSI")
-    print(f"Protocol: {signal.protocol}")
-
-TPMSDatabase
-from database import TPMSDatabase
-
-# Initialize
-db = TPMSDatabase('tpms_data.db')
-
-# Insert signal
-signal_id = db.insert_signal({
-    'tpms_id': 'A42D124A',
-    'timestamp': time.time(),
-    'frequency': 315.0e6,
-    'signal_strength': -82.5,
-    'pressure_psi': 32.0,
-    'protocol': 'Schrader'
-})
-
-# Get vehicles
-vehicles = db.get_all_vehicles(min_encounters=5)
-
-# Get sensors
-sensors = db.get_all_unique_sensors()
-
-ESP32TriggerController
-from esp32_trigger_controller import ESP32TriggerController
-
-# Initialize
-trigger = ESP32TriggerController('192.168.4.1')
-
-# Check connection
-if trigger.connected:
-    # Send trigger
-    trigger.send_trigger('schrader')
-    
-    # Start continuous
-    trigger.start_continuous_trigger('toyota', interval=1.0)
-    
-    # Stop continuous
-    trigger.stop_continuous_trigger()
-
 🐛 Troubleshooting
 Common Issues
 1. HackRF Not Detected
@@ -814,20 +680,6 @@ sudo usermod -a -G plugdev $USER
 2. No Signals Detected
 Symptoms: Scanning active but no signals appear
 
-Diagnostic Steps:
-
-# Run diagnostic script
-python3 diagnose_reception.py
-
-# Test with raw capture
-hackrf_transfer -r test.bin -f 315000000 -s 2457600 -n 24576000
-
-# Check file size (should be ~23 MB)
-ls -lh test.bin
-
-# Analyze with inspectrum
-inspectrum test.bin
-
 Common Causes:
 
 Wrong frequency (try 314.9, 315.0, 433.92 MHz)
@@ -835,87 +687,6 @@ Antenna not connected
 No vehicles nearby (sensors only transmit while moving)
 Sensor battery dead
 Interference from other devices
-3. ESP32 Not Connecting
-Symptoms: “❌ ESP32 Not Connected” in UI
-
-Solutions:
-
-# Check WiFi connection
-nmcli device wifi list | grep TPMS_Trigger
-
-# Connect manually
-nmcli device wifi connect TPMS_Trigger password tpms12345
-
-# Ping ESP32
-ping 192.168.4.1
-
-# Check ESP32 serial output
-# In Arduino IDE: Tools → Serial Monitor
-
-4. Database Errors
-Symptoms: SQLite errors or corrupted data
-
-Solutions:
-
-# Backup database
-cp tpms_data.db tpms_data.db.backup
-
-# Check integrity
-sqlite3 tpms_data.db "PRAGMA integrity_check;"
-
-# Rebuild database (WARNING: deletes all data)
-rm tpms_data.db
-python3 -c "from database import TPMSDatabase; TPMSDatabase('tpms_data.db')"
-
-5. High CPU Usage
-Symptoms: System slow, app unresponsive
-
-Solutions:
-
-Reduce sample rate in config.py
-Increase signal threshold (fewer false positives)
-Close other applications
-Use faster computer
-Disable real-time histogram updates
-6. Streamlit Errors
-Symptoms: App crashes or won’t start
-
-Solutions:
-
-# Clear Streamlit cache
-rm -rf ~/.streamlit/cache
-
-# Reinstall dependencies
-pip install --upgrade --force-reinstall -r requirements.txt
-
-# Check Python version
-python3 --version  # Should be 3.8-3.10
-
-# Run with verbose logging
-streamlit run app.py --logger.level=debug
-
-Diagnostic Tools
-Signal Strength Test
-# In Python console
-from hackrf_interface import HackRFInterface
-import numpy as np
-
-hackrf = HackRFInterface()
-
-def test_callback(iq, rssi, freq):
-    print(f"RSSI: {rssi:.1f} dBm")
-
-hackrf.start(test_callback)
-# Let run for 30 seconds
-hackrf.stop()
-
-Protocol Detection Test
-from tpms_decoder import TPMSDecoder
-
-decoder = TPMSDecoder(2457600)
-stats = decoder.get_protocol_statistics()
-print(stats)
-
 ⚖️ Legal & Safety
 Legal Considerations
 United States (FCC Regulations)
@@ -931,16 +702,6 @@ Transmitting LF Signals (Active):
 ✅ Power Limits: Must comply with field strength limits (very low power)
 ⚠️ Interference: Must not cause harmful interference to licensed services
 ⚠️ Intent: Only use for research/educational purposes
-European Union (ETSI Regulations)
-Receiving: Legal under similar principles as US
-Transmitting: 125 kHz allowed under EN 300 330
-433 MHz: Short Range Devices (SRD) regulations apply
-Other Jurisdictions
-Check local regulations before use. When in doubt:
-
-Passive reception only (no LF trigger)
-Private property only
-Educational/research purposes
 Privacy & Ethics
 Best Practices
 Anonymize Data: Don’t link TPMS IDs to specific individuals
@@ -954,174 +715,32 @@ What NOT To Do
 ❌ Use for stalking or harassment
 ❌ Interfere with vehicle operation
 ❌ Clone or spoof TPMS sensors
-Safety Considerations
-RF Exposure
-125 kHz LF: Very low power, near-field only, safe at normal distances
-315/433 MHz: Receive only, no transmission risk
-HackRF: Low power output (< 10 mW), safe
-Medical Devices
-Pacemakers: Maintain 6-inch distance from LF antenna
-Other Implants: Consult physician if concerned
-General Rule: If you have medical implants, disable LF trigger
-Vehicle Safety
-No Interference: System does not interfere with vehicle operation
-Passive Reception: Receiving signals doesn’t affect sensors
-LF Trigger: Only activates sensors, doesn’t modify operation
-Testing: Test LF trigger away from vehicles initially
-🤝 Contributing
-How to Contribute
-We welcome contributions! Here’s how:
-
-Fork the Repository
-
-# On GitHub, click "Fork"
-git clone https://github.com/YOUR_USERNAME/TPMS.git
-cd TPMS
-
-Create a Branch
-
-git checkout -b feature/your-feature-name
-
-Make Changes
-
-Follow existing code style
-Add comments and docstrings
-Test thoroughly
-Commit Changes
-
-git add .
-git commit -m "Add: description of your changes"
-
-Push and Create PR
-
-git push origin feature/your-feature-name
-# On GitHub, create Pull Request
-
-Contribution Ideas
-🔧 New TPMS Protocols: Add decoders for additional manufacturers
-🌍 Internationalization: Add support for non-US frequencies
-📊 Visualizations: Improve charts and analytics
-🤖 ML Improvements: Enhance clustering algorithms
-📱 Mobile Support: Create mobile-friendly UI
-🐛 Bug Fixes: Fix issues and improve stability
-📚 Documentation: Improve README, add tutorials
-Code Style
-Python: Follow PEP 8
-Docstrings: Use Google style
-Type Hints: Use where appropriate
-Comments: Explain complex logic
-Testing
-Before submitting PR:
-
-# Test basic functionality
-streamlit run app.py
-
-# Test HackRF interface
-python3 -c "from hackrf_interface import HackRFInterface; h = HackRFInterface(); print('OK')"
-
-# Test decoder
-python3 -c "from tpms_decoder import TPMSDecoder; d = TPMSDecoder(2457600); print('OK')"
-
-# Test database
-python3 -c "from database import TPMSDatabase; db = TPMSDatabase(':memory:'); print('OK')"
-
 📄 License
 This project is licensed under the MIT License.
 
-MIT License
-
-Copyright (c) 2025 TPMS Tracker Contributors
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
 📞 Support & Contact
 Getting Help
-GitHub Issues: Report bugs or request features
-Discussions: Ask questions or share ideas
-Email: Contact maintainer
-Resources
-HackRF Documentation: https://hackrf.readthedocs.io/
-TPMS Protocols: https://www.schrader.com/
-SDR Tutorials: https://greatscottgadgets.com/sdr/
-Streamlit Docs: https://docs.streamlit.io/
+Internal Dish Git: Report issues
+Project Maintainer: montjac@dish.com
 🙏 Acknowledgments
 Credits
 HackRF One: Great Scott Gadgets for excellent SDR hardware
 Streamlit: For the amazing web framework
 TPMS Research Community: For protocol documentation
-Contributors: Everyone who has contributed code, ideas, or feedback
-Inspiration
-This project was inspired by:
+Dish Network: For supporting this research project
+Built with ❤️ for the RF research community
 
-Native HackRF TPMS app by @jboone
-RTL-SDR TPMS projects
-Automotive security research community
-📚 Additional Resources
-Tutorials
-Getting Started with HackRF
-TPMS Protocol Analysis
-SDR Signal Processing
-Related Projects
-rtl_433 - Generic data receiver
-Universal Radio Hacker - Wireless protocol investigation
-Inspectrum - Signal analyzer
-Hardware Suppliers
-Great Scott Gadgets - HackRF One
-Adafruit - ESP32 and components
-SparkFun - Electronics components
-🗺️ Roadmap
-Version 1.0 (Current)
-✅ Basic TPMS reception and decoding
-✅ Vehicle clustering with ML
-✅ Web-based UI
-✅ ESP32 LF trigger support
-✅ Timezone support
-Version 1.1 (Planned)
-🔄 GPS integration for location tracking
-🔄 Mobile-responsive UI
-🔄 Real-time map visualization
-🔄 Advanced filtering and search
-Version 2.0 (Future)
-📋 Multi-HackRF support (parallel frequencies)
-📋 Cloud sync and multi-user support
-📋 Advanced ML predictions
-📋 API for third-party integrations
-📋 Docker containerization
-❓ FAQ
-General Questions
-Q: Is this legal?
-A: Yes, passive reception of TPMS signals is legal in most jurisdictions. Check local laws regarding LF transmission.
 
-Q: Can I track specific vehicles?
-A: Technically yes, but ethically and legally questionable. Use responsibly for research/education only.
+## Step 2: Save and commit
 
-Q: Does this work with all vehicles?
-A: Most vehicles manufactured after 2008 have TPMS. Protocol support varies.
+```bash
+# Save the file (Ctrl+X, Y, Enter in nano)
 
-Q: What’s the detection range?
-A: Typically 10-50 meters depending on signal strength and antenna.
+# Add to git
+git add README.md
 
-Technical Questions
-Q: Why HackRF instead of RTL-SDR?
-A: HackRF has better sensitivity and bandwidth for TPMS frequencies. RTL-SDR can work but with limitations.
+# Commit
+git commit -m "Add comprehensive README documentation"
 
-Q: Can I use multiple frequencies simultaneously?
-A: Not with single HackRF. You can manually switch or use multiple HackRF devices.
-
-**Q: How accurate is the tire pressure reading
+# Push to internal Dish repo
+git push origin main
