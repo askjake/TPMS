@@ -372,6 +372,206 @@ def show_vehicle_database():
                     st.progress(prediction['confidence'])
                     st.caption(f"Confidence: {prediction['confidence'] * 100:.0f}%")
 
+
+def render_sensor_database_tab(db):
+    """Render the sensor database and management interface"""
+    st.header("🔍 TPMS Sensor Database")
+
+    # Get all sensors
+    sensors_df = db.get_all_unique_sensors()
+
+    if sensors_df.empty:
+        st.warning("No TPMS sensors detected yet. Start scanning to collect sensor data.")
+        return
+
+    # Summary metrics
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Total Sensors", len(sensors_df))
+    with col2:
+        st.metric("Total Signals", sensors_df['signal_count'].sum())
+    with col3:
+        active_sensors = len(sensors_df[sensors_df['last_seen'] > time.time() - 3600])
+        st.metric("Active (1hr)", active_sensors)
+    with col4:
+        orphaned = db.get_orphaned_sensors()
+        st.metric("Unassigned", len(orphaned))
+
+    # Tabs for different views
+    sensor_tab1, sensor_tab2, sensor_tab3 = st.tabs([
+        "📋 All Sensors",
+        "🔍 Sensor Details",
+        "⚠️ Unassigned Sensors"
+    ])
+
+    with sensor_tab1:
+        st.subheader("All Detected Sensors")
+
+        # Format the dataframe
+        display_df = sensors_df.copy()
+        display_df['first_seen'] = pd.to_datetime(display_df['first_seen'], unit='s')
+        display_df['last_seen'] = pd.to_datetime(display_df['last_seen'], unit='s')
+        display_df['avg_rssi'] = display_df['avg_rssi'].round(1)
+        display_df['avg_pressure'] = display_df['avg_pressure'].round(1)
+        display_df['avg_temperature'] = display_df['avg_temperature'].round(1)
+        display_df['frequency'] = (display_df['frequency'] / 1e6).round(2)
+
+        # Rename columns for display
+        display_df = display_df.rename(columns={
+            'tpms_id': 'Sensor ID',
+            'protocol': 'Protocol',
+            'signal_count': 'Signals',
+            'first_seen': 'First Seen',
+            'last_seen': 'Last Seen',
+            'avg_rssi': 'Avg RSSI (dBm)',
+            'avg_pressure': 'Avg Pressure (PSI)',
+            'avg_temperature': 'Avg Temp (°C)',
+            'frequency': 'Frequency (MHz)'
+        })
+
+        st.dataframe(
+            display_df,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        # Export option
+        csv = display_df.to_csv(index=False)
+        st.download_button(
+            label="📥 Export Sensor List (CSV)",
+            data=csv,
+            file_name=f"tpms_sensors_{int(time.time())}.csv",
+            mime="text/csv"
+        )
+
+    with sensor_tab2:
+        st.subheader("Detailed Sensor Analysis")
+
+        # Sensor selector
+        sensor_ids = sensors_df['tpms_id'].tolist()
+        selected_sensor = st.selectbox(
+            "Select Sensor ID",
+            options=sensor_ids,
+            format_func=lambda x: f"{x} ({sensors_df[sensors_df['tpms_id'] == x]['protocol'].iloc[0]})"
+        )
+
+        if selected_sensor:
+            # Get statistics
+            stats = db.get_sensor_statistics(selected_sensor)
+            history_df = db.get_sensor_history(selected_sensor)
+
+            # Display statistics
+            st.markdown("### Sensor Statistics")
+            stat_col1, stat_col2, stat_col3 = st.columns(3)
+
+            with stat_col1:
+                st.metric("Total Signals", stats['total_signals'])
+                st.metric("Protocol", stats['protocol'])
+                first_seen = datetime.fromtimestamp(stats['first_seen'])
+                st.metric("First Seen", first_seen.strftime("%Y-%m-%d %H:%M"))
+
+            with stat_col2:
+                st.metric("Avg RSSI", f"{stats['avg_rssi']:.1f} dBm")
+                st.metric("RSSI Range", f"{stats['min_rssi']:.1f} to {stats['max_rssi']:.1f}")
+                if stats['avg_pressure']:
+                    st.metric("Avg Pressure", f"{stats['avg_pressure']:.1f} PSI")
+
+            with stat_col3:
+                last_seen = datetime.fromtimestamp(stats['last_seen'])
+                st.metric("Last Seen", last_seen.strftime("%Y-%m-%d %H:%M"))
+                age_minutes = (time.time() - stats['last_seen']) / 60
+                st.metric("Last Seen", f"{age_minutes:.0f} min ago")
+                if stats['avg_temp']:
+                    st.metric("Avg Temperature", f"{stats['avg_temp']:.1f} °C")
+
+            # Signal strength over time
+            st.markdown("### Signal Strength History")
+            if not history_df.empty:
+                chart_df = history_df[['timestamp', 'signal_strength']].copy()
+                chart_df['timestamp'] = pd.to_datetime(chart_df['timestamp'], unit='s')
+
+                fig = px.line(
+                    chart_df,
+                    x='timestamp',
+                    y='signal_strength',
+                    title=f"RSSI Over Time - {selected_sensor}",
+                    labels={'timestamp': 'Time', 'signal_strength': 'RSSI (dBm)'}
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            # Pressure/Temperature over time (if available)
+            if 'pressure_psi' in history_df.columns and history_df['pressure_psi'].notna().any():
+                st.markdown("### Pressure History")
+                pressure_df = history_df[history_df['pressure_psi'].notna()][['timestamp', 'pressure_psi']].copy()
+                pressure_df['timestamp'] = pd.to_datetime(pressure_df['timestamp'], unit='s')
+
+                fig = px.line(
+                    pressure_df,
+                    x='timestamp',
+                    y='pressure_psi',
+                    title=f"Tire Pressure Over Time - {selected_sensor}",
+                    labels={'timestamp': 'Time', 'pressure_psi': 'Pressure (PSI)'}
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            # Raw signal history table
+            with st.expander("📊 View Raw Signal History"):
+                display_history = history_df.copy()
+                display_history['timestamp'] = pd.to_datetime(display_history['timestamp'], unit='s')
+                st.dataframe(display_history, use_container_width=True)
+
+    with sensor_tab3:
+        st.subheader("Unassigned Sensors")
+        st.info("These sensors have been detected but are not assigned to any vehicle.")
+
+        orphaned_df = db.get_orphaned_sensors()
+
+        if orphaned_df.empty:
+            st.success("All sensors are assigned to vehicles!")
+        else:
+            # Display orphaned sensors
+            display_orphaned = orphaned_df.copy()
+            display_orphaned['last_seen'] = pd.to_datetime(display_orphaned['last_seen'], unit='s')
+            st.dataframe(display_orphaned, use_container_width=True)
+
+            # Manual assignment interface
+            st.markdown("### Assign Sensor to Vehicle")
+            vehicles_list = db.get_all_vehicles()  # FIXED: This returns a list, not DataFrame
+
+            if vehicles_list:  # FIXED: Check if list is not empty
+                # Convert to DataFrame for easier handling
+                vehicles_df = pd.DataFrame(vehicles_list)
+
+                assign_col1, assign_col2, assign_col3 = st.columns([2, 2, 1])
+
+                with assign_col1:
+                    sensor_to_assign = st.selectbox(
+                        "Select Sensor",
+                        options=orphaned_df['tpms_id'].tolist()
+                    )
+
+                with assign_col2:
+                    vehicle_to_assign = st.selectbox(
+                        "Select Vehicle",
+                        options=vehicles_df['id'].tolist(),
+                        format_func=lambda x: (
+                            vehicles_df[vehicles_df['id'] == x]['nickname'].iloc[0]
+                            if vehicles_df[vehicles_df['id'] == x]['nickname'].iloc[0]
+                            else f"Vehicle {x}"
+                        )
+                    )
+
+                with assign_col3:
+                    if st.button("Assign", type="primary"):
+                        if db.assign_sensor_to_vehicle(sensor_to_assign, vehicle_to_assign):
+                            st.success(f"Assigned {sensor_to_assign} to vehicle!")
+                            st.rerun()
+                        else:
+                            st.error("Assignment failed")
+            else:
+                st.info("No vehicles in database yet. Vehicles will appear here once detected.")
+
+
 def show_frequency_status():
     """Display frequency hopping status and statistics"""
     st.subheader("📡 Frequency Status")
@@ -964,35 +1164,35 @@ def main():
             st.metric("Signals/Hour", len(recent_signals))
 
     # Main tabs
-    tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "🎯 Live Detection",
-        "📌 Reference Signals",
         "🚗 Vehicle Database",
+        "🔍 Sensor Database",
         "📈 Analytics",
         "🔧 Maintenance",
         "🤖 ML Insights",
         "📡 Sensor Trigger" 
     ])
 
-    with tab0:
+    with tab1:
         show_live_detection()
     
-    with tab1:
-        show_reference_signals()
-
     with tab2:
         show_vehicle_database()
 
     with tab3:
-        show_analytics()
+        render_sensor_database_tab(st.session_state.db)
 
     with tab4:
-        show_maintenance()
+        show_analytics()
 
     with tab5:
+        show_maintenance()
+
+    with tab6:
         show_ml_insights()
         
-    with tab6:
+    with tab7:
         show_trigger_controls()
 
 
