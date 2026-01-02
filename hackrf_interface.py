@@ -12,29 +12,36 @@ from config import config
 # Try to import HackRF library
 HACKRF_AVAILABLE = False
 HackRF = None
-HackRFError = None
+HackRFError = Exception  # Default fallback
 
 print("🔍 Attempting to import HackRF library...")
 
 try:
-    # Try hackrf first (what you have installed)
+    # pyhackrf package installs as 'hackrf' module
     import hackrf
-    print(f"   Found hackrf at: {hackrf.__file__}")
-    from hackrf import HackRF, HackRFError
+    print(f"✅ Found hackrf module at: {hackrf.__file__}")
+    
+    from hackrf import HackRF
+    
+    # Try different error class names
+    try:
+        from hackrf import HackRfError as HackRFError
+        print("   Using HackRfError")
+    except ImportError:
+        try:
+            from hackrf import HackRFError
+            print("   Using HackRFError")
+        except ImportError:
+            print("   No specific error class found, using Exception")
+            HackRFError = Exception
+    
     HACKRF_AVAILABLE = True
     print("✅ HackRF library loaded successfully")
+    
 except ImportError as e:
-    print(f"   hackrf import failed: {e}")
-    try:
-        # Fallback to pyhackrf
-        import pyhackrf
-        print(f"   Found pyhackrf at: {pyhackrf.__file__}")
-        from pyhackrf import HackRF, HackRFError
-        HACKRF_AVAILABLE = True
-        print("✅ PyHackRF library loaded successfully")
-    except ImportError as e2:
-        print(f"   pyhackrf import failed: {e2}")
-        print("⚠️  HackRF library not available - using simulation mode")
+    print(f"❌ hackrf import failed: {e}")
+    print("⚠️  HackRF library not available - using simulation mode")
+    print("   Install with: pip install pyhackrf")
 
 class HackRFInterface:
     def __init__(self):
@@ -83,8 +90,6 @@ class HackRFInterface:
         except Exception as e:
             print(f"❌ Failed to open HackRF: {e}")
             print(f"   Error type: {type(e).__name__}")
-            import traceback
-            traceback.print_exc()
             return False
     
     def close(self):
@@ -136,8 +141,6 @@ class HackRFInterface:
             
         except Exception as e:
             print(f"❌ Configuration error: {e}")
-            import traceback
-            traceback.print_exc()
             return False
     
     def start_rx(self, callback: Callable):
@@ -164,8 +167,6 @@ class HackRFInterface:
             
         except Exception as e:
             print(f"❌ Failed to start RX: {e}")
-            import traceback
-            traceback.print_exc()
             self.is_streaming = False
             return False
     
@@ -346,15 +347,12 @@ class SimulatedHackRF:
         print("⏹️  Stopped simulated RX")
     
     def start(self, callback: Callable):
-        """Start scanning (wrapper)"""
         return self.start_rx(callback)
     
     def stop(self):
-        """Stop scanning (wrapper)"""
         return self.stop_rx()
     
     def get_status(self) -> dict:
-        """Get current status"""
         return {
             'is_streaming': self.is_streaming,
             'frequency': self.frequency / 1e6,
@@ -364,25 +362,20 @@ class SimulatedHackRF:
         }
     
     def change_frequency(self, frequency: int):
-        """Change frequency"""
         self.frequency = frequency
         print(f"📡 Simulated: {frequency / 1e6:.3f} MHz")
         return True
     
     def set_frequency_hopping(self, enabled: bool):
-        """Enable/disable frequency hopping"""
         return False
     
     def set_hop_interval(self, interval: float):
-        """Set hop interval"""
         return False
     
     def increment_detection(self, frequency: float):
-        """Increment detection count"""
         pass
     
     def _simulate_samples(self):
-        """Generate simulated signals"""
         while self.is_streaming:
             noise = (np.random.randn(config.SAMPLES_PER_SCAN) + 
                     1j * np.random.randn(config.SAMPLES_PER_SCAN)) * 0.1
