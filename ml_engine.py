@@ -189,7 +189,7 @@ class VehicleClusteringEngine:
     
         # Filter by time window
         frequent_vehicles = []
-       for vehicle in vehicles:
+        for vehicle in vehicles:
             if vehicle['last_seen'] >= cutoff_time:
                 history = self.db.get_vehicle_history(vehicle['id'])
             
@@ -430,4 +430,5 @@ def create_learning_engine() -> AdaptiveLearningEngine:
 def create_clustering_engine() -> VehicleClusteringEngine:
     """Factory function to create clustering engine"""
     return VehicleClusteringEngine(min_samples=3, eps=0.5)
+
 
