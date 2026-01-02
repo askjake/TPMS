@@ -1,6 +1,6 @@
 """
 HackRF Interface for TPMS Signal Capture
-Modern Python (3.10+) compatible
+Modern Python (3.10+) compatible - with extensive debugging
 """
 import numpy as np
 from typing import Optional, Callable
@@ -8,43 +8,46 @@ import time
 import threading
 from collections import deque
 from config import config
+import sys
+import traceback
+
+# Debug mode
+DEBUG = True
+
+def debug_print(msg):
+    """Print debug message with timestamp"""
+    if DEBUG:
+        print(f"[{time.time():.3f}] {msg}", flush=True)
 
 # Try to import HackRF library
 HACKRF_AVAILABLE = False
 HackRF = None
-HackRFError = Exception  # Default fallback
+HackRFError = Exception
 
-print("🔍 Attempting to import HackRF library...")
+debug_print("🔍 Attempting to import HackRF library...")
 
 try:
-    # pyhackrf package installs as 'hackrf' module
     import hackrf
-    print(f"✅ Found hackrf module at: {hackrf.__file__}")
+    debug_print(f"✅ Found hackrf module at: {hackrf.__file__}")
     
     from hackrf import HackRF
     
-    # Try different error class names
     try:
         from hackrf import HackRfError as HackRFError
-        print("   Using HackRfError")
+        debug_print("   Using HackRfError")
     except ImportError:
-        try:
-            from hackrf import HackRFError
-            print("   Using HackRFError")
-        except ImportError:
-            print("   No specific error class found, using Exception")
-            HackRFError = Exception
+        debug_print("   No specific error class found")
+        HackRFError = Exception
     
     HACKRF_AVAILABLE = True
-    print("✅ HackRF library loaded successfully")
+    debug_print("✅ HackRF library loaded successfully")
     
 except ImportError as e:
-    print(f"❌ hackrf import failed: {e}")
-    print("⚠️  HackRF library not available - using simulation mode")
-    print("   Install with: pip install pyhackrf")
+    debug_print(f"❌ hackrf import failed: {e}")
 
 class HackRFInterface:
     def __init__(self):
+        debug_print("HackRFInterface.__init__ called")
         self.device: Optional[HackRF] = None
         self.is_streaming = False
         self.callback: Optional[Callable] = None
@@ -53,143 +56,155 @@ class HackRFInterface:
         self.samples_received = 0
         self.errors = 0
         self._stop_requested = False
+        self.callback_count = 0
+        self.last_callback_time = 0
         
         # Try to open device on init if library is available
         if HACKRF_AVAILABLE:
-            print("🔧 Attempting to open HackRF device...")
+            debug_print("🔧 Attempting to open HackRF device...")
             success = self.open()
             if success:
-                # Configure with defaults
                 self.configure(
                     config.DEFAULT_FREQUENCY,
                     config.LNA_GAIN,
                     config.VGA_GAIN,
                     config.ENABLE_AMP
                 )
-                print("✅ HackRF ready (not streaming)")
+                debug_print("✅ HackRF ready (not streaming)")
         
     def open(self) -> bool:
         """Open HackRF device"""
+        debug_print("open() called")
         if not HACKRF_AVAILABLE:
-            print("⚠️  HackRF library not available")
+            debug_print("⚠️  HackRF library not available")
             return False
         
         try:
+            debug_print("Creating HackRF() instance...")
             self.device = HackRF()
-            print("✅ HackRF device opened")
+            debug_print("✅ HackRF device opened")
             
-            # Set sample rate
+            debug_print(f"Setting sample rate to {config.SAMPLE_RATE}...")
             self.device.sample_rate = config.SAMPLE_RATE
-            print(f"📊 Sample rate: {config.SAMPLE_RATE / 1e6:.3f} MHz")
+            debug_print(f"📊 Sample rate: {config.SAMPLE_RATE / 1e6:.3f} MHz")
             
-            # Set baseband filter bandwidth
             bandwidth = int(config.SAMPLE_RATE * 0.75)
+            debug_print(f"Setting bandwidth to {bandwidth}...")
             self.device.baseband_filter_bandwidth = bandwidth
-            print(f"🔧 Baseband filter: {bandwidth / 1e6:.3f} MHz")
+            debug_print(f"🔧 Baseband filter: {bandwidth / 1e6:.3f} MHz")
             
             return True
             
         except Exception as e:
-            print(f"❌ Failed to open HackRF: {e}")
+            debug_print(f"❌ Failed to open HackRF: {e}")
+            traceback.print_exc()
             return False
     
     def close(self):
         """Close HackRF device"""
+        debug_print("close() called")
         self.stop_rx()
         
         if self.device:
             try:
                 self.device.close()
-                print("📻 HackRF closed")
+                debug_print("📻 HackRF closed")
             except Exception as e:
-                print(f"⚠️  Error closing HackRF: {e}")
+                debug_print(f"⚠️  Error closing HackRF: {e}")
             finally:
                 self.device = None
     
     def configure(self, frequency: int, lna_gain: int = None, 
                   vga_gain: int = None, enable_amp: bool = None):
         """Configure HackRF parameters"""
+        debug_print(f"configure() called: freq={frequency}, lna={lna_gain}, vga={vga_gain}, amp={enable_amp}")
         if not self.device:
-            print("⚠️  No device to configure")
+            debug_print("⚠️  No device to configure")
             return False
         
         try:
-            # Set frequency
             self.device.freq = frequency
-            print(f"📡 Frequency: {frequency / 1e6:.3f} MHz")
+            debug_print(f"📡 Frequency: {frequency / 1e6:.3f} MHz")
             
-            # Set gains
             if lna_gain is not None:
                 self.device.lna_gain = lna_gain
-                print(f"🔊 LNA Gain: {lna_gain} dB")
+                debug_print(f"🔊 LNA Gain: {lna_gain} dB")
             
             if vga_gain is not None:
                 self.device.vga_gain = vga_gain
-                print(f"🔊 VGA Gain: {vga_gain} dB")
+                debug_print(f"🔊 VGA Gain: {vga_gain} dB")
             
-            # Set RF amp
             if enable_amp is not None:
                 self.device.enable_amp = enable_amp
-                print(f"📶 RF Amp: {'ON' if enable_amp else 'OFF'}")
+                debug_print(f"📶 RF Amp: {'ON' if enable_amp else 'OFF'}")
             
             return True
             
         except Exception as e:
-            print(f"❌ Configuration error: {e}")
+            debug_print(f"❌ Configuration error: {e}")
+            traceback.print_exc()
             return False
     
     def start_rx(self, callback: Callable):
         """Start receiving samples"""
+        debug_print("start_rx() called")
         if not self.device:
-            print("❌ Device not opened")
+            debug_print("❌ Device not opened")
             return False
         
         if self.is_streaming:
-            print("⚠️  Already streaming")
+            debug_print("⚠️  Already streaming")
             return False
         
         try:
+            debug_print(f"Setting callback: {callback}")
             self.callback = callback
             self.is_streaming = True
             self._stop_requested = False
             self.samples_received = 0
             self.errors = 0
+            self.callback_count = 0
             
-            print("🎯 Starting RX streaming...")
+            debug_print("🎯 Calling device.start_rx()...")
             self.device.start_rx(self._rx_callback)
-            print("✅ RX streaming started")
+            debug_print("✅ RX streaming started")
             
             return True
             
         except Exception as e:
-            print(f"❌ Failed to start RX: {e}")
-            import traceback
+            debug_print(f"❌ Failed to start RX: {e}")
             traceback.print_exc()
             self.is_streaming = False
             return False
     
     def stop_rx(self):
         """Stop receiving samples"""
+        debug_print("stop_rx() called")
         if not self.is_streaming:
+            debug_print("Not streaming, nothing to stop")
             return
         
-        print("🛑 Stopping RX...")
+        debug_print("🛑 Stopping RX...")
         self._stop_requested = True
         self.is_streaming = False
         
         # Give callbacks time to finish
+        debug_print("Waiting for callbacks to finish...")
         time.sleep(0.2)
         
         if self.device:
             try:
+                debug_print("Calling device.stop_rx()...")
                 self.device.stop_rx()
-                print(f"⏹️  Stopped RX (received {self.samples_received} samples, {self.errors} errors)")
+                debug_print(f"⏹️  Stopped RX (callbacks={self.callback_count}, samples={self.samples_received}, errors={self.errors})")
             except Exception as e:
-                print(f"⚠️  Error stopping RX: {e}")
+                debug_print(f"⚠️  Error stopping RX: {e}")
+                traceback.print_exc()
         
         # Clear buffer
         with self.lock:
             self.sample_buffer.clear()
+        debug_print("Buffer cleared")
     
     def start(self, callback: Callable):
         """Start scanning (wrapper)"""
@@ -221,10 +236,10 @@ class HackRFInterface:
         if self.device:
             try:
                 self.device.freq = frequency
-                print(f"📡 Changed to {frequency / 1e6:.3f} MHz")
+                debug_print(f"📡 Changed to {frequency / 1e6:.3f} MHz")
                 return True
             except Exception as e:
-                print(f"❌ Failed to change frequency: {e}")
+                debug_print(f"❌ Failed to change frequency: {e}")
                 return False
         return False
     
@@ -239,23 +254,53 @@ class HackRFInterface:
     
     def _rx_callback(self, hackrf_transfer):
         """Internal callback for HackRF data - MUST be fast and safe"""
+        self.callback_count += 1
+        current_time = time.time()
+        
+        # Log first few callbacks and then periodically
+        if self.callback_count <= 5 or self.callback_count % 100 == 0:
+            debug_print(f"_rx_callback #{self.callback_count} called (dt={current_time - self.last_callback_time:.3f}s)")
+        
+        self.last_callback_time = current_time
+        
         # Quick exit if stop requested
         if self._stop_requested or not self.is_streaming:
+            debug_print("Stop requested, returning -1")
             return -1
         
         try:
             # Get buffer safely
+            if self.callback_count <= 3:
+                debug_print(f"  Getting buffer from transfer...")
+            
             buffer = hackrf_transfer.buffer
-            if buffer is None or len(buffer) < 2:
+            if buffer is None:
+                if self.callback_count <= 3:
+                    debug_print(f"  Buffer is None!")
+                return 0
+            
+            buffer_len = len(buffer)
+            if self.callback_count <= 3:
+                debug_print(f"  Buffer length: {buffer_len}")
+            
+            if buffer_len < 2:
+                if self.callback_count <= 3:
+                    debug_print(f"  Buffer too small: {buffer_len}")
                 return 0
             
             # Convert bytes to numpy array
+            if self.callback_count <= 3:
+                debug_print(f"  Converting to numpy array...")
+            
             raw_data = np.frombuffer(buffer, dtype=np.int8)
             
             if len(raw_data) < 2:
                 return 0
             
             # Separate I and Q
+            if self.callback_count <= 3:
+                debug_print(f"  Separating I/Q...")
+            
             i_data = raw_data[0::2].astype(np.float32) / 128.0
             q_data = raw_data[1::2].astype(np.float32) / 128.0
             
@@ -264,12 +309,21 @@ class HackRFInterface:
             
             self.samples_received += len(iq_samples)
             
+            if self.callback_count <= 3:
+                debug_print(f"  Created {len(iq_samples)} IQ samples")
+            
             # Store in buffer with copy
+            if self.callback_count <= 3:
+                debug_print(f"  Storing in buffer...")
+            
             with self.lock:
                 self.sample_buffer.append(iq_samples.copy())
             
             # Call user callback if we have enough samples
             if len(iq_samples) >= config.SAMPLES_PER_SCAN and self.callback:
+                if self.callback_count <= 3:
+                    debug_print(f"  Calling user callback...")
+                
                 try:
                     # Calculate signal strength
                     power = np.abs(iq_samples[:config.SAMPLES_PER_SCAN]) ** 2
@@ -283,28 +337,58 @@ class HackRFInterface:
                     except:
                         pass
                     
-                    # Call callback with copy
+                    if self.callback_count <= 3:
+                        debug_print(f"  Invoking callback with strength={signal_strength:.1f}, freq={freq}")
+                    
+                    # Call callback with copy - THIS IS WHERE IT MIGHT CRASH
                     self.callback(
                         iq_samples[:config.SAMPLES_PER_SCAN].copy(),
                         signal_strength,
                         freq
                     )
+                    
+                    if self.callback_count <= 3:
+                        debug_print(f"  Callback completed successfully")
+                    
                 except Exception as e:
                     self.errors += 1
-                    if self.errors % 100 == 0:
-                        print(f"⚠️  Callback errors: {self.errors}")
+                    if self.errors <= 5:
+                        debug_print(f"❌ Callback error #{self.errors}: {e}")
+                        traceback.print_exc()
+            
+            if self.callback_count <= 3:
+                debug_print(f"  Returning 0 (continue)")
             
             return 0
             
         except Exception as e:
             self.errors += 1
-            if self.errors < 5:  # Only print first few errors
-                print(f"❌ RX callback error: {e}")
+            if self.errors <= 5:
+                debug_print(f"❌ RX callback error #{self.errors}: {e}")
+                traceback.print_exc()
             if self.errors > 1000:
-                print("⚠️  Too many errors, stopping")
+                debug_print("⚠️  Too many errors, stopping")
                 return -1
             return 0
     
+    def capture_samples(self, num_samples: int = None, timeout: float = 1.0) -> Optional[np.ndarray]:
+        """Capture samples (blocking)"""
+        if num_samples is None:
+            num_samples = config.SAMPLES_PER_SCAN
+        
+        if not self.is_streaming:
+            return None
+        
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            with self.lock:
+                if len(self.sample_buffer) > 0:
+                    samples = self.sample_buffer.popleft()
+                    if len(samples) >= num_samples:
+                        return samples[:num_samples]
+            time.sleep(0.01)
+        
+        return None
     
     def get_statistics(self) -> dict:
         """Get interface statistics"""
@@ -314,7 +398,10 @@ class HackRFInterface:
             'errors': self.errors,
             'buffer_size': len(self.sample_buffer),
             'sample_rate': config.SAMPLE_RATE,
+            'callback_count': self.callback_count,
         }
+
+
 
 class SimulatedHackRF:
     """Simulated HackRF for testing"""
@@ -437,4 +524,5 @@ def create_hackrf_interface(use_simulation: bool = False):
         return SimulatedHackRF()
     else:
         return HackRFInterface()
+
 
