@@ -70,7 +70,7 @@ mkdir -p logs
 # Set environment variables
 export PYTHONUNBUFFERED=1
 export STREAMLIT_SERVER_PORT=8502
-export STREAMLIT_SERVER_ADDRESS=localhost
+export STREAMLIT_SERVER_ADDRESS=0.0.0.0
 
 # Start the application
 echo ""
