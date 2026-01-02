@@ -1,96 +1,108 @@
-
 """
-Configuration for TPMS Tracker
-Optimized to match native HackRF TPMS app performance
+Configuration settings for TPMS Scanner
+Optimized for Maurader TPMSRX compatibility
 """
-from pathlib import Path
+from dataclasses import dataclass
+from typing import List
 
+@dataclass
 class Config:
-    # Database
-    DB_PATH = "tpms_tracker.db"
+    # HackRF Settings - matching Maurader baseband
+    SAMPLE_RATE: int = 2_457_600  # 2.4576 MHz - exact Maurader rate
+    CENTER_FREQ: int = 315_000_000  # 315 MHz default
     
-    # HackRF Settings - MATCH NATIVE APP
-    SAMPLE_RATE = 2_457_600  # Match HackRF native (was 2_000_000)
-    BANDWIDTH = 1_750_000    # Match HackRF native (was not set)
-    DEFAULT_GAIN = 20        # LNA gain
-    VGA_GAIN = 20           # VGA gain
-    RF_AMP = 0              # RF amp (0=off, 1=on)
+    # Gain Settings (conservative defaults)
+    LNA_GAIN: int = 32  # 0-40 dB (start moderate)
+    VGA_GAIN: int = 30  # 0-62 dB (start moderate)
+    ENABLE_AMP: bool = True  # RF amp on
     
-    # Gain Settings
-    GAIN_MIN = 0
-    GAIN_MAX = 47
-    GAIN_STEP = 4
-    
-    # Frequency Configuration - MATCH NATIVE APP
-    DEFAULT_FREQUENCY = 314.9e6  # 314.9 MHz (primary)
-    FREQUENCY_LIST = [
-        314.9e6,  # 314.9 MHz - most common
-        315.0e6,  # 315.0 MHz - alternate
-        433.92e6  # 433.92 MHz - European
+    # TPMS Frequency Bands
+    TPMS_FREQUENCIES: List[int] = [
+        314_900_000,  # 314.9 MHz (US)
+        315_000_000,  # 315.0 MHz (US)
+        433_920_000,  # 433.92 MHz (EU)
     ]
-    FREQUENCIES = [314.9, 433.92, 315.0]  # MHz format for compatibility
     
-    # Frequency Hopping - DISABLED for better reception
-    ENABLE_FREQUENCY_HOPPING = False  # Changed from True
-    FREQUENCY_HOP_ENABLED = False     # Duplicate for compatibility
-    FREQUENCY_HOP_INTERVAL = 60       # seconds (if enabled)
-    FREQUENCY_HOP_DWELL_TIME = 1.1    # settling time after hop
-    ADAPTIVE_HOPPING = False          # Changed from True
+    # Signal Detection Thresholds
+    SIGNAL_THRESHOLD: float = -70.0  # dBm - lowered for better sensitivity
+    MIN_SNR: float = 6.0  # dB - minimum SNR for valid decode
     
-    # Signal Detection - LOWERED based on your captures
-    MIN_SIGNAL_STRENGTH = -95    # dBm (very sensitive)
-    SIGNAL_THRESHOLD = -95       # dBm
-    DETECTION_THRESHOLD = -95    # dBm
-    PEAK_POWER_THRESHOLD = -95   # dBm
+    # Symbol Rates (matching Maurader exactly)
+    SYMBOL_RATE_FSK: int = 19_200  # Schrader FSK
+    SYMBOL_RATE_OOK: int = 8_192   # Schrader OOK primary
+    SYMBOL_RATE_OOK_ALT: int = 8_400  # Schrader OOK alternate
     
-    # Demodulation Settings - MATCH NATIVE APP
-    FSK_DEVIATION = 19200       # Hz - for FSK signals
-    SYMBOL_RATE_FSK = 19200     # baud - FSK Schrader
-    SYMBOL_RATE_OOK = 8192      # baud - OOK Schrader
+    # FSK Deviation
+    FSK_DEVIATION: int = 38_400  # 2x symbol rate for Schrader
     
-    # Vehicle Clustering - Allow single sensor detection
-    MIN_SENSORS_FOR_VEHICLE = 1  # Show even single sensors
-    CLUSTER_TIME_WINDOW = 30     # seconds
-    MIN_SIGNALS_PER_VEHICLE = 1
-    MAX_SIGNAL_AGE = 300         # seconds
+    # Capture Settings
+    SAMPLES_PER_SCAN: int = 262_144  # ~107ms at 2.4576 MHz
+    SCAN_DWELL_TIME: float = 0.15  # seconds per frequency
+    SCAN_INTERVAL: float = 0.5  # seconds between scans
     
-    # Processing
-    MAX_QUEUE_SIZE = 1000
-    SIGNAL_BUFFER_SIZE = 262144  # Larger buffer for continuous reception
-    
-    # Signal Processing
-    FFT_SIZE = 2048
-    DECIMATION = 4
+    # Buffer Settings
+    BUFFER_SIZE: int = 262_144  # Must match SAMPLES_PER_SCAN
+    NUM_BUFFERS: int = 4
     
     # Protocol Detection
-    PROTOCOL_DETECTION_ENABLED = True
-    PROTOCOL_MIN_SAMPLES = 100  # Minimum samples before attempting protocol detection
-    KNOWN_PROTOCOLS = [
-        'Toyota/Lexus',
-        'Schrader',
-        'Continental',
-        'TRW',
-        'Pacific',
-        'Beru',
-        'Huf/Beru',
-        'Jansite'
-    ]
+    PROTOCOL_DETECTION_ENABLED: bool = True
+    MAX_UNKNOWN_SIGNALS: int = 100
     
-    # Histogram Settings
-    HISTOGRAM_BINS = 50
-    HISTOGRAM_WINDOW = 300  # seconds of data to display
-    SIGNAL_HISTORY_SIZE = 10000  # Max samples to keep
+    # Packet Validation
+    MIN_PACKET_LENGTH: int = 64  # bits
+    MAX_PACKET_LENGTH: int = 128  # bits
+    MAX_PREAMBLE_ERRORS: int = 2  # bit errors allowed in preamble
     
-    # ML Settings
-    MIN_ENCOUNTERS_FOR_PREDICTION = 5
-    PREDICTION_CONFIDENCE_THRESHOLD = 0.6
+    # Learning Engine
+    LEARNING_ENABLED: bool = True
+    LEARNING_WINDOW: int = 100  # signals to analyze
+    ADAPTATION_THRESHOLD: float = 0.7  # confidence threshold
     
-    # Trigger Settings
-    LF_TRIGGER_FREQUENCY = 125000  # 125 kHz
-    TRIGGER_PULSE_WIDTH = 0.1      # 100ms
-    TRIGGER_TX_GAIN = 47           # Maximum TX gain
-    ENABLE_TRIGGER = True          # Enable trigger functionality
+    # Display Settings
+    MAX_DISPLAY_SENSORS: int = 20
+    SENSOR_TIMEOUT: float = 300.0  # 5 minutes
+    
+    # Logging
+    LOG_ENABLED: bool = True
+    LOG_UNKNOWN_SIGNALS: bool = True
+    LOG_RAW_SAMPLES: bool = False  # Warning: creates large files
+    
+    # Performance
+    USE_MULTIPROCESSING: bool = True
+    MAX_WORKERS: int = 2  # CPU cores for processing
 
-
-# Create singleton instance
+# Global config instance
 config = Config()
+
+# Frequency presets with names
+FREQUENCY_PRESETS = {
+    'US_314.9': 314_900_000,
+    'US_315.0': 315_000_000,
+    'EU_433.92': 433_920_000,
+}
+
+# Protocol-specific parameters
+PROTOCOL_PARAMS = {
+    'Schrader_FSK': {
+        'symbol_rate': 19_200,
+        'deviation': 38_400,
+        'preamble': [0x55, 0x55],
+        'packet_bytes': 10,
+    },
+    'Schrader_OOK_8k192': {
+        'symbol_rate': 8_192,
+        'preamble': [0xAA, 0xAA],
+        'packet_bytes': 8,
+    },
+    'Schrader_OOK_8k4': {
+        'symbol_rate': 8_400,
+        'preamble': [0xAA, 0xAA],
+        'packet_bytes': 8,
+    },
+    'Toyota': {
+        'symbol_rate': 10_000,
+        'deviation': 20_000,
+        'preamble': [0x55, 0x55, 0x55],
+        'packet_bytes': 10,
+    },
+}
