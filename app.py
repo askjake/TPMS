@@ -13,6 +13,51 @@ import pytz
 
 # Timezone configuration
 MOUNTAIN_TZ = pytz.timezone('America/Denver')  # Mountain Time with DST support
+# At top of app.py, after imports
+_processing_thread = None
+_should_process = False
+
+def processing_loop():
+    """Background thread to process samples"""
+    global _should_process
+    
+    print(f"[{time.time():.3f}] Processing thread started", flush=True)
+    
+    while _should_process:
+        try:
+            # Add periodic heartbeat
+            if not hasattr(processing_loop, 'count'):
+                processing_loop.count = 0
+            processing_loop.count += 1
+            
+            if processing_loop.count % 50 == 0:  # Every 5 seconds
+                print(f"[{time.time():.3f}] Processing thread alive, count={processing_loop.count}", flush=True)
+            
+            process_signal_buffer()
+            time.sleep(0.1)  # Process every 100ms
+        except Exception as e:
+            print(f"Processing thread error: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+
+
+def start_processing():
+    """Start background processing thread"""
+    global _processing_thread, _should_process
+    
+    if _processing_thread and _processing_thread.is_alive():
+        return  # Already running
+    
+    _should_process = True
+    _processing_thread = threading.Thread(target=processing_loop, daemon=True)
+    _processing_thread.start()
+    print("✅ Started background processing thread", flush=True)
+
+def stop_processing():
+    """Stop background processing thread"""
+    global _should_process
+    _should_process = False
+    print("⏹️ Stopped background processing thread", flush=True)
 
 def format_timestamp(timestamp, format_str="%Y-%m-%d %H:%M:%S", include_timezone=False):
     """Convert Unix timestamp to Mountain Time formatted string"""
@@ -110,6 +155,24 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+def init_globals():
+    """Initialize global references from session state"""
+    global _decoder, _db, _ml_engine
+    
+    if 'decoder' in st.session_state:
+        _decoder = st.session_state.decoder
+        _db = st.session_state.db
+        _ml_engine = st.session_state.ml_engine
+        
+        # Verify it worked
+        #if _decoder is not None:
+            #print(f"✅ Globals initialized: decoder={type(_decoder).__name__}", flush=True)
+        #else:
+            #print("⚠️  init_globals() called but decoder is still None!", flush=True)
+    else:
+        print("⚠️  init_globals() called but 'decoder' not in session_state yet!", flush=True)
+
+
 # Initialize session state
 if 'db' not in st.session_state:
     st.session_state.db = TPMSDatabase(config.DB_PATH)
@@ -120,41 +183,113 @@ if 'db' not in st.session_state:
     st.session_state.signal_buffer = []
     st.session_state.recent_detections = []
     
-
+    # Initialize global references for background thread
+    # init_globals()  # <-- REMOVE THIS LINE FROM HERE
 
 if 'esp32_trigger' not in st.session_state:
     st.session_state.esp32_trigger = ESP32TriggerController("192.168.4.1")
 
+# ADD THIS LINE HERE (outside the if block):
+init_globals()  # <-- Always refresh global references on every script run
+
+
+# Global buffer for thread-safe data passing
+_sample_buffer = []
+_buffer_lock = threading.Lock()
+_decoder = None
+_db = None
+_ml_engine = None
+_signal_buffer_list = []
 
 def signal_callback(iq_samples, signal_strength, frequency):
-    """Callback for processing HackRF samples - queue-based"""
+    """Callback for processing HackRF samples"""
+    global _sample_buffer
+    
     try:
-        # Debug first few callbacks
         if not hasattr(signal_callback, 'count'):
             signal_callback.count = 0
+            signal_callback.last_log = time.time()
+        
         signal_callback.count += 1
         
-        if signal_callback.count <= 3 or signal_callback.count % 10 == 0:
-            print(f"[{time.time():.3f}] signal_callback #{signal_callback.count}: "
-                  f"samples={len(iq_samples)}, strength={signal_strength:.1f} dBm, "
-                  f"freq={frequency/1e6:.1f} MHz", flush=True)
+        # Only log every 100 callbacks or every 30 seconds
+        now = time.time()
+        if signal_callback.count % 100 == 0 or (now - signal_callback.last_log) > 30.0:
+            #print(f"📊 Processed {signal_callback.count} samples | "
+                  #f"Buffer: {len(_sample_buffer)}", flush=True)
+            signal_callback.last_log = now
         
-        # Put data in queue instead of processing directly
-        signal_queue.put({
-            'iq_samples': iq_samples,
-            'signal_strength': signal_strength,
-            'frequency': frequency,
-            'timestamp': time.time()
-        }, block=False)
-        
-        if signal_callback.count <= 3:
-            print(f"  Queued successfully (queue size: {signal_queue.qsize()})", flush=True)
+        with _buffer_lock:
+            _sample_buffer.append({
+                'iq_samples': iq_samples.copy(),
+                'signal_strength': signal_strength,
+                'frequency': frequency,
+                'timestamp': time.time()
+            })
             
-    except queue.Full:
-        if signal_callback.count <= 3:
-            print(f"  ⚠️  Queue full, dropping sample", flush=True)
+            if len(_sample_buffer) > 100:
+                _sample_buffer = _sample_buffer[-100:]
+                
     except Exception as e:
-        print(f"  ❌ Callback error: {e}", flush=True)
+        print(f"❌ Callback error: {e}", flush=True)
+
+
+def process_signal_buffer():
+    """Process signals from buffer"""
+    global _sample_buffer, _decoder, _db, _ml_engine, _signal_buffer_list
+    
+    if not hasattr(process_signal_buffer, 'call_count'):
+        process_signal_buffer.call_count = 0
+    process_signal_buffer.call_count += 1
+    
+    # Only log every 500 calls
+    if process_signal_buffer.call_count % 500 == 0:
+        print(f"🔄 Processing loop: {process_signal_buffer.call_count} iterations", flush=True)
+    
+    if _decoder is None:
+        return
+    
+    with _buffer_lock:
+        if not _sample_buffer:
+            return
+        samples_to_process = _sample_buffer.copy()
+        _sample_buffer.clear()
+    
+    # Process each sample (decoder will log successful decodes)
+    for data in samples_to_process:
+        try:
+            signal_history_queue.append(data['signal_strength'])
+            signals = _decoder.process_samples(data['iq_samples'], data['frequency'])
+            
+            for signal in signals:
+                signal.signal_strength = data['signal_strength']
+                
+                signal_dict = {
+                    'tpms_id': signal.tpms_id,
+                    'timestamp': signal.timestamp,
+                    'frequency': signal.frequency,
+                    'signal_strength': signal.signal_strength,
+                    'snr': signal.snr,
+                    'pressure_psi': signal.pressure_psi,
+                    'temperature_c': signal.temperature_c,
+                    'battery_low': signal.battery_low,
+                    'protocol': signal.protocol,
+                    'raw_data': signal.raw_data
+                }
+                
+                _db.insert_signal(signal_dict)
+                _signal_buffer_list.append(signal_dict)
+            
+            # Vehicle clustering
+            if len(_signal_buffer_list) > 10:
+                vehicle_ids = _ml_engine.process_signals(_signal_buffer_list)
+                for vehicle_id in vehicle_ids:
+                    vehicle_info = _db.get_vehicle_history(vehicle_id)
+                    print(f"🚗 Vehicle {vehicle_id} detected", flush=True)
+                _signal_buffer_list = []
+                
+        except Exception as e:
+            print(f"❌ Processing error: {e}", flush=True)
 
 
 def show_signal_histogram():
@@ -245,8 +380,9 @@ def show_reference_signals():
 
 def show_live_detection():
     """Live detection tab"""
+    # ALWAYS process queue, even if not on this tab
     if st.session_state.is_scanning:
-        process_signal_queue()
+        process_signal_buffer() 
     
     st.header("Live TPMS Detection")
     
@@ -980,9 +1116,21 @@ def process_signal_queue():
     processed = 0
     max_batch = 10
     
+    # Debug: Log when this function is called
+    if not hasattr(process_signal_queue, 'call_count'):
+        process_signal_queue.call_count = 0
+    process_signal_queue.call_count += 1
+    
+    if process_signal_queue.call_count <= 3 or process_signal_queue.call_count % 50 == 0:
+        print(f"[{time.time():.3f}] process_signal_queue() called #{process_signal_queue.call_count}, "
+              f"queue_size={signal_queue.qsize()}", flush=True)
+    
     while not signal_queue.empty() and processed < max_batch:
         try:
             data = signal_queue.get_nowait()
+            
+            if processed == 0:  # Log first item in batch
+                print(f"  Processing batch: strength={data['signal_strength']:.1f} dBm", flush=True)
             
             # Add to signal history for histogram
             signal_history_queue.append(data['signal_strength'])
@@ -992,9 +1140,16 @@ def process_signal_queue():
                 data['iq_samples'], 
                 data['frequency']
             )
+            
+            if signals:
+                print(f"  ✅ Decoder found {len(signals)} TPMS signals!", flush=True)
 
             for signal in signals:
                 signal.signal_strength = data['signal_strength']
+                
+                print(f"  📡 TPMS Decoded: ID={signal.tpms_id}, "
+                      f"Protocol={signal.protocol}, "
+                      f"Pressure={signal.pressure_psi} PSI", flush=True)
                 
                 # Increment detection count for this frequency
                 st.session_state.hackrf.increment_detection(data['frequency'])
@@ -1034,8 +1189,14 @@ def process_signal_queue():
         except queue.Empty:
             break
         except Exception as e:
-            print(f"Error processing signal: {e}")
+            print(f"  ❌ Error processing signal: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
             continue
+    
+    #if processed > 0:
+        #print(f"  Processed {processed} items from queue", flush=True)
+
 
 # Update show_trigger_controls()
 def show_trigger_controls():
@@ -1164,6 +1325,9 @@ def show_trigger_controls():
 def main():
     st.title("🚗 TPMS Tracker - Intelligent Vehicle Pattern Recognition")
     st.caption(f"🕐 Displaying times in Mountain Time (MT)")
+    
+    if st.session_state.is_scanning:
+        process_signal_buffer() 
 
     with st.sidebar:
         st.header("⚙️ Control Panel")
@@ -1213,15 +1377,21 @@ def main():
         col1, col2 = st.columns(2)
         with col1:
             if st.button("▶️ Start Scan", disabled=st.session_state.is_scanning, key="main_start_btn"):
-                st.session_state.is_scanning = True
-                st.session_state.hackrf.start(signal_callback)
-                st.success("Scanning started!")
-                st.rerun()
+                # First, ensure globals are initialized
+                    init_globals()
+    
+                    # Then start everything
+                    st.session_state.is_scanning = True
+                    st.session_state.hackrf.start(signal_callback)
+                    start_processing()  # Start processing thread AFTER everything is ready
+                    st.success("Scanning started!")
+                    st.rerun()
 
         with col2:
             if st.button("⏹️ Stop Scan", disabled=not st.session_state.is_scanning, key="main_stop_btn"):
                 st.session_state.is_scanning = False
                 st.session_state.hackrf.stop()
+                stop_processing()
                 st.info("Scanning stopped")
                 st.rerun()
 

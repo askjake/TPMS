@@ -114,39 +114,21 @@ echo "[7/8] Installing HackRF support..."
 # Check if libhackrf is installed
 if ldconfig -p | grep -q libhackrf; then
     print_status "libhackrf found"
+    
+    # Get the library path
+    LIBHACKRF_PATH=$(ldconfig -p | grep libhackrf | awk '{print $NF}' | head -1)
+    print_status "Library path: $LIBHACKRF_PATH"
 else
-    print_warning "libhackrf not found"
+    print_error "libhackrf not found!"
     echo ""
-    echo "To use HackRF hardware, install libhackrf:"
-    echo "  Ubuntu/Debian: sudo apt install libhackrf-dev libusb-1.0-0-dev"
-    echo "  Fedora/RHEL: sudo dnf install hackrf-devel libusb-devel"
-    echo ""
-    echo "The application will work in simulation mode without it."
+    echo "Installing libhackrf..."
+    sudo apt update
+    sudo apt install -y libhackrf-dev libusb-1.0-0-dev hackrf
+    print_status "libhackrf installed"
 fi
 
-# Install PyHackRF from source (since it's not on PyPI)
-echo ""
-echo "Installing PyHackRF..."
-if [ -d "pyhackrf_temp" ]; then
-    rm -rf pyhackrf_temp
-fi
-
-git clone https://github.com/ckuethe/pyhackrf.git pyhackrf_temp 2>/dev/null || {
-    print_warning "Could not clone PyHackRF repository"
-    print_warning "HackRF support will be limited to simulation mode"
-}
-
-if [ -d "pyhackrf_temp" ]; then
-    cd pyhackrf_temp
-    pip install . || {
-        print_warning "PyHackRF installation failed"
-        print_warning "Continuing without HackRF support"
-    }
-    cd ..
-    rm -rf pyhackrf_temp
-    print_status "PyHackRF installed"
-fi
-
+# We'll use ctypes to call libhackrf directly - no Python wrapper needed
+print_status "HackRF support configured (using ctypes)"
 # [8/8] Setup permissions and directories
 echo ""
 echo "[8/8] Final setup..."

@@ -1,0 +1,30 @@
+
+========================================
+🚀 TPMS Scanner
+========================================
+
+🔌 Activating virtual environment...
+[0;32m✅ Using: Python 3.13.7[0m
+
+🔍 Checking for HackRF device...
+[0;32m✅ HackRF device detected[0m
+
+========================================
+🌐 Starting web interface
+========================================
+
+URL: http://localhost:8502
+
+Press Ctrl+C to stop
+
+
+  You can now view your Streamlit app in your browser.
+
+  URL: http://0.0.0.0:8502
+
+[1767378461.885] 🔍 Attempting to import HackRF library...
+[1767378461.885] ❌ hackrf import failed: No module named 'hackrf'
+[1767378465.823] HackRFInterface.__init__ called
+[1767378465.834] HackRFInterface.__init__ called
+[1767378473.262] start_rx() called
+[1767378473.262] ❌ Device not opened

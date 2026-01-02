@@ -1,0 +1,5225 @@
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
+import time
+import threading
+import queue
+import numpy as np
+from collections import deque
+from esp32_trigger_controller import ESP32TriggerController
+import pytz
+
+# Timezone configuration
+MOUNTAIN_TZ = pytz.timezone('America/Denver')  # Mountain Time with DST support
+# At top of app.py, after imports
+_processing_thread = None
+_should_process = False
+
+def processing_loop():
+    """Background thread to process samples"""
+    global _should_process
+    
+    while _should_process:
+        try:
+            process_signal_buffer()
+            time.sleep(0.1)  # Process every 100ms
+        except Exception as e:
+            print(f"Processing thread error: {e}", flush=True)
+
+def start_processing():
+    """Start background processing thread"""
+    global _processing_thread, _should_process
+    
+    if _processing_thread and _processing_thread.is_alive():
+        return  # Already running
+    
+    _should_process = True
+    _processing_thread = threading.Thread(target=processing_loop, daemon=True)
+    _processing_thread.start()
+    print("✅ Started background processing thread", flush=True)
+
+def stop_processing():
+    """Stop background processing thread"""
+    global _should_process
+    _should_process = False
+    print("⏹️ Stopped background processing thread", flush=True)
+
+def format_timestamp(timestamp, format_str="%Y-%m-%d %H:%M:%S", include_timezone=False):
+    """Convert Unix timestamp to Mountain Time formatted string"""
+    if timestamp is None:
+        return "Never"
+    
+    # Convert from UTC to Mountain Time
+    utc_dt = datetime.fromtimestamp(timestamp, tz=pytz.UTC)
+    mountain_dt = utc_dt.astimezone(MOUNTAIN_TZ)
+    
+    if include_timezone:
+        return mountain_dt.strftime(format_str + " %Z")
+    return mountain_dt.strftime(format_str)
+
+def timestamp_to_mountain(timestamp):
+    """Convert Unix timestamp to Mountain Time datetime object"""
+    if timestamp is None:
+        return None
+    utc_dt = datetime.fromtimestamp(timestamp, tz=pytz.UTC)
+    return utc_dt.astimezone(MOUNTAIN_TZ)
+
+def pandas_timestamp_to_mountain(series):
+    """Convert pandas timestamp series to Mountain Time"""
+    return pd.to_datetime(series, unit='s', utc=True).dt.tz_convert(MOUNTAIN_TZ)
+
+# Add to session state
+if 'esp32_trigger' not in st.session_state:
+    st.session_state.esp32_trigger = ESP32TriggerController("192.168.4.1")
+
+# Update show_trigger_controls()
+def show_trigger_controls():
+    """ESP32 LF Trigger Controls"""
+    st.header("📡 ESP32 LF Trigger Control")
+    
+    # Connection status
+    if st.session_state.esp32_trigger.connected:
+        st.success("✅ ESP32 Connected")
+    else:
+        st.error("❌ ESP32 Not Connected")
+        if st.button("🔄 Reconnect"):
+            st.session_state.esp32_trigger.check_connection()
+            st.rerun()
+    
+    if not st.session_state.esp32_trigger.connected:
+        st.info("Connect to WiFi network: **TPMS_Trigger** (password: tpms12345)")
+        return
+    
+    # Rest of trigger controls...
+
+# Import config and modules
+from config import config
+from database import TPMSDatabase
+from hackrf_interface import HackRFInterface
+from tpms_decoder import TPMSDecoder
+from ml_engine import VehicleClusteringEngine
+from esp32_trigger_controller import ESP32TriggerController
+import pytz
+
+# Timezone configuration
+MOUNTAIN_TZ = pytz.timezone('America/Denver')  # Mountain Time with DST support
+
+def format_timestamp(timestamp, format_str="%Y-%m-%d %H:%M:%S", include_timezone=False):
+    """Convert Unix timestamp to Mountain Time formatted string"""
+    if timestamp is None:
+        return "Never"
+    
+    # Convert from UTC to Mountain Time
+    utc_dt = datetime.fromtimestamp(timestamp, tz=pytz.UTC)
+    mountain_dt = utc_dt.astimezone(MOUNTAIN_TZ)
+    
+    if include_timezone:
+        return mountain_dt.strftime(format_str + " %Z")
+    return mountain_dt.strftime(format_str)
+
+def timestamp_to_mountain(timestamp):
+    """Convert Unix timestamp to Mountain Time datetime object"""
+    if timestamp is None:
+        return None
+    utc_dt = datetime.fromtimestamp(timestamp, tz=pytz.UTC)
+    return utc_dt.astimezone(MOUNTAIN_TZ)
+
+def pandas_timestamp_to_mountain(series):
+    """Convert pandas timestamp series to Mountain Time"""
+    return pd.to_datetime(series, unit='s', utc=True).dt.tz_convert(MOUNTAIN_TZ)
+
+# Global queues for thread-safe communication
+signal_queue = queue.Queue(maxsize=1000)
+signal_history_queue = deque(maxlen=config.SIGNAL_HISTORY_SIZE)
+
+# Page config
+st.set_page_config(
+    page_title="TPMS Tracker",
+    page_icon="🚗",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+def init_globals():
+    """Initialize global references from session state"""
+    global _decoder, _db, _ml_engine
+    if 'decoder' in st.session_state:
+        _decoder = st.session_state.decoder
+        _db = st.session_state.db
+        _ml_engine = st.session_state.ml_engine
+# Initialize session state
+if 'db' not in st.session_state:
+    st.session_state.db = TPMSDatabase(config.DB_PATH)
+    st.session_state.hackrf = HackRFInterface()
+    st.session_state.decoder = TPMSDecoder(config.SAMPLE_RATE)
+    st.session_state.ml_engine = VehicleClusteringEngine(st.session_state.db)
+    st.session_state.is_scanning = False
+    st.session_state.signal_buffer = []
+    st.session_state.recent_detections = []
+    
+    # Initialize global references for background thread
+    init_globals()
+
+
+
+if 'esp32_trigger' not in st.session_state:
+    st.session_state.esp32_trigger = ESP32TriggerController("192.168.4.1")
+
+
+# Global buffer for thread-safe data passing
+_sample_buffer = []
+_buffer_lock = threading.Lock()
+_decoder = None
+_db = None
+_ml_engine = None
+_signal_buffer_list = []
+
+def signal_callback(iq_samples, signal_strength, frequency):
+    """Callback for processing HackRF samples - direct approach"""
+    global _sample_buffer
+    
+    try:
+        # Store in thread-safe buffer
+        with _buffer_lock:
+            _sample_buffer.append({
+                'iq_samples': iq_samples.copy(),  # Important: copy the data!
+                'signal_strength': signal_strength,
+                'frequency': frequency,
+                'timestamp': time.time()
+            })
+            
+            # Limit buffer size
+            if len(_sample_buffer) > 100:
+                _sample_buffer = _sample_buffer[-100:]  # Keep last 100
+        
+        # Debug
+        if not hasattr(signal_callback, 'count'):
+            signal_callback.count = 0
+        signal_callback.count += 1
+        
+        if signal_callback.count % 100 == 0:
+            with _buffer_lock:
+                buffer_size = len(_sample_buffer)
+            print(f"[{time.time():.3f}] Callback #{signal_callback.count}: "
+                  f"samples={len(iq_samples)}, strength={signal_strength:.1f} dBm, "
+                  f"buffer_size={buffer_size}", flush=True)
+            
+    except Exception as e:
+        print(f"Callback error: {e}", flush=True)
+
+
+
+
+
+def process_signal_buffer():
+    """Process signals from buffer - thread-safe version"""
+    global _sample_buffer, _decoder, _db, _ml_engine, _signal_buffer_list
+    
+    # Check if globals are initialized
+    if _decoder is None:
+        return  # Not ready yet
+    
+    # Get samples from buffer
+    with _buffer_lock:
+        if not _sample_buffer:
+            return
+            
+        samples_to_process = _sample_buffer.copy()
+        _sample_buffer.clear()
+    
+    print(f"[{time.time():.3f}] Processing {len(samples_to_process)} samples", flush=True)
+    
+    # Process each sample
+    for data in samples_to_process:
+        try:
+            # Add to histogram
+            signal_history_queue.append(data['signal_strength'])
+            
+            # Decode
+            signals = _decoder.process_samples(
+                data['iq_samples'],
+                data['frequency']
+            )
+            
+            if signals:
+                print(f"  ✅ Found {len(signals)} TPMS signals!", flush=True)
+            
+            for signal in signals:
+                signal.signal_strength = data['signal_strength']
+                
+                print(f"  📡 TPMS: ID={signal.tpms_id}, "
+                      f"Protocol={signal.protocol}, "
+                      f"Pressure={signal.pressure_psi} PSI", flush=True)
+                
+                signal_dict = {
+                    'tpms_id': signal.tpms_id,
+                    'timestamp': signal.timestamp,
+                    'frequency': signal.frequency,
+                    'signal_strength': signal.signal_strength,
+                    'snr': signal.snr,
+                    'pressure_psi': signal.pressure_psi,
+                    'temperature_c': signal.temperature_c,
+                    'battery_low': signal.battery_low,
+                    'protocol': signal.protocol,
+                    'raw_data': signal.raw_data
+                }
+                
+                _db.insert_signal(signal_dict)
+                _signal_buffer_list.append(signal_dict)
+            
+            # Vehicle clustering
+            if len(_signal_buffer_list) > 10:
+                vehicle_ids = _ml_engine.process_signals(_signal_buffer_list)
+                
+                for vehicle_id in vehicle_ids:
+                    vehicle_info = _db.get_vehicle_history(vehicle_id)
+                    # Store in session state from main thread later
+                    print(f"  🚗 Vehicle detected: ID={vehicle_id}", flush=True)
+                
+                _signal_buffer_list = []
+                
+        except Exception as e:
+            print(f"  ❌ Processing error: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+
+
+def show_signal_histogram():
+    """Display real-time signal strength histogram"""
+    st.subheader("📊 Signal Strength Distribution")
+    
+    if len(signal_history_queue) < 10:
+        st.info("Collecting signal data...")
+        return
+    
+    # Convert to numpy array
+    signal_data = np.array(list(signal_history_queue))
+    
+    # Create histogram
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(
+        x=signal_data,
+        nbinsx=config.HISTOGRAM_BINS,
+        name='Signal Strength',
+        marker_color='lightblue'
+    ))
+    
+    # Add threshold line
+    fig.add_vline(
+        x=config.SIGNAL_THRESHOLD,
+        line_dash="dash",
+        line_color="red",
+        annotation_text="Detection Threshold"
+    )
+    
+    fig.update_layout(
+        title='Signal Strength Distribution (dBm)',
+        xaxis_title='Signal Strength (dBm)',
+        yaxis_title='Count',
+        showlegend=True,
+        height=300
+    )
+    
+    st.plotly_chart(fig, width="stretch")
+    
+    # Statistics
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Mean", f"{np.mean(signal_data):.1f} dBm")
+    with col2:
+        st.metric("Median", f"{np.median(signal_data):.1f} dBm")
+    with col3:
+        st.metric("Max", f"{np.max(signal_data):.1f} dBm")
+    with col4:
+        above_threshold = np.sum(signal_data > config.SIGNAL_THRESHOLD)
+        st.metric("Above Threshold", f"{above_threshold} ({above_threshold/len(signal_data)*100:.1f}%)")
+        
+def show_reference_signals():
+    """Display reference 'happy path' signals"""
+    from reference_signals import REFERENCE_SIGNALS, get_reference_characteristics
+    
+    st.subheader("📌 Reference Signals (Happy Path)")
+    st.caption("These known-good captures anchor the ML learning system")
+    
+    for ref_name, ref_data in REFERENCE_SIGNALS.items():
+        with st.expander(f"🎯 {ref_data['protocol']} - {ref_data['tpms_id']}"):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Frequency", f"{ref_data['frequency']} MHz")
+                st.metric("Signal Strength", f"{ref_data['signal_strength']} dBm")
+            with col2:
+                st.metric("Protocol", ref_data['protocol'])
+                st.metric("Modulation", ref_data['modulation'])
+            with col3:
+                st.metric("TPMS ID", ref_data['tpms_id'])
+                st.caption(ref_data['timestamp'])
+            
+            st.info(f"📝 {ref_data['notes']}")
+    
+    # Show reference characteristics
+    ref_chars = get_reference_characteristics()
+    st.divider()
+    st.subheader("🎯 Detection Parameters (from references)")
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Frequency Range", f"{ref_chars['frequency_range'][0]}-{ref_chars['frequency_range'][1]} MHz")
+    with col2:
+        st.metric("Min Signal Strength", f"{ref_chars['min_signal_strength']} dBm")
+    with col3:
+        st.metric("Typical Strength", f"{ref_chars['typical_strength']} dBm")
+
+
+def show_live_detection():
+    """Live detection tab"""
+    # ALWAYS process queue, even if not on this tab
+    if st.session_state.is_scanning:
+        process_signal_buffer() 
+    
+    st.header("Live TPMS Detection")
+    
+    # Add frequency status at top
+    show_frequency_status()
+    
+    st.divider()
+    
+    # Signal histogram
+    show_signal_histogram()
+    
+    st.divider()
+    
+    # Protocol monitoring
+    show_protocol_monitoring()
+    
+    st.divider()
+
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        st.subheader("Recent Vehicle Detections")
+
+
+        if st.session_state.recent_detections:
+            recent = st.session_state.recent_detections[-10:][::-1]
+
+            for detection in recent:
+                vehicle = detection['vehicle']
+                dt = timestamp_to_mountain(detection['timestamp'])
+
+                with st.container():
+                    col_a, col_b, col_c = st.columns([2, 2, 1])
+
+                    with col_a:
+                        nickname = vehicle.get('nickname', 'Unknown Vehicle')
+                        st.markdown(f"**{nickname}**")
+                        st.caption(f"ID: {vehicle['id']}")
+
+                    with col_b:
+                        st.text(dt.strftime("%H:%M:%S"))
+                        st.caption(f"Seen {vehicle['encounter_count']} times")
+
+                    with col_c:
+                        if st.button("View", key=f"view_{detection['vehicle_id']}_{detection['timestamp']}"):
+                            st.session_state.selected_vehicle = vehicle['id']
+
+                    st.divider()
+        else:
+            st.info("No vehicles detected yet. Start scanning to begin detection.")
+
+    with col2:
+        st.subheader("Live Signal Stream")
+        recent_signals = st.session_state.db.get_recent_signals(10)
+
+        if recent_signals:
+            signal_df = pd.DataFrame(recent_signals)
+            signal_df['timestamp'] = pandas_timestamp_to_mountain(signal_df['timestamp'])
+
+            st.dataframe(
+                signal_df[['tpms_id', 'timestamp', 'signal_strength', 'frequency']],
+                hide_index=True,
+                width="stretch"
+            )
+        else:
+            st.info("Waiting for signals...")
+
+        if st.session_state.is_scanning:
+            time.sleep(1)
+            st.rerun()
+
+def show_protocol_monitoring():
+    """Display detected protocols and unknown signals"""
+    st.subheader("🔍 Protocol Detection")
+    
+    if not hasattr(st.session_state, 'decoder'):
+        return
+    
+    # Get protocol statistics
+    stats = st.session_state.decoder.get_protocol_statistics()
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.write("**Unknown Signals Detected**")
+        st.metric("Total Unknown", stats['total_unknown'])
+        
+        if stats['modulation_types']:
+            st.write("**Modulation Types:**")
+            for mod_type, count in stats['modulation_types'].items():
+                st.write(f"- {mod_type}: {count}")
+        else:
+            st.info("No unknown signals detected yet")
+    
+    with col2:
+        st.write("**Signal Characteristics**")
+        
+        if stats['common_baud_rates']:
+            st.write("**Detected Baud Rates:**")
+            for rate in stats['common_baud_rates']:
+                st.write(f"- {rate:,} bps")
+        
+        if stats['avg_signal_strength'] > 0:
+            st.metric("Avg Signal Strength", f"{stats['avg_signal_strength']:.1f} dBm")
+    
+    # Show recent unknown signals
+    unknown_signals = st.session_state.decoder.get_unknown_signals(60)
+    
+    if unknown_signals:
+        st.write("**Recent Unknown Signals (last 60s):**")
+        
+        unknown_df = pd.DataFrame([
+            {
+                'Time': datetime.fromtimestamp(s.timestamp).strftime('%H:%M:%S'),
+                'Frequency': f"{s.frequency:.2f} MHz",
+                'Strength': f"{s.signal_strength:.1f} dBm",
+                'Modulation': s.modulation_type,
+                'Baud Rate': f"{s.baud_rate:,}" if s.baud_rate else "Unknown",
+                'Length': s.packet_length
+            }
+            for s in unknown_signals[-10:]
+        ])
+        
+        st.dataframe(unknown_df, width="stretch", hide_index=True)
+
+def show_vehicle_database():
+    """Vehicle database tab"""
+    st.header("Vehicle Database")
+
+    vehicles = st.session_state.db.get_all_vehicles()
+
+    if not vehicles:
+        st.info("No vehicles in database yet.")
+        return
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        min_encounters = st.slider("Min Encounters", 1, 50, 1)
+    with col2:
+        sort_by = st.selectbox("Sort By", ["Last Seen", "First Seen", "Encounter Count"])
+    with col3:
+        search = st.text_input("Search TPMS ID")
+
+    filtered = [v for v in vehicles if v['encounter_count'] >= min_encounters]
+
+    if search:
+        filtered = [v for v in filtered if search.upper() in str(v['tpms_ids'])]
+
+    if sort_by == "Last Seen":
+        filtered.sort(key=lambda x: x['last_seen'], reverse=True)
+    elif sort_by == "First Seen":
+        filtered.sort(key=lambda x: x['first_seen'], reverse=True)
+    else:
+        filtered.sort(key=lambda x: x['encounter_count'], reverse=True)
+
+    for vehicle in filtered:
+        with st.expander(
+                f"🚗 {vehicle.get('nickname', 'Vehicle')} #{vehicle['id']} - "
+                f"Seen {vehicle['encounter_count']} times"
+        ):
+            col1, col2 = st.columns([2, 1])
+
+            with col1:
+                st.write("**TPMS IDs:**")
+                for tpms_id in vehicle['tpms_ids']:
+                    st.code(tpms_id, language=None)
+
+                st.write("**Timeline:**")
+                st.write(f"First seen: {format_timestamp(vehicle['first_seen'], '%Y-%m-%d %H:%M')}")
+                st.write(f"Last seen: {format_timestamp(vehicle['last_seen'], '%Y-%m-%d %H:%M')}")
+
+                current_nickname = vehicle.get('nickname', '')
+                new_nickname = st.text_input(
+                    "Nickname",
+                    value=current_nickname,
+                    key=f"nickname_{vehicle['id']}"
+                )
+                if new_nickname != current_nickname:
+                    if st.button("Save Nickname", key=f"save_{vehicle['id']}"):
+                        st.session_state.db.update_vehicle_nickname(vehicle['id'], new_nickname)
+                        st.success("Nickname updated!")
+                        st.rerun()
+
+            with col2:
+                history = st.session_state.db.get_vehicle_history(vehicle['id'])
+                st.metric("Total Encounters", len(history['encounters']))
+
+                if history['maintenance']:
+                    avg_pressure = sum(m['avg_pressure'] for m in history['maintenance'] if m['avg_pressure']) / len(
+                        history['maintenance'])
+                    st.metric("Avg Pressure", f"{avg_pressure:.1f} PSI")
+
+                prediction = st.session_state.ml_engine.predict_next_encounter(vehicle['id'])
+                if prediction['prediction'] == 'estimated':
+                    st.write("**Next encounter predicted:**")
+                    st.write(prediction['predicted_datetime'].strftime('%Y-%m-%d %H:%M'))
+                    st.progress(prediction['confidence'])
+                    st.caption(f"Confidence: {prediction['confidence'] * 100:.0f}%")
+                    
+def safe_float_convert(value, default=0.0):
+    """Safely convert various types to float"""
+    if value is None:
+        return default
+    
+    # If it's bytes, try to decode and convert
+    if isinstance(value, bytes):
+        try:
+            # Try to decode as UTF-8 string first
+            value = value.decode('utf-8')
+        except:
+            try:
+                # Try to interpret as raw float bytes
+                import struct
+                if len(value) == 4:
+                    return struct.unpack('f', value)[0]
+                elif len(value) == 8:
+                    return struct.unpack('d', value)[0]
+            except:
+                return default
+    
+    # Try direct conversion
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def render_sensor_database_tab(db):
+    """Render the sensor database and management interface"""
+    st.header("🔍 TPMS Sensor Database")
+
+    # Get all sensors
+    sensors_df = db.get_all_unique_sensors()
+
+    if sensors_df.empty:
+        st.warning("No TPMS sensors detected yet. Start scanning to collect sensor data.")
+        return
+
+    # Summary metrics
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Total Sensors", len(sensors_df))
+    with col2:
+        st.metric("Total Signals", int(sensors_df['signal_count'].sum()))
+    with col3:
+        active_sensors = len(sensors_df[sensors_df['last_seen'] > time.time() - 3600])
+        st.metric("Active (1hr)", active_sensors)
+    with col4:
+        orphaned = db.get_orphaned_sensors()
+        st.metric("Unassigned", len(orphaned))
+
+    # Tabs for different views
+    sensor_tab1, sensor_tab2, sensor_tab3 = st.tabs([
+        "📋 All Sensors",
+        "🔍 Sensor Details",
+        "⚠️ Unassigned Sensors"
+    ])
+
+    with sensor_tab1:
+        st.subheader("All Detected Sensors")
+
+        # Format the dataframe
+        display_df = sensors_df.copy()
+        display_df['first_seen'] = pandas_timestamp_to_mountain(display_df['first_seen'])
+        display_df['last_seen'] = pandas_timestamp_to_mountain(display_df['last_seen'])
+        
+        # Convert to float and round
+        display_df['avg_rssi'] = pd.to_numeric(display_df['avg_rssi'], errors='coerce').round(1)
+        display_df['avg_pressure'] = pd.to_numeric(display_df['avg_pressure'], errors='coerce').round(1)
+        display_df['avg_temperature'] = pd.to_numeric(display_df['avg_temperature'], errors='coerce').round(1)
+        display_df['frequency'] = pd.to_numeric(display_df['frequency'], errors='coerce') / 1e6
+        display_df['frequency'] = display_df['frequency'].round(2)
+
+        # Rename columns for display
+        display_df = display_df.rename(columns={
+            'tpms_id': 'Sensor ID',
+            'protocol': 'Protocol',
+            'signal_count': 'Signals',
+            'first_seen': 'First Seen',
+            'last_seen': 'Last Seen',
+            'avg_rssi': 'Avg RSSI (dBm)',
+            'avg_pressure': 'Avg Pressure (PSI)',
+            'avg_temperature': 'Avg Temp (°C)',
+            'frequency': 'Frequency (MHz)'
+        })
+
+        st.dataframe(
+            display_df,
+            width="stretch",
+            hide_index=True
+        )
+
+        # Export option
+        csv = display_df.to_csv(index=False)
+        st.download_button(
+            label="📥 Export Sensor List (CSV)",
+            data=csv,
+            file_name=f"tpms_sensors_{int(time.time())}.csv",
+            mime="text/csv"
+        )
+
+    with sensor_tab2:
+        st.subheader("Detailed Sensor Analysis")
+
+        # Sensor selector
+        sensor_ids = sensors_df['tpms_id'].tolist()
+        selected_sensor = st.selectbox(
+            "Select Sensor ID",
+            options=sensor_ids,
+            format_func=lambda x: f"{x} ({sensors_df[sensors_df['tpms_id'] == x]['protocol'].iloc[0]})"
+        )
+
+        if selected_sensor:
+            # Get statistics
+            stats = db.get_sensor_statistics(selected_sensor)
+            history_df = db.get_sensor_history(selected_sensor)
+
+            # Display statistics
+            st.markdown("### Sensor Statistics")
+            stat_col1, stat_col2, stat_col3 = st.columns(3)
+
+            with stat_col1:
+                st.metric("Total Signals", stats['total_signals'])
+                st.metric("Protocol", stats['protocol'])
+                st.metric("First Seen", format_timestamp(stats['first_seen'], "%Y-%m-%d %H:%M"))
+
+            with stat_col2:
+                # Convert to float safely
+                avg_rssi = safe_float_convert(stats['avg_rssi'])
+                min_rssi = safe_float_convert(stats['min_rssi'])
+                max_rssi = safe_float_convert(stats['max_rssi'])
+    
+                st.metric("Avg RSSI", f"{avg_rssi:.1f} dBm")
+                st.metric("RSSI Range", f"{min_rssi:.1f} to {max_rssi:.1f} dBm")
+    
+                if stats.get('avg_pressure'):
+                    avg_pressure = safe_float_convert(stats['avg_pressure'])
+                    st.metric("Avg Pressure", f"{avg_pressure:.1f} PSI")
+
+            with stat_col3:
+                st.metric("Last Seen", format_timestamp(stats['last_seen'], "%Y-%m-%d %H:%M"))
+                age_minutes = (time.time() - stats['last_seen']) / 60
+                st.metric("Age", f"{age_minutes:.0f} min ago")
+    
+                if stats.get('avg_temp'):
+                    avg_temp = safe_float_convert(stats['avg_temp'])
+                    st.metric("Avg Temperature", f"{avg_temp:.1f} °C")
+
+
+            # Signal strength over time
+            st.markdown("### Signal Strength History")
+            if not history_df.empty:
+                chart_df = history_df[['timestamp', 'signal_strength']].copy()
+                chart_df['timestamp'] = pandas_timestamp_to_mountain(chart_df['timestamp'])
+                chart_df['signal_strength'] = pd.to_numeric(chart_df['signal_strength'], errors='coerce')
+
+                fig = px.line(
+                    chart_df,
+                    x='timestamp',
+                    y='signal_strength',
+                    title=f"RSSI Over Time - {selected_sensor}",
+                    labels={'timestamp': 'Time', 'signal_strength': 'RSSI (dBm)'}
+                )
+                st.plotly_chart(fig, width="stretch")
+
+            # Pressure/Temperature over time (if available)
+            if 'pressure_psi' in history_df.columns and history_df['pressure_psi'].notna().any():
+                st.markdown("### Pressure History")
+                pressure_df = history_df[history_df['pressure_psi'].notna()][['timestamp', 'pressure_psi']].copy()
+                pressure_df['timestamp'] = pandas_timestamp_to_mountain(pressure_df['timestamp'])
+                pressure_df['pressure_psi'] = pd.to_numeric(pressure_df['pressure_psi'], errors='coerce')
+
+                fig = px.line(
+                    pressure_df,
+                    x='timestamp',
+                    y='pressure_psi',
+                    title=f"Tire Pressure Over Time - {selected_sensor}",
+                    labels={'timestamp': 'Time', 'pressure_psi': 'Pressure (PSI)'}
+                )
+                st.plotly_chart(fig, width="stretch")
+
+            # Raw signal history table
+            with st.expander("📊 View Raw Signal History"):
+                display_history = history_df.copy()
+                display_history['timestamp'] = pandas_timestamp_to_mountain(display_history['timestamp'])
+                st.dataframe(display_history, width="stretch")
+
+    with sensor_tab3:
+        st.subheader("Unassigned Sensors")
+        st.info("These sensors have been detected but are not assigned to any vehicle.")
+
+        orphaned_df = db.get_orphaned_sensors()
+
+        if orphaned_df.empty:
+            st.success("All sensors are assigned to vehicles!")
+        else:
+            # Display orphaned sensors
+            display_orphaned = orphaned_df.copy()
+            display_orphaned['last_seen'] = pandas_timestamp_to_mountain(display_orphaned['last_seen'])
+            st.dataframe(display_orphaned, width="stretch")
+
+            # Manual assignment interface
+            st.markdown("### Assign Sensor to Vehicle")
+            vehicles_list = db.get_all_vehicles()
+
+            if vehicles_list:
+                # Convert to DataFrame for easier handling
+                vehicles_df = pd.DataFrame(vehicles_list)
+
+                assign_col1, assign_col2, assign_col3 = st.columns([2, 2, 1])
+
+                with assign_col1:
+                    sensor_to_assign = st.selectbox(
+                        "Select Sensor",
+                        options=orphaned_df['tpms_id'].tolist()
+                    )
+
+                with assign_col2:
+                    vehicle_to_assign = st.selectbox(
+                        "Select Vehicle",
+                        options=vehicles_df['id'].tolist(),
+                        format_func=lambda x: (
+                            vehicles_df[vehicles_df['id'] == x]['nickname'].iloc[0]
+                            if vehicles_df[vehicles_df['id'] == x]['nickname'].iloc[0]
+                            else f"Vehicle {x}"
+                        )
+                    )
+
+                with assign_col3:
+                    if st.button("Assign", type="primary"):
+                        if db.assign_sensor_to_vehicle(sensor_to_assign, vehicle_to_assign):
+                            st.success(f"Assigned {sensor_to_assign} to vehicle!")
+                            st.rerun()
+                        else:
+                            st.error("Assignment failed")
+            else:
+                st.info("📝 No vehicles in database yet. Vehicles will appear here once detected during scanning.")
+
+
+def show_frequency_status():
+    """Display frequency hopping status and statistics"""
+    st.subheader("📡 Frequency Status")
+    
+    if not st.session_state.is_scanning:
+        st.info("Start scanning to see frequency statistics")
+        return
+    
+    status = st.session_state.hackrf.get_status()
+    freq_stats = status.get('frequency_stats', {})
+    
+    # Current frequency
+    st.write(f"**Current Frequency:** {status['frequency']:.2f} MHz")
+    
+    # Initialize session state for controls if not exists
+    if 'freq_hop_enabled' not in st.session_state:
+        st.session_state.freq_hop_enabled = status.get('frequency_hopping', True)
+    if 'hop_interval' not in st.session_state:
+        st.session_state.hop_interval = status.get('hop_interval', 30.0)
+    
+    # Frequency hopping control
+    col1, col2 = st.columns(2)
+    with col1:
+        hop_enabled = st.checkbox(
+            "Enable Frequency Hopping",
+            value=st.session_state.freq_hop_enabled,
+            key="freq_hop_toggle"
+        )
+        # Only update if changed
+        if hop_enabled != st.session_state.freq_hop_enabled:
+            st.session_state.freq_hop_enabled = hop_enabled
+            st.session_state.hackrf.set_frequency_hopping(hop_enabled)
+            st.rerun()
+    
+    with col2:
+        if st.session_state.freq_hop_enabled:
+            hop_interval = st.slider(
+                "Hop Interval (seconds)",
+                min_value=10.0,
+                max_value=60.0,
+                value=st.session_state.hop_interval,
+                step=5.0,
+                key="hop_interval_slider"
+            )
+            # Only update if changed
+            if abs(hop_interval - st.session_state.hop_interval) > 0.1:
+                st.session_state.hop_interval = hop_interval
+                st.session_state.hackrf.set_hop_interval(hop_interval)
+    
+    # Frequency statistics table
+    if freq_stats:
+        st.write("**Frequency Statistics:**")
+        
+        freq_df = pd.DataFrame([
+            {
+                'Frequency': f"{freq:.2f} MHz",
+                'Samples': stats['samples'],
+                'Avg Strength': f"{stats['avg_strength']:.1f} dBm",
+                'Detections': stats['detections']
+            }
+            for freq, stats in freq_stats.items()
+        ])
+        
+        st.dataframe(freq_df, width="stretch", hide_index=True)
+        
+        # Bar chart of detections per frequency
+        if any(stats['detections'] > 0 for stats in freq_stats.values()):
+            fig = go.Figure(data=[
+                go.Bar(
+                    x=[f"{freq:.2f}" for freq in freq_stats.keys()],
+                    y=[stats['detections'] for stats in freq_stats.values()],
+                    marker_color='lightgreen'
+                )
+            ])
+            fig.update_layout(
+                title='TPMS Detections by Frequency',
+                xaxis_title='Frequency (MHz)',
+                yaxis_title='Detections',
+                height=300
+            )
+            st.plotly_chart(fig, width="stretch")
+
+
+def show_analytics():
+    """Analytics tab"""
+    st.header("Analytics & Patterns")
+
+    vehicles = st.session_state.db.get_all_vehicles(min_encounters=2)
+
+    if not vehicles:
+        st.info("Not enough data for analytics yet. Keep scanning!")
+        return
+
+    days = st.slider("Analysis Period (days)", 1, 90, 30)
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Encounter Frequency")
+
+        encounter_data = []
+        for vehicle in vehicles:
+            history = st.session_state.db.get_vehicle_history(vehicle['id'])
+            for encounter in history['encounters']:
+                mt_timestamp = timestamp_to_mountain(encounter['timestamp'])
+                encounter_data.append({
+                    'vehicle_id': vehicle['id'],
+                    'nickname': vehicle.get('nickname', 'Vehicle ' + str(vehicle['id'])),
+                    'timestamp': mt_timestamp,
+                    'date': mt_timestamp.date()
+                })
+
+        if encounter_data:
+            df = pd.DataFrame(encounter_data)
+
+            daily_counts = df.groupby('date').size().reset_index(name='encounters')
+            fig = px.line(
+                daily_counts,
+                x='date',
+                y='encounters',
+                title='Daily Vehicle Encounters',
+                labels={'date': 'Date', 'encounters': 'Number of Vehicles'}
+            )
+            st.plotly_chart(fig, width="stretch")
+
+            df['hour'] = df['timestamp'].dt.hour
+            df['day_of_week'] = df['timestamp'].dt.day_name()
+
+            heatmap_data = df.groupby(['day_of_week', 'hour']).size().reset_index(name='count')
+
+            days_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+            heatmap_pivot = heatmap_data.pivot(index='day_of_week', columns='hour', values='count').fillna(0)
+            heatmap_pivot = heatmap_pivot.reindex(days_order)
+
+            fig_heatmap = go.Figure(data=go.Heatmap(
+                z=heatmap_pivot.values,
+                x=heatmap_pivot.columns,
+                y=heatmap_pivot.index,
+                colorscale='YlOrRd',
+                text=heatmap_pivot.values,
+                texttemplate='%{text}',
+                textfont={"size": 10}
+            ))
+            fig_heatmap.update_layout(
+                title='Encounter Patterns by Day and Hour',
+                xaxis_title='Hour of Day',
+                yaxis_title='Day of Week'
+            )
+            st.plotly_chart(fig_heatmap, width="stretch")
+
+    with col2:
+        st.subheader("Top Vehicles")
+
+        top_vehicles = sorted(vehicles, key=lambda x: x['encounter_count'], reverse=True)[:10]
+
+        top_df = pd.DataFrame([
+            {
+                'Vehicle': v.get('nickname', 'Vehicle ' + str(v['id'])),
+                'Encounters': v['encounter_count'],
+                'Last Seen': format_timestamp(v['last_seen'], '%Y-%m-%d')
+            }
+            for v in top_vehicles
+        ])
+
+        fig_bar = px.bar(
+            top_df,
+            x='Encounters',
+            y='Vehicle',
+            orientation='h',
+            title='Most Frequently Encountered Vehicles',
+            color='Encounters',
+            color_continuous_scale='Blues'
+        )
+        st.plotly_chart(fig_bar, width="stretch")
+
+        st.subheader("Recent Activity")
+        recent_vehicles = sorted(vehicles, key=lambda x: x['last_seen'], reverse=True)[:5]
+
+        for v in recent_vehicles:
+            now_mountain = datetime.now(MOUNTAIN_TZ)
+            last_seen_mountain = timestamp_to_mountain(v['last_seen'])
+            time_ago = now_mountain - last_seen_mountain
+            hours_ago = time_ago.total_seconds() / 3600
+
+            if hours_ago < 1:
+                time_str = f"{int(time_ago.total_seconds() / 60)} minutes ago"
+            elif hours_ago < 24:
+                time_str = f"{int(hours_ago)} hours ago"
+            else:
+                time_str = f"{int(hours_ago / 24)} days ago"
+
+            nickname = v.get('nickname', 'Vehicle ' + str(v['id']))
+            st.write(f"**{nickname}** - {time_str}")
+
+
+def show_maintenance():
+    """Maintenance tracking tab"""
+    st.header("🔧 Tire Maintenance Monitoring")
+
+    vehicles = st.session_state.db.get_all_vehicles(min_encounters=3)
+
+    if not vehicles:
+        st.info("Not enough data for maintenance analysis yet.")
+        return
+
+    vehicle_options = {
+        f"{v.get('nickname', 'Vehicle ' + str(v['id']))} (ID: {v['id']})": v['id']
+        for v in vehicles
+    }
+
+    selected_name = st.selectbox("Select Vehicle", list(vehicle_options.keys()))
+    vehicle_id = vehicle_options[selected_name]
+
+    days = st.slider("Analysis Period (days)", 7, 90, 30, key="maintenance_days")
+
+    analysis = st.session_state.db.analyze_maintenance(vehicle_id, days)
+
+    if not analysis:
+        st.warning("No maintenance data available for this vehicle.")
+        return
+
+    st.subheader("Tire Health Overview")
+
+    cols = st.columns(4)
+    for idx, (tpms_id, data) in enumerate(analysis.items()):
+        with cols[idx % 4]:
+            st.write(f"**Tire {idx + 1}**")
+            st.caption(f"ID: {tpms_id[:8]}...")
+
+            if data['avg_pressure']:
+                pressure = data['avg_pressure']
+
+                if 30 <= pressure <= 35:
+                    color = "🟢"
+                    status = "Good"
+                elif 28 <= pressure < 30 or 35 < pressure <= 38:
+                    color = "🟡"
+                    status = "Warning"
+                else:
+                    color = "🔴"
+                    status = "Alert"
+
+                st.metric(
+                    "Avg Pressure",
+                    f"{pressure:.1f} PSI",
+                    delta=f"{data['pressure_std']:.1f} std"
+                )
+                st.write(f"{color} {status}")
+
+                if data['avg_temp']:
+                    st.metric("Avg Temp", f"{data['avg_temp']:.1f}°C")
+
+                if data['alerts']:
+                    st.warning("⚠️ " + ", ".join(data['alerts']))
+
+
+def show_ml_insights():
+    """ML insights tab"""
+    st.header("🤖 Machine Learning Insights")
+
+    patterns = st.session_state.ml_engine.find_patterns(days=30)
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Frequent Commuters")
+
+        if patterns['frequent_vehicles']:
+            for vehicle_info in patterns['frequent_vehicles'][:10]:
+                with st.container():
+                    st.write(f"**{vehicle_info['nickname']}**")
+
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        st.metric("Encounters", vehicle_info['encounter_count'])
+                    with col_b:
+                        days_known = (vehicle_info['last_seen'] - vehicle_info['first_seen']).days
+                        if days_known > 0:
+                            freq = vehicle_info['encounter_count'] / days_known
+                            st.metric("Frequency", f"{freq:.1f}/day")
+
+                    st.divider()
+        else:
+            st.info("Not enough data to identify patterns yet.")
+
+    with col2:
+        st.subheader("Detection Patterns")
+        st.info("Pattern analysis will appear here as data accumulates.")
+
+def process_signal_queue():
+    """Process signals from the queue - runs in main Streamlit thread"""
+    processed = 0
+    max_batch = 10
+    
+    # Debug: Log when this function is called
+    if not hasattr(process_signal_queue, 'call_count'):
+        process_signal_queue.call_count = 0
+    process_signal_queue.call_count += 1
+    
+    if process_signal_queue.call_count <= 3 or process_signal_queue.call_count % 50 == 0:
+        print(f"[{time.time():.3f}] process_signal_queue() called #{process_signal_queue.call_count}, "
+              f"queue_size={signal_queue.qsize()}", flush=True)
+    
+    while not signal_queue.empty() and processed < max_batch:
+        try:
+            data = signal_queue.get_nowait()
+            
+            if processed == 0:  # Log first item in batch
+                print(f"  Processing batch: strength={data['signal_strength']:.1f} dBm", flush=True)
+            
+            # Add to signal history for histogram
+            signal_history_queue.append(data['signal_strength'])
+            
+            # Process with decoder
+            signals = st.session_state.decoder.process_samples(
+                data['iq_samples'], 
+                data['frequency']
+            )
+            
+            if signals:
+                print(f"  ✅ Decoder found {len(signals)} TPMS signals!", flush=True)
+
+            for signal in signals:
+                signal.signal_strength = data['signal_strength']
+                
+                print(f"  📡 TPMS Decoded: ID={signal.tpms_id}, "
+                      f"Protocol={signal.protocol}, "
+                      f"Pressure={signal.pressure_psi} PSI", flush=True)
+                
+                # Increment detection count for this frequency
+                st.session_state.hackrf.increment_detection(data['frequency'])
+
+                signal_dict = {
+                    'tpms_id': signal.tpms_id,
+                    'timestamp': signal.timestamp,
+                    'frequency': signal.frequency,
+                    'signal_strength': signal.signal_strength,
+                    'snr': signal.snr,
+                    'pressure_psi': signal.pressure_psi,
+                    'temperature_c': signal.temperature_c,
+                    'battery_low': signal.battery_low,
+                    'protocol': signal.protocol,
+                    'raw_data': signal.raw_data
+                }
+                
+                st.session_state.db.insert_signal(signal_dict)
+                st.session_state.signal_buffer.append(signal_dict)
+
+            # Process for vehicle clustering
+            if len(st.session_state.signal_buffer) > 10:
+                vehicle_ids = st.session_state.ml_engine.process_signals(st.session_state.signal_buffer)
+
+                for vehicle_id in vehicle_ids:
+                    vehicle_info = st.session_state.db.get_vehicle_history(vehicle_id)
+                    st.session_state.recent_detections.append({
+                        'vehicle_id': vehicle_id,
+                        'timestamp': time.time(),
+                        'vehicle': vehicle_info['vehicle']
+                    })
+
+                st.session_state.signal_buffer = []
+            
+            processed += 1
+            
+        except queue.Empty:
+            break
+        except Exception as e:
+            print(f"  ❌ Error processing signal: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    if processed > 0:
+        print(f"  Processed {processed} items from queue", flush=True)
+
+
+# Update show_trigger_controls()
+def show_trigger_controls():
+    """ESP32 LF Trigger Controls"""
+    st.header("📡 ESP32 LF Trigger Control")
+    
+    # Connection status
+    if st.session_state.esp32_trigger.connected:
+        st.success("✅ ESP32 Connected")
+    else:
+        st.error("❌ ESP32 Not Connected")
+        if st.button("🔄 Reconnect"):
+            st.session_state.esp32_trigger.check_connection()
+            st.rerun()
+    
+    if not st.session_state.esp32_trigger.connected:
+        st.info("Connect to WiFi network: **TPMS_Trigger** (password: tpms12345)")
+        return
+    
+    st.info("⚠️  **Warning:** Transmitting requires proper licensing and should only be used in controlled environments.")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("🔧 Sensor Activation")
+        
+        protocol = st.selectbox(
+            "Trigger Protocol",
+            list(st.session_state.trigger.trigger_patterns.keys()),
+            key="trigger_protocol_select"
+        )
+        
+        if st.button("📡 Send Single Trigger", key="send_trigger_btn"):
+            with st.spinner("Sending trigger..."):
+                st.session_state.trigger.send_trigger(protocol)
+                st.success(f"✅ {protocol.title()} trigger sent!")
+        
+        st.divider()
+        
+        st.subheader("🔄 Continuous Triggering")
+        
+        trigger_interval = st.slider(
+            "Trigger Interval (seconds)",
+            min_value=0.5,
+            max_value=5.0,
+            value=1.0,
+            step=0.5,
+            key="trigger_interval_slider"
+        )
+        
+        col_a, col_b = st.columns(2)
+        
+        with col_a:
+            if st.button("▶️ Start Continuous", 
+                        disabled=st.session_state.trigger.is_transmitting,
+                        key="start_continuous_trigger_btn"):
+                st.session_state.trigger.start_continuous_trigger(protocol, trigger_interval)
+                st.success("Continuous trigger started!")
+        
+        with col_b:
+            if st.button("⏹️ Stop Continuous",
+                        disabled=not st.session_state.trigger.is_transmitting,
+                        key="stop_continuous_trigger_btn"):
+                st.session_state.trigger.stop_continuous_trigger()
+                st.info("Continuous trigger stopped")
+    
+    with col2:
+        st.subheader("🎯 Active Scan")
+        
+        st.write("**Trigger and Listen Mode**")
+        st.caption("Send trigger, then listen for sensor responses")
+        
+        listen_duration = st.slider(
+            "Listen Duration (seconds)",
+            min_value=1.0,
+            max_value=10.0,
+            value=5.0,
+            step=1.0,
+            key="listen_duration_slider"
+        )
+        
+        if st.button("🔍 Trigger & Listen", key="trigger_listen_btn"):
+            with st.spinner(f"Triggering and listening for {listen_duration}s..."):
+                st.session_state.dual_mode.trigger_and_listen(protocol, listen_duration)
+                st.success("Scan complete! Check Live Detection tab for results.")
+        
+        st.divider()
+        
+        st.write("**Multi-Protocol Scan**")
+        st.caption("Try all protocols sequentially")
+        
+        if st.button("🔍 Scan All Protocols", key="scan_all_btn"):
+            with st.spinner("Scanning all protocols..."):
+                st.session_state.dual_mode.scan_and_activate()
+                st.success("Multi-protocol scan complete!")
+    
+    st.divider()
+    
+    # Trigger status
+    st.subheader("📊 Trigger Status")
+    
+    status = st.session_state.trigger.get_status()
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.metric("LF Frequency", f"{status['lf_frequency'] / 1000:.1f} kHz")
+    
+    with col2:
+        st.metric("Status", "🟢 Active" if status['transmitting'] else "🔴 Idle")
+    
+    with col3:
+        if status['transmitting']:
+            st.metric("Trigger Interval", f"{status['trigger_interval']:.1f}s")
+    
+    # Protocol details
+    with st.expander("📋 Available Trigger Protocols"):
+        for proto_name, proto_config in st.session_state.trigger.trigger_patterns.items():
+            st.write(f"**{proto_name.title()}**")
+            st.write(f"- Frequency: {proto_config['frequency'] / 1000:.1f} kHz")
+            st.write(f"- Pulse Width: {proto_config['pulse_width'] * 1000:.0f}ms")
+            st.write(f"- Pulse Count: {proto_config['pulse_count']}")
+            st.divider()
+
+
+def main():
+    st.title("🚗 TPMS Tracker - Intelligent Vehicle Pattern Recognition")
+    st.caption(f"🕐 Displaying times in Mountain Time (MT)")
+    
+    if st.session_state.is_scanning:
+        process_signal_buffer() 
+
+    with st.sidebar:
+        st.header("⚙️ Control Panel")
+        st.subheader("Scanner Control")
+
+        # Manual frequency selection
+        if not st.session_state.is_scanning:
+            freq_mhz = st.selectbox(
+                "Select Frequency",
+                [314.9, 315.0, 433.92],
+                index=0,
+                key="freq_select"
+            )
+            
+            if st.button("Set Frequency", key="set_freq_btn"):
+                st.session_state.hackrf.change_frequency(freq_mhz * 1e6)
+                st.success(f"Frequency set to {freq_mhz} MHz")
+        else:
+            # Show current frequency when scanning
+            status = st.session_state.hackrf.get_status()
+            st.info(f"📡 Scanning: {status['frequency']:.1f} MHz")
+            
+            # Allow frequency change during scan
+            if st.button("Change Frequency", key="change_freq_btn"):
+                st.session_state.show_freq_change = True
+            
+            if st.session_state.get('show_freq_change', False):
+                new_freq = st.selectbox(
+                    "New Frequency",
+                    [314.9, 315.0, 433.92],
+                    key="new_freq_select"
+                )
+                
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    if st.button("Apply", key="apply_freq_btn"):
+                        st.session_state.hackrf.change_frequency(new_freq * 1e6)
+                        st.session_state.show_freq_change = False
+                        st.rerun()
+                with col_b:
+                    if st.button("Cancel", key="cancel_freq_btn"):
+                        st.session_state.show_freq_change = False
+                        st.rerun()
+
+        st.divider()
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("▶️ Start Scan", disabled=st.session_state.is_scanning, key="main_start_btn"):
+                st.session_state.is_scanning = True
+                st.session_state.hackrf.start(signal_callback)
+                start_processing()
+                st.success("Scanning started!")
+                st.rerun()
+
+        with col2:
+            if st.button("⏹️ Stop Scan", disabled=not st.session_state.is_scanning, key="main_stop_btn"):
+                st.session_state.is_scanning = False
+                st.session_state.hackrf.stop()
+                stop_processing()
+                st.info("Scanning stopped")
+                st.rerun()
+
+
+
+        # Scanner status display
+        if st.session_state.is_scanning:
+            st.divider()
+            st.metric("Status", "🟢 Active")
+            st.metric("Frequency", f"{config.DEFAULT_FREQUENCY / 1e6:.1f} MHz")
+            st.metric("Sample Rate", f"{config.SAMPLE_RATE / 1e6:.2f} MS/s")
+            st.metric("Bandwidth", f"{config.BANDWIDTH / 1e6:.2f} MHz")
+            st.caption("🔒 Continuous reception mode (no hopping)")
+            
+            # Advanced settings
+            with st.expander("⚙️ Advanced Settings"):
+                new_gain = st.slider(
+                    "LNA Gain (dB)",
+                    min_value=0,
+                    max_value=40,
+                    value=config.DEFAULT_GAIN,
+                    step=8,
+                    help="Adjust receiver gain",
+                    key="main_lna_gain_slider"  # ADD THIS
+                )
+                
+                new_vga = st.slider(
+                    "VGA Gain (dB)",
+                    min_value=0,
+                    max_value=62,
+                    value=config.VGA_GAIN,
+                    step=2,
+                    help="Adjust VGA gain",
+                    key="main_vga_gain_slider"  # ADD THIS
+                )
+                
+                if st.button("Apply Settings", key="main_apply_settings_btn"):
+                    # Restart with new settings
+                    st.session_state.hackrf.stop()
+                    st.session_state.hackrf.gain = new_gain
+                    st.session_state.hackrf.vga_gain = new_vga
+                    st.session_state.hackrf.start(signal_callback)
+                    st.success("Settings applied!")
+        else:
+            st.metric("Status", "🔴 Inactive")
+
+        st.divider()
+
+        st.subheader("📊 Statistics")
+        vehicles = st.session_state.db.get_all_vehicles()
+        st.metric("Known Vehicles", len(vehicles))
+
+        recent_signals = st.session_state.db.get_recent_signals(3600)
+        st.metric("Signals (1hr)", len(recent_signals))
+        
+        # Signals per hour
+        if recent_signals:
+            st.metric("Signals/Hour", len(recent_signals))
+
+    # Main tabs
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "🎯 Live Detection",
+        "🚗 Vehicle Database",
+        "🔍 Sensor Database",
+        "📈 Analytics",
+        "🔧 Maintenance",
+        "🤖 ML Insights",
+        "📡 Sensor Trigger" 
+    ])
+
+    with tab1:
+        show_live_detection()
+    
+    with tab2:
+        show_vehicle_database()
+
+    with tab3:
+        render_sensor_database_tab(st.session_state.db)
+
+    with tab4:
+        show_analytics()
+
+    with tab5:
+        show_maintenance()
+
+    with tab6:
+        show_ml_insights()
+        
+    with tab7:
+        show_trigger_controls()
+
+
+if __name__ == "__main__":
+    main()
+"""
+Configuration settings for TPMS Scanner
+Optimized for Maurader TPMSRX compatibility
+"""
+from dataclasses import dataclass, field
+from typing import List
+from pathlib import Path
+
+@dataclass
+class Config:
+    # Add to Config class
+    HISTOGRAM_BINS: int = 50  # Number of bins for signal histogram
+    DEFAULT_FREQUENCY: int = 315_000_000  # Default frequency
+    BANDWIDTH: int = 1_750_000  # 1.75 MHz bandwidth
+    DEFAULT_GAIN: int = 32  # Default LNA gain
+
+    # HackRF Settings - matching Maurader baseband
+    SAMPLE_RATE: int = 2_457_600  # 2.4576 MHz - exact Maurader rate
+    CENTER_FREQ: int = 315_000_000  # 315 MHz default
+    
+    # Gain Settings (conservative defaults)
+    LNA_GAIN: int = 32  # 0-40 dB (start moderate)
+    VGA_GAIN: int = 30  # 0-62 dB (start moderate)
+    ENABLE_AMP: bool = True  # RF amp on
+    
+    # TPMS Frequency Bands - using default_factory for mutable default
+    TPMS_FREQUENCIES: List[int] = field(default_factory=lambda: [
+        314_900_000,  # 314.9 MHz (US)
+        315_000_000,  # 315.0 MHz (US)
+        433_920_000,  # 433.92 MHz (EU)
+    ])
+    
+    # Signal Detection Thresholds
+    SIGNAL_THRESHOLD: float = -70.0  # dBm - lowered for better sensitivity
+    MIN_SNR: float = 6.0  # dB - minimum SNR for valid decode
+    
+    # Symbol Rates (matching Maurader exactly)
+    SYMBOL_RATE_FSK: int = 19_200  # Schrader FSK
+    SYMBOL_RATE_OOK: int = 8_192   # Schrader OOK primary
+    SYMBOL_RATE_OOK_ALT: int = 8_400  # Schrader OOK alternate
+    
+    # FSK Deviation
+    FSK_DEVIATION: int = 38_400  # 2x symbol rate for Schrader
+    
+    # Capture Settings
+    SAMPLES_PER_SCAN: int = 262_144  # ~107ms at 2.4576 MHz
+    SCAN_DWELL_TIME: float = 0.15  # seconds per frequency
+    SCAN_INTERVAL: float = 0.5  # seconds between scans
+    
+    # Buffer Settings
+    BUFFER_SIZE: int = 262_144  # Must match SAMPLES_PER_SCAN
+    NUM_BUFFERS: int = 4
+    
+    # Protocol Detection
+    PROTOCOL_DETECTION_ENABLED: bool = True
+    MAX_UNKNOWN_SIGNALS: int = 100
+    
+    # Packet Validation
+    MIN_PACKET_LENGTH: int = 64  # bits
+    MAX_PACKET_LENGTH: int = 128  # bits
+    MAX_PREAMBLE_ERRORS: int = 2  # bit errors allowed in preamble
+    
+    # Learning Engine
+    LEARNING_ENABLED: bool = True
+    LEARNING_WINDOW: int = 100  # signals to analyze
+    ADAPTATION_THRESHOLD: float = 0.7  # confidence threshold
+    
+    # Display Settings
+    MAX_DISPLAY_SENSORS: int = 20
+    SENSOR_TIMEOUT: float = 300.0  # 5 minutes
+    SIGNAL_HISTORY_SIZE: int = 1000  # Number of signals to keep in history
+    
+    # Database Settings
+    DB_PATH: str = "tpms_tracker.db"  # SQLite database path
+    DB_BACKUP_ENABLED: bool = True
+    DB_BACKUP_INTERVAL: int = 3600  # seconds (1 hour)
+    
+    # Logging
+    LOG_ENABLED: bool = True
+    LOG_UNKNOWN_SIGNALS: bool = True
+    LOG_RAW_SAMPLES: bool = False  # Warning: creates large files
+    LOG_DIR: str = "logs"
+    LOG_FILE: str = "tpms_scanner.log"
+    LOG_MAX_SIZE: int = 10_485_760  # 10 MB
+    LOG_BACKUP_COUNT: int = 5
+    
+    # Performance
+    USE_MULTIPROCESSING: bool = True
+    MAX_WORKERS: int = 2  # CPU cores for processing
+    
+    # UI Settings
+    REFRESH_RATE: float = 1.0  # seconds
+    PLOT_HISTORY_SECONDS: int = 60  # seconds of history to plot
+    ENABLE_ANIMATIONS: bool = True
+    
+    # Advanced Settings
+    DEBUG_MODE: bool = False
+    SIMULATION_MODE: bool = False  # Force simulation mode
+    SAVE_RAW_IQ: bool = False  # Save raw IQ samples
+    IQ_SAVE_DIR: str = "iq_samples"
+    
+    # ESP32 Trigger Settings (if using ESP32 trigger)
+    ESP32_ENABLED: bool = False
+    ESP32_PORT: str = "/dev/ttyUSB0"
+    ESP32_BAUD: int = 115200
+    ESP32_TRIGGER_DURATION: float = 0.5  # seconds
+    
+    # Alert Settings
+    ENABLE_ALERTS: bool = False
+    ALERT_ON_NEW_SENSOR: bool = True
+    ALERT_SOUND: bool = False
+    
+    # Export Settings
+    EXPORT_FORMAT: str = "csv"  # csv, json, or both
+    EXPORT_DIR: str = "exports"
+    AUTO_EXPORT: bool = False
+    AUTO_EXPORT_INTERVAL: int = 3600  # seconds
+
+# Global config instance
+config = Config()
+
+# Frequency presets with names
+FREQUENCY_PRESETS = {
+    'US_314.9': 314_900_000,
+    'US_315.0': 315_000_000,
+    'EU_433.92': 433_920_000,
+}
+
+# Protocol-specific parameters
+PROTOCOL_PARAMS = {
+    'Schrader_FSK': {
+        'symbol_rate': 19_200,
+        'deviation': 38_400,
+        'preamble': [0x55, 0x55],
+        'packet_bytes': 10,
+    },
+    'Schrader_OOK_8k192': {
+        'symbol_rate': 8_192,
+        'preamble': [0xAA, 0xAA],
+        'packet_bytes': 8,
+    },
+    'Schrader_OOK_8k4': {
+        'symbol_rate': 8_400,
+        'preamble': [0xAA, 0xAA],
+        'packet_bytes': 8,
+    },
+    'Toyota': {
+        'symbol_rate': 10_000,
+        'deviation': 20_000,
+        'preamble': [0x55, 0x55, 0x55],
+        'packet_bytes': 10,
+    },
+}
+
+# Ensure directories exist
+def ensure_directories():
+    """Create necessary directories if they don't exist"""
+    directories = [
+        config.LOG_DIR,
+        config.IQ_SAVE_DIR,
+        config.EXPORT_DIR,
+        "data",
+        "models",
+    ]
+    
+    for directory in directories:
+        Path(directory).mkdir(parents=True, exist_ok=True)
+
+# Call on import
+ensure_directories()
+
+import sqlite3
+import json
+from datetime import datetime
+from typing import List, Dict, Optional, Tuple
+import numpy as np
+import pandas as pd  # ADDED
+
+
+class TPMSDatabase:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.init_database()
+
+    def init_database(self):
+        """Initialize database schema"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # Raw TPMS signals
+        cursor.execute('''
+                       CREATE TABLE IF NOT EXISTS tpms_signals
+                       (
+                           id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                           tpms_id         TEXT NOT NULL,
+                           timestamp       REAL NOT NULL,
+                           latitude        REAL,
+                           longitude       REAL,
+                           frequency       REAL,
+                           signal_strength REAL,
+                           snr             REAL,
+                           pressure_psi    REAL,
+                           temperature_c   REAL,
+                           battery_low     INTEGER,
+                           protocol        TEXT,
+                           raw_data        BLOB
+                       )
+                       ''')
+
+        # Vehicle clusters (groups of 4 TPMS)
+        cursor.execute('''
+                       CREATE TABLE IF NOT EXISTS vehicles
+                       (
+                           id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                           vehicle_hash    TEXT UNIQUE NOT NULL,
+                           first_seen      REAL        NOT NULL,
+                           last_seen       REAL        NOT NULL,
+                           encounter_count INTEGER DEFAULT 1,
+                           tpms_ids        TEXT        NOT NULL, -- JSON array
+                           nickname        TEXT,
+                           notes           TEXT,
+                           metadata        TEXT                  -- JSON for additional data
+                       )
+                       ''')
+
+        # Encounters (when a vehicle is detected)
+        cursor.execute('''
+                       CREATE TABLE IF NOT EXISTS encounters
+                       (
+                           id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                           vehicle_id     INTEGER NOT NULL,
+                           timestamp      REAL    NOT NULL,
+                           latitude       REAL,
+                           longitude      REAL,
+                           duration       REAL,
+                           signal_quality REAL,
+                           FOREIGN KEY (vehicle_id) REFERENCES vehicles (id)
+                       )
+                       ''')
+
+        # Maintenance tracking
+        cursor.execute('''
+                       CREATE TABLE IF NOT EXISTS maintenance_history
+                       (
+                           id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                           vehicle_id        INTEGER NOT NULL,
+                           tpms_id           TEXT    NOT NULL,
+                           timestamp         REAL    NOT NULL,
+                           avg_pressure      REAL,
+                           min_pressure      REAL,
+                           max_pressure      REAL,
+                           avg_temperature   REAL,
+                           pressure_variance REAL,
+                           alert_type        TEXT,
+                           FOREIGN KEY (vehicle_id) REFERENCES vehicles (id)
+                       )
+                       ''')
+
+        # Create indices
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_tpms_id ON tpms_signals(tpms_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON tpms_signals(timestamp)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_vehicle_hash ON vehicles(vehicle_hash)')
+
+        conn.commit()
+        conn.close()
+
+    def insert_signal(self, signal_data: Dict) -> int:
+        """Insert a raw TPMS signal"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+                       INSERT INTO tpms_signals
+                       (tpms_id, timestamp, latitude, longitude, frequency,
+                        signal_strength, snr, pressure_psi, temperature_c,
+                        battery_low, protocol, raw_data)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ''', (
+                           signal_data['tpms_id'],
+                           signal_data['timestamp'],
+                           signal_data.get('latitude'),
+                           signal_data.get('longitude'),
+                           signal_data['frequency'],
+                           signal_data['signal_strength'],
+                           signal_data['snr'],
+                           signal_data.get('pressure_psi'),
+                           signal_data.get('temperature_c'),
+                           signal_data.get('battery_low', 0),
+                           signal_data.get('protocol', 'unknown'),
+                           signal_data.get('raw_data')
+                       ))
+
+        signal_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return signal_id
+
+    def get_recent_signals(self, time_window: int = 30) -> List[Dict]:
+        """Get signals from the last N seconds"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cutoff_time = datetime.now().timestamp() - time_window
+
+        cursor.execute('''
+                       SELECT *
+                       FROM tpms_signals
+                       WHERE timestamp > ?
+                       ORDER BY timestamp DESC
+                       ''', (cutoff_time,))
+
+        columns = [description[0] for description in cursor.description]
+        results = [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+        conn.close()
+        return results
+
+    def get_all_unique_sensors(self):
+        """Get all unique TPMS sensors ever seen"""
+        query = """
+                SELECT tpms_id, \
+                       protocol, \
+                       COUNT(*)             as signal_count, \
+                       MIN(timestamp)       as first_seen, \
+                       MAX(timestamp)       as last_seen, \
+                       AVG(signal_strength) as avg_rssi, \
+                       AVG(pressure_psi)    as avg_pressure, \
+                       AVG(temperature_c)   as avg_temperature, \
+                       MAX(frequency)       as frequency
+                FROM tpms_signals
+                GROUP BY tpms_id
+                ORDER BY last_seen DESC \
+                """
+        conn = sqlite3.connect(self.db_path)
+        result = pd.read_sql_query(query, conn)
+        conn.close()
+        return result
+
+    def get_sensor_history(self, tpms_id):
+        """Get full history for a specific sensor"""
+        query = """
+                SELECT *
+                FROM tpms_signals
+                WHERE tpms_id = ?
+                ORDER BY timestamp DESC \
+                """
+        conn = sqlite3.connect(self.db_path)
+        result = pd.read_sql_query(query, conn, params=(tpms_id,))
+        conn.close()
+        return result
+
+    def get_sensor_statistics(self, tpms_id):
+        """Get detailed statistics for a sensor"""
+        query = """
+                SELECT COUNT(*)             as total_signals, \
+                       MIN(timestamp)       as first_seen, \
+                       MAX(timestamp)       as last_seen, \
+                       AVG(signal_strength) as avg_rssi, \
+                       MIN(signal_strength) as min_rssi, \
+                       MAX(signal_strength) as max_rssi, \
+                       AVG(pressure_psi)    as avg_pressure, \
+                       MIN(pressure_psi)    as min_pressure, \
+                       MAX(pressure_psi)    as max_pressure, \
+                       AVG(temperature_c)   as avg_temp, \
+                       MIN(temperature_c)   as min_temp, \
+                       MAX(temperature_c)   as max_temp, \
+                       protocol
+                FROM tpms_signals
+                WHERE tpms_id = ? \
+                """
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        result = conn.execute(query, (tpms_id,)).fetchone()
+        conn.close()
+        return dict(result) if result else None
+
+    def get_orphaned_sensors(self):
+        """Get sensors not assigned to any vehicle"""
+        query = """
+                SELECT DISTINCT ts.tpms_id, ts.protocol, MAX(ts.timestamp) as last_seen
+                FROM tpms_signals ts
+                         LEFT JOIN vehicles v ON ts.tpms_id IN (SELECT json_each.value \
+                                                                FROM vehicles, json_each(vehicles.tpms_ids) \
+                                                                WHERE vehicles.id = v.id)
+                WHERE v.id IS NULL
+                GROUP BY ts.tpms_id
+                ORDER BY last_seen DESC \
+                """
+        conn = sqlite3.connect(self.db_path)
+        result = pd.read_sql_query(query, conn)
+        conn.close()
+        return result
+
+    def assign_sensor_to_vehicle(self, tpms_id, vehicle_id):
+        """Manually assign a sensor to a vehicle"""
+        conn = sqlite3.connect(self.db_path)
+
+        # Get current tpms_ids for vehicle
+        vehicle = conn.execute(
+            "SELECT tpms_ids FROM vehicles WHERE id = ?",
+            (vehicle_id,)
+        ).fetchone()
+
+        if vehicle:
+            tpms_ids = json.loads(vehicle[0])
+            if tpms_id not in tpms_ids:
+                tpms_ids.append(tpms_id)
+                conn.execute(
+                    "UPDATE vehicles SET tpms_ids = ? WHERE id = ?",
+                    (json.dumps(tpms_ids), vehicle_id)
+                )
+                conn.commit()
+                conn.close()
+                return True
+
+        conn.close()
+        return False
+
+
+    def upsert_vehicle(self, tpms_ids: List[str], timestamp: float,
+                       location: Optional[Tuple[float, float]] = None) -> int:
+        """Create or update a vehicle cluster"""
+        vehicle_hash = self._generate_vehicle_hash(tpms_ids)
+
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # Check if vehicle exists
+        cursor.execute('SELECT id, encounter_count FROM vehicles WHERE vehicle_hash = ?',
+                       (vehicle_hash,))
+        result = cursor.fetchone()
+
+        if result:
+            vehicle_id, encounter_count = result
+            cursor.execute('''
+                           UPDATE vehicles
+                           SET last_seen       = ?,
+                               encounter_count = ?
+                           WHERE id = ?
+                           ''', (timestamp, encounter_count + 1, vehicle_id))
+        else:
+            cursor.execute('''
+                           INSERT INTO vehicles (vehicle_hash, first_seen, last_seen, tpms_ids)
+                           VALUES (?, ?, ?, ?)
+                           ''', (vehicle_hash, timestamp, timestamp, json.dumps(sorted(tpms_ids))))
+            vehicle_id = cursor.lastrowid
+
+        # Record encounter
+        cursor.execute('''
+                       INSERT INTO encounters (vehicle_id, timestamp, latitude, longitude)
+                       VALUES (?, ?, ?, ?)
+                       ''', (vehicle_id, timestamp,
+                             location[0] if location else None,
+                             location[1] if location else None))
+
+        conn.commit()
+        conn.close()
+        return vehicle_id
+
+    def get_vehicle_history(self, vehicle_id: int) -> Dict:
+        """Get complete history for a vehicle"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # Vehicle info
+        cursor.execute('SELECT * FROM vehicles WHERE id = ?', (vehicle_id,))
+        vehicle = dict(zip([d[0] for d in cursor.description], cursor.fetchone()))
+        vehicle['tpms_ids'] = json.loads(vehicle['tpms_ids'])
+
+        # Encounters
+        cursor.execute('''
+                       SELECT *
+                       FROM encounters
+                       WHERE vehicle_id = ?
+                       ORDER BY timestamp DESC
+                       ''', (vehicle_id,))
+        encounters = [dict(zip([d[0] for d in cursor.description], row))
+                      for row in cursor.fetchall()]
+
+        # Maintenance data
+        cursor.execute('''
+            SELECT tpms_id, AVG(pressure_psi) as avg_pressure, 
+                   AVG(temperature_c) as avg_temp,
+                   MIN(pressure_psi) as min_pressure,
+                   MAX(pressure_psi) as max_pressure
+            FROM tpms_signals
+            WHERE tpms_id IN ({})
+            GROUP BY tpms_id
+        '''.format(','.join('?' * len(vehicle['tpms_ids']))), vehicle['tpms_ids'])
+
+        maintenance = [dict(zip([d[0] for d in cursor.description], row))
+                       for row in cursor.fetchall()]
+
+        conn.close()
+
+        return {
+            'vehicle': vehicle,
+            'encounters': encounters,
+            'maintenance': maintenance
+        }
+
+    def get_all_vehicles(self, min_encounters: int = 1) -> List[Dict]:
+        """Get all known vehicles"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+                       SELECT *
+                       FROM vehicles
+                       WHERE encounter_count >= ?
+                       ORDER BY last_seen DESC
+                       ''', (min_encounters,))
+
+        columns = [d[0] for d in cursor.description]
+        vehicles = []
+        for row in cursor.fetchall():
+            vehicle = dict(zip(columns, row))
+            vehicle['tpms_ids'] = json.loads(vehicle['tpms_ids'])
+            vehicles.append(vehicle)
+
+        conn.close()
+        return vehicles
+
+    def analyze_maintenance(self, vehicle_id: int, days: int = 30) -> Dict:
+        """Analyze tire maintenance for a vehicle"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # Get TPMS IDs for this vehicle
+        cursor.execute('SELECT tpms_ids FROM vehicles WHERE id = ?', (vehicle_id,))
+        tpms_ids = json.loads(cursor.fetchone()[0])
+
+        cutoff_time = datetime.now().timestamp() - (days * 86400)
+
+        # Get pressure and temperature trends
+        cursor.execute('''
+            SELECT tpms_id, timestamp, pressure_psi, temperature_c
+            FROM tpms_signals
+            WHERE tpms_id IN ({}) AND timestamp > ?
+            ORDER BY timestamp
+        '''.format(','.join('?' * len(tpms_ids))), tpms_ids + [cutoff_time])
+
+        data = cursor.fetchall()
+        conn.close()
+
+        # Analyze per tire
+        tire_analysis = {}
+        for tpms_id in tpms_ids:
+            tire_data = [(t, p, temp) for tid, t, p, temp in data if tid == tpms_id]
+
+            if tire_data:
+                pressures = [p for _, p, _ in tire_data if p is not None]
+                temps = [t for _, _, t in tire_data if t is not None]
+
+                tire_analysis[tpms_id] = {
+                    'avg_pressure': np.mean(pressures) if pressures else None,
+                    'pressure_std': np.std(pressures) if pressures else None,
+                    'min_pressure': min(pressures) if pressures else None,
+                    'max_pressure': max(pressures) if pressures else None,
+                    'avg_temp': np.mean(temps) if temps else None,
+                    'readings_count': len(tire_data),
+                    'alerts': self._generate_alerts(pressures, temps)
+                }
+
+        return tire_analysis
+
+    def _generate_alerts(self, pressures: List[float], temps: List[float]) -> List[str]:
+        """Generate maintenance alerts"""
+        alerts = []
+
+        if pressures:
+            avg_pressure = np.mean(pressures)
+            if avg_pressure < 28:
+                alerts.append('LOW_PRESSURE')
+            elif avg_pressure > 40:
+                alerts.append('HIGH_PRESSURE')
+
+            if len(pressures) > 5:
+                pressure_variance = np.std(pressures)
+                if pressure_variance > 5:
+                    alerts.append('UNSTABLE_PRESSURE')
+
+        if temps:
+            avg_temp = np.mean(temps)
+            if avg_temp > 80:
+                alerts.append('HIGH_TEMPERATURE')
+
+        return alerts
+
+    def _generate_vehicle_hash(self, tpms_ids: List[str]) -> str:
+        """Generate a unique hash for a vehicle based on its TPMS IDs"""
+        return '-'.join(sorted(tpms_ids))
+
+    def update_vehicle_nickname(self, vehicle_id: int, nickname: str):
+        """Set a friendly name for a vehicle"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('UPDATE vehicles SET nickname = ? WHERE id = ?',
+                       (nickname, vehicle_id))
+        conn.commit()
+        conn.close()
+"""
+Debug and diagnostic tools for TPMS Tracker
+"""
+import numpy as np
+from scipy import signal as scipy_signal
+import subprocess
+import time
+from typing import Dict, List, Tuple
+from dataclasses import dataclass
+from config import config
+import shutil
+
+@dataclass
+class SpectrumPeak:
+    frequency: float
+    power: float
+    bandwidth: float
+    snr: float
+
+@dataclass
+class ModulationAnalysis:
+    frequency: float
+    modulation_type: str
+    confidence: float
+    baud_rate: int
+    bandwidth: float
+    characteristics: Dict
+
+@dataclass
+class HardwareInfo:
+    device_found: bool
+    serial_number: str
+    board_id: str
+    firmware_version: str
+    part_id: str
+    operacake_detected: bool
+
+class DebugTools:
+    def __init__(self):
+        self.hackrf_path = shutil.which('hackrf_transfer') or 'hackrf_transfer'
+        self.hackrf_info_path = shutil.which('hackrf_info') or 'hackrf_info'
+    
+    def get_hardware_info(self) -> HardwareInfo:
+        """Get HackRF hardware information"""
+        try:
+            result = subprocess.run(
+                [self.hackrf_info_path],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            
+            if result.returncode != 0:
+                return HardwareInfo(
+                    device_found=False,
+                    serial_number="N/A",
+                    board_id="N/A",
+                    firmware_version="N/A",
+                    part_id="N/A",
+                    operacake_detected=False
+                )
+            
+            output = result.stdout
+            
+            # Parse output
+            serial = "Unknown"
+            board_id = "Unknown"
+            firmware = "Unknown"
+            part_id = "Unknown"
+            operacake = False
+            
+            for line in output.split('\n'):
+                if "Serial number:" in line:
+                    serial = line.split(':')[1].strip()
+                elif "Board ID Number:" in line:
+                    board_id = line.split(':')[1].strip()
+                elif "Firmware Version:" in line:
+                    firmware = line.split(':')[1].strip()
+                elif "Part ID Number:" in line:
+                    part_id = line.split(':')[1].strip()
+                elif "Operacake found" in line:
+                    operacake = True
+            
+            return HardwareInfo(
+                device_found=True,
+                serial_number=serial,
+                board_id=board_id,
+                firmware_version=firmware,
+                part_id=part_id,
+                operacake_detected=operacake
+            )
+        
+        except Exception as e:
+            print(f"Error getting hardware info: {e}")
+            return HardwareInfo(
+                device_found=False,
+                serial_number="Error",
+                board_id="Error",
+                firmware_version="Error",
+                part_id="Error",
+                operacake_detected=False
+            )
+    
+    def spectrum_scan(self, start_freq: float, end_freq: float, 
+                 step: float = 0.5, duration: float = 0.5) -> Tuple[List[SpectrumPeak], List[Tuple[float, float]]]:
+        """
+        Perform a spectrum scan across frequency range
+    
+        Args:
+            start_freq: Start frequency in MHz
+            end_freq: End frequency in MHz
+            step: Step size in MHz
+            duration: Duration to sample each frequency in seconds
+    
+        Returns:
+            Tuple of (peaks list, raw spectrum data as [(freq, power)])
+        """
+        peaks = []
+        raw_spectrum = []
+        num_steps = int((end_freq - start_freq) / step) + 1
+    
+        print(f"📊 Scanning {num_steps} frequencies from {start_freq} to {end_freq} MHz...")
+    
+        for i in range(num_steps):
+            freq = start_freq + (i * step)
+        
+            # Capture samples at this frequency
+            power, snr = self._measure_frequency(freq, duration)
+        
+            # Store all measurements for visualization
+            raw_spectrum.append((freq, power))
+        
+            # Only record significant signals as peaks
+            if power > -85:
+                # Estimate bandwidth
+                bandwidth = self._estimate_bandwidth(freq, power)
+            
+                peaks.append(SpectrumPeak(
+                    frequency=freq,
+                    power=power,
+                    bandwidth=bandwidth,
+                    snr=snr
+                ))
+        
+            # Progress indicator
+            if (i + 1) % 10 == 0:
+                print(f"   Progress: {i+1}/{num_steps} frequencies scanned...")
+    
+        # Sort peaks by power
+        peaks.sort(key=lambda x: x.power, reverse=True)
+    
+        print(f"✅ Scan complete! Found {len(peaks)} peaks above -85 dBm")
+    
+        return peaks, raw_spectrum
+
+    
+    def _measure_frequency(self, freq: float, duration: float) -> Tuple[float, float]:
+        """Measure power and SNR at a specific frequency"""
+        try:
+            # Calculate number of samples
+            num_samples = int(config.SAMPLE_RATE * duration)
+            
+            # Run hackrf_transfer to capture samples
+            cmd = [
+                self.hackrf_path,
+                '-r', '-',
+                '-f', str(int(freq * 1e6)),
+                '-s', str(config.SAMPLE_RATE),
+                '-g', '40',  # High gain for detection
+                '-l', '32',
+                '-a', '1',
+                '-n', str(num_samples)
+            ]
+            
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=duration + 2
+            )
+            
+            if result.returncode != 0 or len(result.stdout) < 100:
+                return -100, 0
+            
+            # Convert to IQ samples
+            iq_data = np.frombuffer(result.stdout, dtype=np.int8)
+            
+            # Ensure even length
+            if len(iq_data) % 2 != 0:
+                iq_data = iq_data[:-1]
+            
+            i_samples = iq_data[0::2].astype(np.float32) / 128.0
+            q_samples = iq_data[1::2].astype(np.float32) / 128.0
+            
+            min_len = min(len(i_samples), len(q_samples))
+            complex_samples = i_samples[:min_len] + 1j * q_samples[:min_len]
+            
+            # Calculate power
+            power = np.mean(np.abs(complex_samples) ** 2)
+            power_dbm = 10 * np.log10(power + 1e-10) - 60
+            
+            # Calculate SNR
+            signal_power = np.max(np.abs(complex_samples) ** 2)
+            noise_power = np.median(np.abs(complex_samples) ** 2)
+            snr = 10 * np.log10((signal_power / (noise_power + 1e-10)))
+            
+            return power_dbm, snr
+        
+        except Exception as e:
+            print(f"Error measuring {freq} MHz: {e}")
+            return -100, 0
+    
+    def _estimate_bandwidth(self, center_freq: float, center_power: float) -> float:
+        """Estimate signal bandwidth"""
+        # Simple bandwidth estimation by checking adjacent frequencies
+        step = 0.1  # MHz
+        bandwidth = 0
+        
+        # Check up to 1 MHz on each side
+        for offset in [0.1, 0.2, 0.3, 0.4, 0.5]:
+            power_high, _ = self._measure_frequency(center_freq + offset, 0.2)
+            power_low, _ = self._measure_frequency(center_freq - offset, 0.2)
+            
+            # If power drops by more than 6dB, we've found the edge
+            if power_high < center_power - 6 or power_low < center_power - 6:
+                bandwidth = offset * 2
+                break
+        
+        return bandwidth if bandwidth > 0 else 0.2  # Default to 200 kHz
+    
+    def analyze_modulation(self, frequency: float, duration: float = 2.0) -> ModulationAnalysis:
+        """
+        Analyze modulation type at a specific frequency
+        
+        Args:
+            frequency: Frequency to analyze in MHz
+            duration: Duration to capture in seconds
+        
+        Returns:
+            ModulationAnalysis object
+        """
+        try:
+            # Capture samples
+            num_samples = int(config.SAMPLE_RATE * duration)
+            
+            cmd = [
+                self.hackrf_path,
+                '-r', '-',
+                '-f', str(int(frequency * 1e6)),
+                '-s', str(config.SAMPLE_RATE),
+                '-g', '40',
+                '-l', '32',
+                '-a', '1',
+                '-n', str(num_samples)
+            ]
+            
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=duration + 2
+            )
+            
+            if result.returncode != 0 or len(result.stdout) < 1000:
+                return ModulationAnalysis(
+                    frequency=frequency,
+                    modulation_type="Unknown",
+                    confidence=0.0,
+                    baud_rate=0,
+                    bandwidth=0,
+                    characteristics={}
+                )
+            
+            # Convert to IQ samples
+            iq_data = np.frombuffer(result.stdout, dtype=np.int8)
+            
+            if len(iq_data) % 2 != 0:
+                iq_data = iq_data[:-1]
+            
+            i_samples = iq_data[0::2].astype(np.float32) / 128.0
+            q_samples = iq_data[1::2].astype(np.float32) / 128.0
+            
+            min_len = min(len(i_samples), len(q_samples))
+            complex_samples = i_samples[:min_len] + 1j * q_samples[:min_len]
+            
+            # Analyze characteristics
+            characteristics = self._analyze_signal_characteristics(complex_samples)
+            
+            # Determine modulation type
+            mod_type, confidence = self._classify_modulation(characteristics)
+            
+            # Estimate baud rate
+            baud_rate = self._estimate_baud_rate(complex_samples)
+            
+            # Estimate bandwidth
+            bandwidth = self._estimate_bandwidth(frequency, characteristics['avg_power'])
+            
+            return ModulationAnalysis(
+                frequency=frequency,
+                modulation_type=mod_type,
+                confidence=confidence,
+                baud_rate=baud_rate,
+                bandwidth=bandwidth,
+                characteristics=characteristics
+            )
+        
+        except Exception as e:
+            print(f"Error analyzing modulation: {e}")
+            return ModulationAnalysis(
+                frequency=frequency,
+                modulation_type="Error",
+                confidence=0.0,
+                baud_rate=0,
+                bandwidth=0,
+                characteristics={"error": str(e)}
+            )
+    
+    def _analyze_signal_characteristics(self, samples: np.ndarray) -> Dict:
+        """Analyze signal characteristics"""
+        # Amplitude
+        amplitude = np.abs(samples)
+        amp_mean = np.mean(amplitude)
+        amp_std = np.std(amplitude)
+        amp_var = np.var(amplitude)
+        
+        # Phase
+        phase = np.angle(samples)
+        phase_diff = np.diff(phase)
+        phase_var = np.var(phase_diff)
+        
+        # Frequency (instantaneous)
+        inst_freq = np.diff(np.unwrap(phase))
+        freq_var = np.var(inst_freq)
+        
+        # Power
+        power = amplitude ** 2
+        avg_power = 10 * np.log10(np.mean(power) + 1e-10) - 60
+        
+        return {
+            'amp_mean': float(amp_mean),
+            'amp_std': float(amp_std),
+            'amp_var': float(amp_var),
+            'phase_var': float(phase_var),
+            'freq_var': float(freq_var),
+            'avg_power': float(avg_power)
+        }
+    
+    def _classify_modulation(self, characteristics: Dict) -> Tuple[str, float]:
+        """Classify modulation type based on characteristics"""
+        amp_var = characteristics['amp_var']
+        phase_var = characteristics['phase_var']
+        freq_var = characteristics['freq_var']
+        
+        # Decision tree based on variance
+        if amp_var > 0.3:
+            if phase_var < 0.2:
+                return "ASK/OOK", 0.8
+            else:
+                return "QAM", 0.6
+        
+        elif phase_var > 0.5:
+            if amp_var < 0.1:
+                return "PSK/BPSK", 0.7
+            else:
+                return "QPSK", 0.6
+        
+        elif freq_var > 0.3:
+            return "FSK", 0.75
+        
+        else:
+            return "Unknown/CW", 0.5
+    
+    def _estimate_baud_rate(self, samples: np.ndarray) -> int:
+        """Estimate symbol/baud rate"""
+        try:
+            # Use autocorrelation
+            amplitude = np.abs(samples)
+            
+            # Normalize
+            amplitude = amplitude - np.mean(amplitude)
+            
+            # Autocorrelation
+            autocorr = np.correlate(amplitude, amplitude, mode='full')
+            autocorr = autocorr[len(autocorr)//2:]
+            
+            # Find peaks
+            peaks, _ = scipy_signal.find_peaks(autocorr, distance=10, height=np.max(autocorr)*0.3)
+            
+            if len(peaks) > 1:
+                # Average distance between peaks
+                avg_distance = np.mean(np.diff(peaks[:5]))
+                baud_rate = int(config.SAMPLE_RATE / avg_distance)
+                
+                # Round to common baud rates
+                common_rates = [1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200]
+                closest = min(common_rates, key=lambda x: abs(x - baud_rate))
+                
+                if abs(closest - baud_rate) < baud_rate * 0.2:  # Within 20%
+                    return closest
+                
+                return baud_rate
+        
+        except Exception:
+            pass
+        
+        return 0
+    
+    def run_full_diagnostic(self) -> Dict:
+        """Run complete diagnostic suite"""
+        print("🔍 Starting full diagnostic...")
+    
+        results = {
+            'timestamp': time.time(),
+            'hardware': None,
+            'spectrum_scan': [],
+            'raw_spectrum': [],  # NEW
+            'modulation_analysis': []
+        }
+    
+        # 1. Hardware check
+        print("📡 Checking hardware...")
+        results['hardware'] = self.get_hardware_info()
+    
+        if not results['hardware'].device_found:
+            print("❌ Hardware not found!")
+            return results
+    
+        # 2. Spectrum scan on TPMS frequencies
+        print("📊 Scanning TPMS frequencies...")
+        all_raw_spectrum = []
+    
+        for freq in config.FREQUENCIES:
+            # Scan ±5 MHz around each TPMS frequency
+            peaks, raw_spectrum = self.spectrum_scan(freq - 5, freq + 5, step=0.5, duration=0.3)
+            results['spectrum_scan'].extend(peaks)
+            all_raw_spectrum.extend(raw_spectrum)
+    
+        results['raw_spectrum'] = all_raw_spectrum
+        
+        # 3. Analyze top peaks
+        print("🔬 Analyzing detected signals...")
+        top_peaks = sorted(results['spectrum_scan'], key=lambda x: x.power, reverse=True)[:5]
+    
+        for peak in top_peaks:
+            print(f"   Analyzing {peak.frequency:.2f} MHz...")
+            analysis = self.analyze_modulation(peak.frequency, duration=1.0)
+            results['modulation_analysis'].append(analysis)
+    
+        print("✅ Diagnostic complete!")
+    
+        return results
+
+"""
+ESP32 TPMS Trigger Controller
+Communicates with ESP32 via WiFi to control LF triggering
+"""
+
+import requests
+import time
+from typing import Optional, Dict
+import threading
+
+class ESP32TriggerController:
+    """Control ESP32-based LF trigger via WiFi"""
+    
+    def __init__(self, esp32_ip: str = "192.168.4.1"):
+        """
+        Initialize ESP32 controller
+        
+        Args:
+            esp32_ip: IP address of ESP32 (default is AP mode IP)
+        """
+        self.esp32_ip = esp32_ip
+        self.base_url = f"http://{esp32_ip}"
+        self.connected = False
+        self.is_triggering = False
+        
+        # Try to connect
+        self.check_connection()
+    
+    def check_connection(self) -> bool:
+        """Check if ESP32 is reachable"""
+        try:
+            response = requests.get(f"{self.base_url}/status", timeout=2)
+            if response.status_code == 200:
+                self.connected = True
+                print(f"✅ Connected to ESP32 at {self.esp32_ip}")
+                return True
+        except Exception as e:
+            self.connected = False
+            print(f"❌ Cannot connect to ESP32 at {self.esp32_ip}: {e}")
+        
+        return False
+    
+    def send_trigger(self, protocol: str = "generic") -> bool:
+        """
+        Send single trigger pulse
+        
+        Args:
+            protocol: Trigger pattern ('schrader', 'toyota', 'continental', 'generic')
+        
+        Returns:
+            True if successful
+        """
+        if not self.connected:
+            print("⚠️  Not connected to ESP32")
+            return False
+        
+        pattern_map = {
+            'schrader': 0,
+            'toyota': 1,
+            'continental': 2,
+            'generic': 3
+        }
+        
+        pattern_id = pattern_map.get(protocol.lower(), 3)
+        
+        try:
+            response = requests.post(
+                f"{self.base_url}/trigger",
+                data={'pattern': pattern_id},
+                timeout=5
+            )
+            
+            if response.status_code == 200:
+                print(f"📡 Trigger sent: {protocol}")
+                return True
+            else:
+                print(f"⚠️  Trigger failed: {response.text}")
+                return False
+                
+        except Exception as e:
+            print(f"❌ Trigger error: {e}")
+            return False
+    
+    def start_continuous(self, protocol: str = "generic", interval: float = 1.0) -> bool:
+        """
+        Start continuous triggering on ESP32
+        
+        Args:
+            protocol: Trigger pattern
+            interval: Time between triggers (seconds)
+        
+        Returns:
+            True if successful
+        """
+        if not self.connected:
+            print("⚠️  Not connected to ESP32")
+            return False
+        
+        pattern_map = {
+            'schrader': 0,
+            'toyota': 1,
+            'continental': 2,
+            'generic': 3
+        }
+        
+        pattern_id = pattern_map.get(protocol.lower(), 3)
+        
+        try:
+            response = requests.post(
+                f"{self.base_url}/start_continuous",
+                data={
+                    'pattern': pattern_id,
+                    'interval': interval
+                },
+                timeout=5
+            )
+            
+            if response.status_code == 200:
+                self.is_triggering = True
+                print(f"🔄 Continuous triggering started: {protocol} @ {interval}s")
+                return True
+            else:
+                print(f"⚠️  Start failed: {response.text}")
+                return False
+                
+        except Exception as e:
+            print(f"❌ Start error: {e}")
+            return False
+    
+    def stop_continuous(self) -> bool:
+        """Stop continuous triggering"""
+        if not self.connected:
+            return False
+        
+        try:
+            response = requests.post(
+                f"{self.base_url}/stop_continuous",
+                timeout=5
+            )
+            
+            if response.status_code == 200:
+                self.is_triggering = False
+                print("⏹️  Continuous triggering stopped")
+                return True
+            else:
+                print(f"⚠️  Stop failed: {response.text}")
+                return False
+                
+        except Exception as e:
+            print(f"❌ Stop error: {e}")
+            return False
+    
+    def get_status(self) -> Optional[Dict]:
+        """Get ESP32 trigger status"""
+        if not self.connected:
+            return None
+        
+        try:
+            response = requests.get(f"{self.base_url}/status", timeout=2)
+            if response.status_code == 200:
+                return response.json()
+        except Exception as e:
+            print(f"⚠️  Status error: {e}")
+        
+        return None
+### hackrf_interface_polling.py
+import logging
+import time
+import numpy as np
+from typing import Callable, Optional
+ import threading
+
+# Import our wrapper instead of non-existent 'hackrf' module
+try:
+    from hackrf_wrapper import HackRFDevice, is_available
+    HACKRF_AVAILABLE = is_available()
+except Exception as e:
+    logging.error(f"Failed to import HackRF wrapper: {e}")
+    HACKRF_AVAILABLE = False
+    HackRFDevice = None
+
+logger = logging.getLogger(__name__)
+
+class HackRFInterface:
+    def __init__(self):
+        logger.info("HackRFInterface.__init__ called")
+        
+        self.device = None
+        self.is_running = False
+        self.callback = None
+        self.frequency = 314.9e6
+        self.sample_rate = 2_457_600
+        self.lna_gain = 32
+        self.vga_gain = 40
+        
+        if not HACKRF_AVAILABLE:
+            logger.warning("HackRF library not available - simulation mode")
+            return
+        
+        # Try to open device
+        try:
+            self.device = HackRFDevice()
+            if self.device.open():
+                logger.info("✅ HackRF device opened successfully")
+                self._configure_device()
+            else:
+                logger.error("❌ Failed to open HackRF device")
+                self.device = None
+        except Exception as e:
+            logger.error(f"❌ Error initializing HackRF: {e}")
+            self.device = None
+    
+    def _configure_device(self):
+        """Configure device with default settings"""
+        if not self.device:
+            return
+        
+        self.device.set_freq(int(self.frequency))
+        self.device.set_sample_rate(self.sample_rate)
+        self.device.set_lna_gain(self.lna_gain)
+        self.device.set_vga_gain(self.vga_gain)
+        self.device.set_amp_enable(True)
+    
+    def start(self, callback: Callable):
+        """Start receiving"""
+        logger.info("start_rx() called")
+        
+        if not self.device:
+            logger.error("❌ Device not opened")
+            return False
+        
+        self.callback = callback
+        
+        def rx_callback(iq_data):
+            """Internal callback wrapper"""
+            try:
+                # Convert int8 to complex float
+                iq_complex = (iq_data[::2] + 1j * iq_data[1::2]).astype(np.complex64) / 128.0
+                
+                # Calculate RSSI
+                power = np.mean(np.abs(iq_complex) ** 2)
+                rssi = 10 * np.log10(power + 1e-10) - 50  # Rough calibration
+                
+                # Call user callback
+                if self.callback:
+                    self.callback(iq_complex, rssi, self.frequency)
+            except Exception as e:
+                logger.error(f"Callback error: {e}")
+        
+        if self.device.start_rx(rx_callback):
+            self.is_running = True
+            logger.info("✅ RX started successfully")
+            return True
+        else:
+            logger.error("❌ Failed to start RX")
+            return False
+    
+    def stop(self):
+        """Stop receiving"""
+        if self.device and self.is_running:
+            self.device.stop_rx()
+            self.is_running = False
+            logger.info("RX stopped")
+    
+    def change_frequency(self, freq_hz: float):
+        """Change center frequency"""
+        self.frequency = freq_hz
+        if self.device:
+            self.device.set_freq(int(freq_hz))
+    
+    def get_status(self):
+        """Get current status"""
+        return {
+            'frequency': self.frequency / 1e6,
+            'is_running': self.is_running,
+            'sample_rate': self.sample_rate,
+            'lna_gain': self.lna_gain,
+            'vga_gain': self.vga_gain
+        }
+    
+    def __del__(self):
+        """Cleanup"""
+        if self.device:
+            self.stop()
+            self.device.close()
+### hackrf_interface
+import logging
+import time
+import numpy as np
+from typing import Callable, Optional
+import threading
+
+# Import our wrapper
+try:
+    from hackrf_wrapper import HackRFDevice, is_available
+    HACKRF_AVAILABLE = is_available()
+except Exception as e:
+    logging.error(f"Failed to import HackRF wrapper: {e}")
+    HACKRF_AVAILABLE = False
+    HackRFDevice = None
+
+logger = logging.getLogger(__name__)
+
+class HackRFInterface:
+    def __init__(self):
+        logger.info("HackRFInterface.__init__ called")
+        
+        self.device = None
+        self.is_running = False
+        self.callback = None
+        self.frequency = 314.9e6
+        self.sample_rate = 2_457_600
+        self.lna_gain = 32
+        self.vga_gain = 40
+        
+        if not HACKRF_AVAILABLE:
+            logger.warning("HackRF library not available - simulation mode")
+            return
+        
+        # Try to open device
+        try:
+            self.device = HackRFDevice()
+            if self.device.open():
+                logger.info("✅ HackRF device opened successfully")
+                self._configure_device()
+            else:
+                logger.error("❌ Failed to open HackRF device")
+                self.device = None
+        except Exception as e:
+            logger.error(f"❌ Error initializing HackRF: {e}")
+            self.device = None
+    
+    def _configure_device(self):
+        """Configure device with default settings"""
+        if not self.device:
+            return
+        
+        self.device.set_freq(int(self.frequency))
+        self.device.set_sample_rate(self.sample_rate)
+        self.device.set_lna_gain(self.lna_gain)
+        self.device.set_vga_gain(self.vga_gain)
+        self.device.set_amp_enable(True)
+    
+    def start(self, callback: Callable):
+        """Start receiving"""
+        logger.info("start() called")
+        
+        if not self.device:
+            logger.error("❌ Device not opened")
+            return False
+        
+        self.callback = callback
+        
+        def rx_callback(iq_data):
+            """Internal callback wrapper"""
+            try:
+                # Convert int8 to complex float
+                iq_complex = (iq_data[::2] + 1j * iq_data[1::2]).astype(np.complex64) / 128.0
+                
+                # Calculate RSSI
+                power = np.mean(np.abs(iq_complex) ** 2)
+                rssi = 10 * np.log10(power + 1e-10) - 50  # Rough calibration
+                
+                # Call user callback
+                if self.callback:
+                    self.callback(iq_complex, rssi, self.frequency)
+            except Exception as e:
+                logger.error(f"Callback error: {e}")
+        
+        if self.device.start_rx(rx_callback):
+            self.is_running = True
+            logger.info("✅ RX started successfully")
+            return True
+        else:
+            logger.error("❌ Failed to start RX")
+            return False
+    
+    def stop(self):
+        """Stop receiving"""
+        if self.device and self.is_running:
+            self.device.stop_rx()
+            self.is_running = False
+            logger.info("RX stopped")
+    
+    def change_frequency(self, freq_hz: float):
+        """Change center frequency"""
+        self.frequency = freq_hz
+        if self.device:
+            self.device.set_freq(int(freq_hz))
+            logger.info(f"Changed frequency to {freq_hz/1e6:.1f} MHz")
+    
+    def set_frequency_hopping(self, enabled: bool):
+        """Frequency hopping not implemented"""
+        return False
+    
+    def set_hop_interval(self, interval: float):
+        """Frequency hopping not implemented"""
+        return False
+    
+    def increment_detection(self, frequency: float):
+        """Track detections per frequency"""
+        pass
+    
+    def get_status(self):
+        """Get current status"""
+        return {
+            'frequency': self.frequency / 1e6,
+            'is_streaming': self.is_running,
+            'sample_rate': self.sample_rate,
+            'lna_gain': self.lna_gain,
+            'vga_gain': self.vga_gain,
+            'frequency_hopping': False,
+            'hop_interval': 30.0,
+            'frequency_stats': {}
+        }
+    
+    def get_statistics(self):
+        """Get statistics"""
+        return {
+            'is_streaming': self.is_running,
+            'samples_received': 0,
+            'errors': 0,
+            'buffer_size': 0,
+            'sample_rate': self.sample_rate
+        }
+    
+    def __del__(self):
+        """Cleanup"""
+        if self.device:
+            self.stop()
+            self.device.close()
+
+class SimulatedHackRF:
+    """Simulated HackRF for testing"""
+    
+    def __init__(self):
+        logger.info("SimulatedHackRF initialized")
+        self.is_running = False
+        self.callback = None
+        self.frequency = 315_000_000
+        self.thread = None
+    
+    def start(self, callback: Callable):
+        if self.is_running:
+            return False
+        
+        self.callback = callback
+        self.is_running = True
+        self.thread = threading.Thread(target=self._simulate, daemon=True)
+        self.thread.start()
+        logger.info("✅ Simulation started")
+        return True
+    
+    def stop(self):
+        self.is_running = False
+        if self.thread:
+            self.thread.join(timeout=1.0)
+        logger.info("Simulation stopped")
+    
+    def _simulate(self):
+        """Generate simulated TPMS signals"""
+        from config import config
+        
+        while self.is_running:
+            # Generate noise
+            noise = (np.random.randn(config.SAMPLES_PER_SCAN) + 
+                    1j * np.random.randn(config.SAMPLES_PER_SCAN)) * 0.1
+            
+            # Occasionally add a signal
+            if np.random.random() < 0.05:
+                t = np.arange(config.SAMPLES_PER_SCAN) / config.SAMPLE_RATE
+                carrier = 50000
+                symbol_rate = 19200
+                
+                num_bits = int(len(t) * symbol_rate / config.SAMPLE_RATE)
+                bits = np.random.randint(0, 2, num_bits)
+                samples_per_bit = config.SAMPLE_RATE // symbol_rate
+                bit_signal = np.repeat(bits, samples_per_bit)[:len(t)]
+                
+                freq_dev = 20000
+                inst_freq = carrier + (bit_signal - 0.5) * 2 * freq_dev
+                phase = 2 * np.pi * np.cumsum(inst_freq) / config.SAMPLE_RATE
+                signal = 0.5 * np.exp(1j * phase)
+                
+                noise += signal
+            
+            if self.callback:
+                power = np.abs(noise) ** 2
+                rssi = 10 * np.log10(np.mean(power) + 1e-10)
+                self.callback(noise, rssi, self.frequency)
+            
+            time.sleep(0.5)
+    
+    def change_frequency(self, freq):
+        self.frequency = freq
+        return True
+    
+    def set_frequency_hopping(self, enabled):
+        return False
+    
+    def set_hop_interval(self, interval):
+        return False
+    
+    def increment_detection(self, freq):
+        pass
+    
+    def get_status(self):
+        return {'frequency': self.frequency / 1e6, 'is_streaming': self.is_running}
+    
+    def get_statistics(self):
+        return {'is_streaming': self.is_running, 'samples_received': 0}
+
+def create_hackrf_interface(use_simulation=False):
+    """Factory function"""
+    if use_simulation or not HACKRF_AVAILABLE:
+        return SimulatedHackRF()
+    return HackRFInterface()
+
+"""
+HackRF Library Wrapper using ctypes
+Direct interface to libhackrf.so without external dependencies
+"""
+
+import ctypes
+import ctypes.util
+import numpy as np
+from typing import Optional, Callable
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Find libhackrf
+_libhackrf_path = ctypes.util.find_library('hackrf')
+if not _libhackrf_path:
+    # Try common paths
+    for path in ['/usr/lib/x86_64-linux-gnu/libhackrf.so',
+                 '/usr/lib/x86_64-linux-gnu/libhackrf.so.0',
+                 '/usr/local/lib/libhackrf.so',
+                 '/usr/lib/libhackrf.so']:
+        try:
+            _libhackrf = ctypes.CDLL(path)
+            _libhackrf_path = path
+            logger.info(f"✅ Loaded libhackrf from {path}")
+            break
+        except:
+            continue
+    
+    if not _libhackrf_path:
+        logger.error("❌ libhackrf not found!")
+        _libhackrf = None
+else:
+    _libhackrf = ctypes.CDLL(_libhackrf_path)
+    logger.info(f"✅ Loaded libhackrf from {_libhackrf_path}")
+
+# HackRF constants
+HACKRF_SUCCESS = 0
+HACKRF_TRUE = 1
+HACKRF_ERROR_INVALID_PARAM = -2
+HACKRF_ERROR_NOT_FOUND = -5
+HACKRF_ERROR_LIBUSB = -1000
+
+# Transfer structure (matches hackrf.h)
+class hackrf_transfer(ctypes.Structure):
+    _fields_ = [
+        ("device", ctypes.c_void_p),
+        ("buffer", ctypes.POINTER(ctypes.c_uint8)),
+        ("buffer_length", ctypes.c_int),
+        ("valid_length", ctypes.c_int),
+        ("rx_ctx", ctypes.c_void_p),
+        ("tx_ctx", ctypes.c_void_p)
+    ]
+
+# Callback type - takes pointer to hackrf_transfer struct
+hackrf_sample_block_cb_fn = ctypes.CFUNCTYPE(
+    ctypes.c_int,
+    ctypes.POINTER(hackrf_transfer)
+)
+
+
+class HackRFDevice:
+    """Python wrapper for HackRF device"""
+    
+    def __init__(self):
+        self.device = None
+        self.callback = None
+        self.is_streaming = False
+        self.python_callback = None
+        
+        if _libhackrf is None:
+            raise RuntimeError("libhackrf not available")
+    
+    def open(self) -> bool:
+        """Open HackRF device"""
+        try:
+            # Initialize library
+            result = _libhackrf.hackrf_init()
+            if result != HACKRF_SUCCESS:
+                logger.error(f"hackrf_init failed: {result}")
+                return False
+            
+            # Open device
+            device_ptr = ctypes.c_void_p()
+            result = _libhackrf.hackrf_open(ctypes.byref(device_ptr))
+            
+            if result != HACKRF_SUCCESS:
+                logger.error(f"hackrf_open failed: {result}")
+                return False
+            
+            self.device = device_ptr
+            logger.info("✅ HackRF device opened successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to open HackRF: {e}")
+            return False
+    
+    def close(self):
+        """Close HackRF device"""
+        if self.device:
+            try:
+                if self.is_streaming:
+                    self.stop_rx()
+                _libhackrf.hackrf_close(self.device)
+                _libhackrf.hackrf_exit()
+                self.device = None
+                logger.info("HackRF device closed")
+            except Exception as e:
+                logger.error(f"Error closing HackRF: {e}")
+    
+    def set_freq(self, freq_hz: int) -> bool:
+        """Set center frequency in Hz"""
+        if not self.device:
+            return False
+        
+        result = _libhackrf.hackrf_set_freq(self.device, ctypes.c_uint64(freq_hz))
+        if result == HACKRF_SUCCESS:
+            logger.info(f"Frequency set to {freq_hz / 1e6:.2f} MHz")
+            return True
+        else:
+            logger.error(f"Failed to set frequency: {result}")
+            return False
+    
+    def set_sample_rate(self, rate_hz: int) -> bool:
+        """Set sample rate in Hz"""
+        if not self.device:
+            return False
+        
+        result = _libhackrf.hackrf_set_sample_rate(self.device, ctypes.c_double(rate_hz))
+        if result == HACKRF_SUCCESS:
+            logger.info(f"Sample rate set to {rate_hz / 1e6:.2f} MS/s")
+            return True
+        else:
+            logger.error(f"Failed to set sample rate: {result}")
+            return False
+    
+    def set_lna_gain(self, gain_db: int) -> bool:
+        """Set LNA gain (0-40 dB, 8 dB steps)"""
+        if not self.device:
+            return False
+        
+        # Clamp to valid range and round to nearest 8
+        gain_db = max(0, min(40, gain_db))
+        gain_db = (gain_db // 8) * 8
+        
+        result = _libhackrf.hackrf_set_lna_gain(self.device, ctypes.c_uint32(gain_db))
+        if result == HACKRF_SUCCESS:
+            logger.info(f"LNA gain set to {gain_db} dB")
+            return True
+        else:
+            logger.error(f"Failed to set LNA gain: {result}")
+            return False
+    
+    def set_vga_gain(self, gain_db: int) -> bool:
+        """Set VGA gain (0-62 dB, 2 dB steps)"""
+        if not self.device:
+            return False
+        
+        # Clamp to valid range and round to nearest 2
+        gain_db = max(0, min(62, gain_db))
+        gain_db = (gain_db // 2) * 2
+        
+        result = _libhackrf.hackrf_set_vga_gain(self.device, ctypes.c_uint32(gain_db))
+        if result == HACKRF_SUCCESS:
+            logger.info(f"VGA gain set to {gain_db} dB")
+            return True
+        else:
+            logger.error(f"Failed to set VGA gain: {result}")
+            return False
+    
+    def set_amp_enable(self, enable: bool) -> bool:
+        """Enable/disable RF amplifier"""
+        if not self.device:
+            return False
+        
+        result = _libhackrf.hackrf_set_amp_enable(
+            self.device,
+            ctypes.c_uint8(1 if enable else 0)
+        )
+        if result == HACKRF_SUCCESS:
+            logger.info(f"RF amp {'enabled' if enable else 'disabled'}")
+            return True
+        else:
+            logger.error(f"Failed to set amp enable: {result}")
+            return False
+    
+    def start_rx(self, callback: Callable) -> bool:
+        """Start receiving with callback"""
+        if not self.device:
+            logger.error("Device not opened")
+            return False
+        
+        # Store Python callback
+        self.python_callback = callback
+        
+        # Create C callback wrapper
+        def c_callback(transfer_ptr):
+            try:
+                # Dereference the transfer structure
+                transfer = transfer_ptr.contents
+                
+                # Get buffer length
+                buffer_length = transfer.valid_length
+                
+                if buffer_length <= 0:
+                    logger.warning(f"Empty buffer: valid_length={buffer_length}")
+                    return 0
+                
+                # Extract data from buffer
+                # Data is interleaved I/Q as signed 8-bit integers
+                buffer_array = ctypes.cast(
+                    transfer.buffer,
+                    ctypes.POINTER(ctypes.c_int8 * buffer_length)
+                ).contents
+                
+                # Convert to numpy array
+                iq_data = np.frombuffer(buffer_array, dtype=np.int8)
+                
+                # Call Python callback
+                if self.python_callback:
+                    self.python_callback(iq_data)
+                
+                return 0  # Success
+                
+            except Exception as e:
+                logger.error(f"Callback error: {e}", exc_info=True)
+                return -1
+        
+        # Store callback to prevent garbage collection
+        self.callback = hackrf_sample_block_cb_fn(c_callback)
+        
+        # Start RX
+        result = _libhackrf.hackrf_start_rx(
+            self.device,
+            self.callback,
+            None  # user data (not used)
+        )
+        
+        if result == HACKRF_SUCCESS:
+            self.is_streaming = True
+            logger.info("✅ RX streaming started")
+            return True
+        else:
+            logger.error(f"Failed to start RX: {result}")
+            return False
+    
+    def stop_rx(self) -> bool:
+        """Stop receiving"""
+        if not self.device or not self.is_streaming:
+            return False
+        
+        result = _libhackrf.hackrf_stop_rx(self.device)
+        if result == HACKRF_SUCCESS:
+            self.is_streaming = False
+            logger.info("RX streaming stopped")
+            return True
+        else:
+            logger.error(f"Failed to stop RX: {result}")
+            return False
+    
+    def is_streaming_rx(self) -> bool:
+        """Check if currently receiving"""
+        if not self.device:
+            return False
+        
+        result = _libhackrf.hackrf_is_streaming(self.device)
+        return result == HACKRF_TRUE
+
+
+# Test if library is available
+def is_available() -> bool:
+    """Check if libhackrf is available"""
+    return _libhackrf is not None
+
+
+def get_version() -> Optional[str]:
+    """Get library version"""
+    if not _libhackrf:
+        return None
+    
+    try:
+        version = ctypes.create_string_buffer(128)
+        _libhackrf.hackrf_library_version(version)
+        return version.value.decode('utf-8')
+    except:
+        return "unknown"
+
+"""
+Automated HackRF Tools Installer for Windows
+Downloads and installs HackRF tools and sets up PATH
+"""
+
+import os
+import sys
+import subprocess
+import urllib.request
+import zipfile
+import winreg
+from pathlib import Path
+import json
+
+# Latest release info
+HACKRF_RELEASES_API = "https://api.github.com/repos/greatscottgadgets/hackrf/releases/latest"
+HACKRF_FALLBACK_VERSION = "2024.02.1"
+INSTALL_DIR = Path("C:/hackrf")
+
+def get_latest_release():
+    """Get the latest HackRF release info from GitHub API"""
+    print("🔍 Checking for latest HackRF release...")
+
+    try:
+        req = urllib.request.Request(HACKRF_RELEASES_API)
+        req.add_header('User-Agent', 'TPMS-Tracker-Installer')
+
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode())
+
+            version = data['tag_name'].replace('v', '')
+
+            # Find the Windows x64 asset
+            for asset in data['assets']:
+                if 'win-x64' in asset['name'] and asset['name'].endswith('.zip'):
+                    return {
+                        'version': version,
+                        'url': asset['browser_download_url'],
+                        'name': asset['name']
+                    }
+
+            print("⚠️  No Windows x64 release found in latest version")
+            return None
+
+    except Exception as e:
+        print(f"⚠️  Could not fetch latest release: {e}")
+        return None
+
+def get_fallback_url():
+    """Get fallback download URLs for known versions"""
+    # These are direct links to known working releases
+    fallback_urls = [
+        {
+            'version': '2024.02.1',
+            'url': 'https://github.com/greatscottgadgets/hackrf/releases/download/v2024.02.1/hackrf-2024.02.1.zip',
+            'name': 'hackrf-2024.02.1-win-x64.zip'
+        },
+        {
+            'version': '2023.01.1',
+            'url': 'https://github.com/greatscottgadgets/hackrf/releases/download/v2023.01.1/hackrf-2023.01.1.zip',
+            'name': 'hackrf-2023.01.1-win-x64.zip'
+        },
+        {
+            'version': '2022.09.1',
+            'url': 'https://github.com/greatscottgadgets/hackrf/releases/download/v2022.09.1/hackrf-2022.09.1.zip',
+            'name': 'hackrf-2022.09.1-win-x64.zip'
+        }
+    ]
+
+    return fallback_urls
+
+def is_admin():
+    """Check if script is running with admin privileges"""
+    try:
+        return os.getuid() == 0
+    except AttributeError:
+        import ctypes
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+
+def download_hackrf(release_info):
+    """Download HackRF tools"""
+    print(f"📥 Downloading HackRF {release_info['version']}...")
+    print(f"URL: {release_info['url']}")
+
+    zip_path = Path("hackrf.zip")
+
+    try:
+        # Add headers to avoid 403 errors
+        req = urllib.request.Request(release_info['url'])
+        req.add_header('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+
+        with urllib.request.urlopen(req, timeout=60) as response:
+            total_size = int(response.headers.get('content-length', 0))
+            block_size = 8192
+            downloaded = 0
+
+            with open(zip_path, 'wb') as f:
+                while True:
+                    buffer = response.read(block_size)
+                    if not buffer:
+                        break
+
+                    downloaded += len(buffer)
+                    f.write(buffer)
+
+                    # Show progress
+                    if total_size > 0:
+                        percent = (downloaded / total_size) * 100
+                        print(f"\rProgress: {percent:.1f}% ({downloaded}/{total_size} bytes)", end='')
+
+        print("\n✅ Download complete!")
+        return zip_path
+
+    except urllib.error.HTTPError as e:
+        print(f"\n❌ HTTP Error {e.code}: {e.reason}")
+        return None
+    except urllib.error.URLError as e:
+        print(f"\n❌ URL Error: {e.reason}")
+        return None
+    except Exception as e:
+        print(f"\n❌ Download failed: {e}")
+        return None
+
+def extract_hackrf(zip_path):
+    """Extract HackRF tools"""
+    print(f"📦 Extracting to {INSTALL_DIR}...")
+
+    try:
+        INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            # List contents
+            file_list = zip_ref.namelist()
+            print(f"Extracting {len(file_list)} files...")
+
+            # Extract all files
+            zip_ref.extractall(INSTALL_DIR)
+
+        print("✅ Extraction complete!")
+
+        # Clean up
+        zip_path.unlink()
+
+        # Find the bin directory (it might be in a subdirectory)
+        bin_dirs = list(INSTALL_DIR.rglob("bin"))
+        if bin_dirs:
+            print(f"Found bin directory: {bin_dirs[0]}")
+            return bin_dirs[0].parent
+        else:
+            print("⚠️  No bin directory found, using install root")
+            return INSTALL_DIR
+
+    except Exception as e:
+        print(f"❌ Extraction failed: {e}")
+        return None
+
+def add_to_path(hackrf_dir):
+    """Add HackRF bin directory to system PATH"""
+    bin_dir = str(hackrf_dir / "bin")
+
+    # Check if bin directory exists
+    if not (hackrf_dir / "bin").exists():
+        print(f"⚠️  Bin directory not found at {bin_dir}")
+        # Try to find it
+        possible_bins = list(hackrf_dir.rglob("hackrf_transfer.exe"))
+        if possible_bins:
+            bin_dir = str(possible_bins[0].parent)
+            print(f"Found hackrf_transfer.exe at {bin_dir}")
+        else:
+            print("❌ Could not locate hackrf_transfer.exe")
+            return False
+
+    print(f"🔧 Adding {bin_dir} to PATH...")
+
+    try:
+        # Get current PATH
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            'Environment',
+            0,
+            winreg.KEY_ALL_ACCESS
+        )
+
+        try:
+            current_path, _ = winreg.QueryValueEx(key, 'Path')
+        except WindowsError:
+            current_path = ''
+
+        # Add to PATH if not already there
+        if bin_dir.lower() not in current_path.lower():
+            new_path = f"{current_path};{bin_dir}" if current_path else bin_dir
+            winreg.SetValueEx(key, 'Path', 0, winreg.REG_EXPAND_SZ, new_path)
+            print("✅ PATH updated!")
+            print("⚠️  Please restart your terminal for PATH changes to take effect")
+        else:
+            print("ℹ️  Already in PATH")
+
+        winreg.CloseKey(key)
+        return True
+
+    except Exception as e:
+        print(f"❌ Failed to update PATH: {e}")
+        print(f"Please manually add {bin_dir} to your PATH")
+        return False
+
+def test_installation():
+    """Test if HackRF tools are working"""
+    print("\n🧪 Testing installation...")
+
+    # Refresh environment variables
+    os.environ['PATH'] = os.popen('echo %PATH%').read().strip()
+
+    try:
+        result = subprocess.run(
+            ['hackrf_info', '--version'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+
+        if result.returncode == 0 or 'hackrf' in result.stdout.lower():
+            print("✅ HackRF tools installed successfully!")
+            if result.stdout:
+                print(f"Output: {result.stdout.strip()}")
+            return True
+        else:
+            print("⚠️  Installation complete but hackrf_info not responding properly")
+            print("You may need to restart your terminal")
+            return False
+
+    except FileNotFoundError:
+        print("⚠️  hackrf_info not found in PATH")
+        print("Please restart your terminal and try again")
+        return False
+    except Exception as e:
+        print(f"⚠️  Test failed: {e}")
+        return False
+
+def manual_install_instructions():
+    """Print manual installation instructions"""
+    print("\n" + "=" * 60)
+    print("📋 Manual Installation Instructions")
+    print("=" * 60)
+    print("\n1. Go to: https://github.com/greatscottgadgets/hackrf/releases")
+    print("2. Download the latest 'hackrf-*-win-x64.zip' file")
+    print("3. Extract to C:\\hackrf")
+    print("4. Add C:\\hackrf\\bin to your PATH:")
+    print("   - Search for 'Environment Variables' in Windows")
+    print("   - Edit 'Path' under User variables")
+    print("   - Add new entry: C:\\hackrf\\bin")
+    print("5. Restart your terminal")
+    print("6. Test with: hackrf_info")
+    print()
+
+def main():
+    print("=" * 60)
+    print("HackRF Tools Installer for Windows")
+    print("=" * 60)
+    print()
+
+    # Check if already installed
+    try:
+        result = subprocess.run(
+            ['hackrf_info', '--version'],
+            capture_output=True,
+            timeout=5
+        )
+        if result.returncode == 0 or 'hackrf' in result.stdout.decode().lower():
+            print("✅ HackRF tools already installed!")
+            print("Run 'hackrf_info' to test your device")
+            return
+    except:
+        pass
+
+    # Try to get latest release
+    release_info = get_latest_release()
+
+    # If that fails, try fallback URLs
+    if not release_info:
+        print("\n📋 Trying fallback URLs...")
+        fallback_urls = get_fallback_url()
+
+        for fb in fallback_urls:
+            print(f"\nTrying version {fb['version']}...")
+            zip_path = download_hackrf(fb)
+
+            if zip_path:
+                release_info = fb
+                break
+
+        if not release_info:
+            print("\n❌ All download attempts failed")
+            manual_install_instructions()
+            sys.exit(1)
+    else:
+        # Download latest release
+        zip_path = download_hackrf(release_info)
+
+        if not zip_path:
+            print("\n❌ Download failed")
+            manual_install_instructions()
+            sys.exit(1)
+
+    # Extract
+    hackrf_dir = extract_hackrf(zip_path)
+    if not hackrf_dir:
+        manual_install_instructions()
+        sys.exit(1)
+
+    # Add to PATH
+    add_to_path(hackrf_dir)
+
+    # Test
+    test_installation()
+
+    print("\n" + "=" * 60)
+    print("📋 Next Steps:")
+    print("=" * 60)
+    print("1. RESTART your terminal/command prompt")
+    print("2. Plug in your HackRF One")
+    print("3. Install WinUSB driver using Zadig:")
+    print("   - Download: https://zadig.akeo.ie/")
+    print("   - Run as Administrator")
+    print("   - Options → List All Devices")
+    print("   - Select 'HackRF One' device")
+    print("   - Select 'WinUSB' driver")
+    print("   - Click 'Replace Driver' or 'Install Driver'")
+    print("4. Test with: hackrf_info")
+    print("5. Run the app: start.bat")
+    print()
+
+if __name__ == "__main__":
+    main()
+
+"""
+Machine Learning Engine for TPMS Signal Analysis
+Modern Python (3.10+) compatible
+"""
+import numpy as np
+from sklearn.cluster import DBSCAN
+from sklearn.preprocessing import StandardScaler
+from typing import List, Dict, Optional, Tuple
+import time
+from dataclasses import dataclass, field
+from collections import defaultdict
+
+@dataclass
+class SignalCharacteristics:
+    """Characteristics of a detected signal"""
+    frequency: float
+    power: float
+    snr: float
+    modulation: str
+    baud_rate: int
+    timestamp: float
+    decoded: bool = False
+    protocol: Optional[str] = None
+    characteristics: Dict = field(default_factory=dict)
+
+class VehicleClusteringEngine:
+    """
+    ML engine for clustering TPMS sensors by vehicle
+    Uses DBSCAN for spatial-temporal clustering
+    """
+    
+    def __init__(self, min_samples: int = 3, eps: float = 0.5):
+        self.min_samples = min_samples
+        self.eps = eps
+        self.scaler = StandardScaler()
+        self.signal_history: List[SignalCharacteristics] = []
+        self.clusters: Dict[int, List[str]] = {}
+        self.vehicle_profiles: Dict[int, Dict] = {}
+        
+    def add_signal(self, signal: SignalCharacteristics):
+        """Add a signal to the history"""
+        self.signal_history.append(signal)
+        
+        # Keep only recent signals (last 1000)
+        if len(self.signal_history) > 1000:
+            self.signal_history = self.signal_history[-1000:]
+    
+    def cluster_sensors(self, sensor_data: List[Dict]) -> Dict[int, List[str]]:
+        """
+        Cluster TPMS sensors by vehicle using DBSCAN
+        
+        Args:
+            sensor_data: List of sensor readings with timestamps and signal characteristics
+            
+        Returns:
+            Dictionary mapping cluster_id to list of sensor IDs
+        """
+        if len(sensor_data) < self.min_samples:
+            return {}
+        
+        # Extract features for clustering
+        features = []
+        sensor_ids = []
+        
+        for sensor in sensor_data:
+            # Features: time_of_day, signal_strength, frequency_offset, etc.
+            features.append([
+                sensor.get('timestamp', 0) % 86400,  # Time of day in seconds
+                sensor.get('signal_strength', 0),
+                sensor.get('frequency', 0),
+                sensor.get('snr', 0),
+            ])
+            sensor_ids.append(sensor.get('id', ''))
+        
+        features = np.array(features)
+        
+        # Normalize features
+        features_scaled = self.scaler.fit_transform(features)
+        
+        # Perform DBSCAN clustering
+        clustering = DBSCAN(eps=self.eps, min_samples=self.min_samples)
+        labels = clustering.fit_predict(features_scaled)
+        
+        # Group sensors by cluster
+        clusters = defaultdict(list)
+        for sensor_id, label in zip(sensor_ids, labels):
+            if label != -1:  # -1 is noise in DBSCAN
+                clusters[label].append(sensor_id)
+        
+        self.clusters = dict(clusters)
+        return self.clusters
+    
+    def identify_vehicle(self, sensor_ids: List[str]) -> Optional[int]:
+        """
+        Identify which vehicle a set of sensors belongs to
+        
+        Args:
+            sensor_ids: List of TPMS sensor IDs
+            
+        Returns:
+            Vehicle cluster ID or None if no match
+        """
+        # Find cluster with most matching sensors
+        best_match = None
+        best_score = 0
+        
+        for cluster_id, cluster_sensors in self.clusters.items():
+            # Calculate overlap
+            overlap = len(set(sensor_ids) & set(cluster_sensors))
+            score = overlap / len(sensor_ids) if sensor_ids else 0
+            
+            if score > best_score and score >= 0.5:  # At least 50% match
+                best_score = score
+                best_match = cluster_id
+        
+        return best_match
+    
+    def get_vehicle_profile(self, cluster_id: int) -> Optional[Dict]:
+        """Get the profile for a vehicle cluster"""
+        return self.vehicle_profiles.get(cluster_id)
+    
+    def update_vehicle_profile(self, cluster_id: int, sensor_data: List[Dict]):
+        """Update vehicle profile with new sensor data"""
+        if cluster_id not in self.vehicle_profiles:
+            self.vehicle_profiles[cluster_id] = {
+                'sensor_ids': [],
+                'first_seen': time.time(),
+                'last_seen': time.time(),
+                'detection_count': 0,
+                'avg_signal_strength': 0,
+                'typical_frequency': 0,
+            }
+        
+        profile = self.vehicle_profiles[cluster_id]
+        
+        # Update profile
+        profile['last_seen'] = time.time()
+        profile['detection_count'] += 1
+        
+        # Update sensor IDs
+        for sensor in sensor_data:
+            sensor_id = sensor.get('id', '')
+            if sensor_id and sensor_id not in profile['sensor_ids']:
+                profile['sensor_ids'].append(sensor_id)
+        
+        # Update statistics
+        if sensor_data:
+            profile['avg_signal_strength'] = np.mean([
+                s.get('signal_strength', 0) for s in sensor_data
+            ])
+            profile['typical_frequency'] = np.mean([
+                s.get('frequency', 0) for s in sensor_data
+            ])
+    
+    def get_statistics(self) -> Dict:
+        """Get clustering statistics"""
+        return {
+            'total_signals': len(self.signal_history),
+            'num_clusters': len(self.clusters),
+            'num_vehicles': len(self.vehicle_profiles),
+            'signals_per_cluster': {
+                cid: len(sensors) for cid, sensors in self.clusters.items()
+            }
+        }
+
+    def find_patterns(self, days: int = 30) -> Dict:
+        """
+        Find patterns in vehicle encounters
+    
+        Args:
+            days: Number of days to analyze
+        
+        Returns:
+            Dictionary with pattern analysis
+        """
+        from datetime import datetime, timedelta
+    
+        cutoff_time = datetime.now().timestamp() - (days * 86400)
+    
+        # Get vehicles from database
+        if not hasattr(self, 'db') or self.db is None:
+            return {
+                'frequent_vehicles': [],
+                'time_patterns': {},
+                'location_clusters': {}
+            }
+    
+        vehicles = self.db.get_all_vehicles(min_encounters=2)
+    
+        # Filter by time window
+        frequent_vehicles = []
+        for vehicle in vehicles:
+            if vehicle['last_seen'] >= cutoff_time:
+                history = self.db.get_vehicle_history(vehicle['id'])
+            
+                # Count encounters in time window
+                recent_encounters = [
+                    e for e in history['encounters'] 
+                    if e['timestamp'] >= cutoff_time
+                ]
+            
+                if len(recent_encounters) >= 3:
+                    frequent_vehicles.append({
+                        'id': vehicle['id'],
+                        'nickname': vehicle.get('nickname', f"Vehicle {vehicle['id']}"),
+                        'encounter_count': len(recent_encounters),
+                        'first_seen': datetime.fromtimestamp(vehicle['first_seen']),
+                        'last_seen': datetime.fromtimestamp(vehicle['last_seen']),
+                        'tpms_ids': vehicle['tpms_ids']
+                    })
+    
+        # Sort by encounter count
+        frequent_vehicles.sort(key=lambda x: x['encounter_count'], reverse=True)
+    
+        return {
+            'frequent_vehicles': frequent_vehicles,
+            'time_patterns': self._analyze_time_patterns(frequent_vehicles),
+            'location_clusters': {}
+        }
+
+    def _analyze_time_patterns(self, vehicles: List[Dict]) -> Dict:
+        """Analyze temporal patterns in vehicle encounters"""
+        patterns = {
+            'peak_hours': [],
+            'peak_days': [],
+            'regular_commuters': []
+        }
+    
+        if not vehicles:
+            return patterns
+    
+        # Analyze hour-of-day patterns
+        hour_counts = {}
+        for vehicle in vehicles:
+            if hasattr(self, 'db') and self.db:
+                history = self.db.get_vehicle_history(vehicle['id'])
+                for encounter in history['encounters']:
+                    from datetime import datetime
+                    dt = datetime.fromtimestamp(encounter['timestamp'])
+                    hour = dt.hour
+                    hour_counts[hour] = hour_counts.get(hour, 0) + 1
+    
+        if hour_counts:
+            # Find peak hours
+            sorted_hours = sorted(hour_counts.items(), key=lambda x: x[1], reverse=True)
+            patterns['peak_hours'] = [
+                {'hour': h, 'count': c} for h, c in sorted_hours[:3]
+            ]
+    
+        return patterns
+
+    def predict_next_encounter(self, vehicle_id: int) -> Dict:
+        """
+        Predict next encounter time for a vehicle
+    
+        Args:
+            vehicle_id: Vehicle ID
+        
+        Returns:
+            Dictionary with prediction details
+        """
+        from datetime import datetime, timedelta
+    
+        if not hasattr(self, 'db') or self.db is None:
+            return {
+                'prediction': 'insufficient_data',
+                'confidence': 0.0
+            }
+    
+        history = self.db.get_vehicle_history(vehicle_id)
+        encounters = history['encounters']
+    
+        if len(encounters) < 3:
+            return {
+                'prediction': 'insufficient_data',
+                'confidence': 0.0
+            }
+        
+        # Calculate average time between encounters
+        timestamps = sorted([e['timestamp'] for e in encounters])
+        intervals = [timestamps[i+1] - timestamps[i] for i in range(len(timestamps)-1)]
+    
+        if not intervals:
+            return {
+                'prediction': 'insufficient_data',
+                'confidence': 0.0
+            }
+    
+        avg_interval = sum(intervals) / len(intervals)
+        std_interval = (sum((x - avg_interval)**2 for x in intervals) / len(intervals)) ** 0.5
+    
+        # Predict next encounter
+        last_encounter = timestamps[-1]
+        predicted_time = last_encounter + avg_interval
+        predicted_datetime = datetime.fromtimestamp(predicted_time)
+    
+        # Calculate confidence based on consistency
+        if std_interval > 0:
+            coefficient_of_variation = std_interval / avg_interval
+            confidence = max(0.0, min(1.0, 1.0 - coefficient_of_variation))
+        else:
+            confidence = 0.9
+    
+        return {
+            'prediction': 'estimated',
+            'predicted_datetime': predicted_datetime,
+            'predicted_timestamp': predicted_time,
+            'confidence': confidence,
+            'avg_interval_hours': avg_interval / 3600,
+            'last_encounter': datetime.fromtimestamp(last_encounter)
+        }
+
+
+class AdaptiveLearningEngine:
+    """
+    Adaptive learning engine for TPMS signal detection
+    Learns optimal parameters from successful decodes
+    """
+    
+    def __init__(self, learning_rate: float = 0.1):
+        self.learning_rate = learning_rate
+        self.signal_history: List[SignalCharacteristics] = []
+        self.protocol_stats: Dict[str, Dict] = defaultdict(lambda: {
+            'success_count': 0,
+            'fail_count': 0,
+            'avg_snr': 0,
+            'avg_power': 0,
+            'optimal_params': {}
+        })
+        
+    def learn_from_signal(self, signal: Dict, decoded: bool, protocol: Optional[str] = None):
+        """
+        Learn from a signal detection attempt
+        
+        Args:
+            signal: Signal characteristics
+            decoded: Whether the signal was successfully decoded
+            protocol: Protocol name if decoded
+        """
+        # Create signal characteristics
+        sig_char = SignalCharacteristics(
+            frequency=signal.get('frequency', 0),
+            power=signal.get('power', 0),
+            snr=signal.get('snr', 0),
+            modulation=signal.get('modulation', 'Unknown'),
+            baud_rate=signal.get('baud_rate', 0),
+            timestamp=time.time(),
+            decoded=decoded,
+            protocol=protocol,
+            characteristics=signal.get('characteristics', {})
+        )
+        
+        self.signal_history.append(sig_char)
+        
+        # Update protocol statistics
+        if decoded and protocol:
+            stats = self.protocol_stats[protocol]
+            stats['success_count'] += 1
+            
+            # Update running averages
+            n = stats['success_count']
+            stats['avg_snr'] = (stats['avg_snr'] * (n - 1) + sig_char.snr) / n
+            stats['avg_power'] = (stats['avg_power'] * (n - 1) + sig_char.power) / n
+        elif protocol:
+            self.protocol_stats[protocol]['fail_count'] += 1
+        
+        # Keep only recent history
+        if len(self.signal_history) > 1000:
+            self.signal_history = self.signal_history[-1000:]
+    
+    def get_optimal_scan_parameters(self, frequency: float) -> Dict:
+        """
+        Get optimal scanning parameters based on learned data
+        
+        Args:
+            frequency: Target frequency
+            
+        Returns:
+            Dictionary of optimal parameters
+        """
+        # Find most successful protocol at this frequency
+        best_protocol = None
+        best_success_rate = 0
+        
+        for protocol, stats in self.protocol_stats.items():
+            total = stats['success_count'] + stats['fail_count']
+            if total > 0:
+                success_rate = stats['success_count'] / total
+                if success_rate > best_success_rate:
+                    best_success_rate = success_rate
+                    best_protocol = protocol
+        
+        if best_protocol:
+            stats = self.protocol_stats[best_protocol]
+            return {
+                'protocol': best_protocol,
+                'expected_modulation': best_protocol.split('_')[1] if '_' in best_protocol else None,
+                'expected_baud_rate': stats['optimal_params'].get('baud_rate'),
+                'threshold': stats['avg_power'] - 10,  # 10 dB below average
+                'success_rate': best_success_rate
+            }
+        
+        return {}
+    
+    def get_protocol_statistics(self) -> Dict[str, Dict]:
+        """Get statistics for all protocols"""
+        return dict(self.protocol_stats)
+    
+    def get_learning_summary(self) -> Dict:
+        """Get summary of learning progress"""
+        total_signals = len(self.signal_history)
+        decoded_signals = sum(1 for s in self.signal_history if s.decoded)
+        
+        return {
+            'total_signals': total_signals,
+            'decoded_signals': decoded_signals,
+            'decode_rate': decoded_signals / total_signals if total_signals > 0 else 0,
+            'protocols_learned': len(self.protocol_stats),
+            'best_protocol': max(
+                self.protocol_stats.items(),
+                key=lambda x: x[1]['success_count'],
+                default=(None, None)
+            )[0] if self.protocol_stats else None
+        }
+
+def create_learning_engine() -> AdaptiveLearningEngine:
+    """Factory function to create learning engine"""
+    return AdaptiveLearningEngine(learning_rate=0.1)
+
+def create_clustering_engine() -> VehicleClusteringEngine:
+    """Factory function to create clustering engine"""
+    return VehicleClusteringEngine(min_samples=3, eps=0.5)
+
+
+"""
+Reference 'Happy Path' Signals
+These are known good TPMS captures that anchor the ML learning
+"""
+
+REFERENCE_SIGNALS = {
+    "toyota_lexus_5920441A": {
+        "tpms_id": "5920441A",
+        "protocol": "Toyota/Lexus",
+        "frequency": 314.9,
+        "signal_strength": -86.6,
+        "modulation": "FSK",
+        "bit_pattern": [0x59, 0x20, 0x44, 0x1A],
+        "timestamp": "2025-12-29 22:12:31",
+        "notes": "First successful capture - reference signal"
+    },
+    "schrader_A42D124A": {
+        "tpms_id": "A42D124A",
+        "protocol": "Schrader",
+        "frequency": 314.9,
+        "signal_strength": -86.2,
+        "modulation": "PSK",
+        "bit_pattern": [0xA4, 0x2D, 0x12, 0x4A],
+        "timestamp": "2025-12-30 15:20:26",
+        "notes": "Second capture - Schrader protocol reference"
+    }
+}
+
+def get_reference_characteristics():
+    """Get the common characteristics from reference signals"""
+    return {
+        "frequency_range": (314.8, 315.0),
+        "min_signal_strength": -90.0,  # dBm
+        "typical_strength": -86.0,
+        "modulation_types": ["FSK", "PSK", "FSK/PSK"],
+        "symbol_rates": [2184, 2520, 2730],  # Common rates from captures
+        "protocols": ["Toyota/Lexus", "Schrader"]
+    }
+from setuptools import setup, find_packages
+
+setup(
+    name="tpms-tracker",
+    version="1.0.0",
+    description="Intelligent TPMS Vehicle Pattern Recognition System",
+    author="Your Name",
+    packages=find_packages(),
+    install_requires=[
+        'streamlit>=1.28.0',
+        'pandas>=2.0.0',
+        'numpy>=1.24.0',
+        'plotly>=5.17.0',
+        'scikit-learn>=1.3.0',
+        'scipy>=1.11.0',
+    ],
+    python_requires='>=3.9',
+)
+#!/usr/bin/env python3
+"""
+TPMS Tracker - Linux Startup Script
+Checks dependencies and launches the Streamlit app
+"""
+
+import sys
+import os
+import subprocess
+import shutil
+from pathlib import Path
+
+def print_header():
+    """Print startup header"""
+    print("\n" + "="*60)
+    print("🚗 TPMS Tracker - Startup Script (Linux)")
+    print("="*60 + "\n")
+
+def check_dependencies():
+    """Check if required Python packages are installed"""
+    print("📦 Checking Python dependencies...")
+    required = ['streamlit', 'numpy', 'scipy', 'pandas']
+    missing = []
+    
+    for package in required:
+        try:
+            __import__(package)
+        except ImportError:
+            missing.append(package)
+    
+    if missing:
+        print(f"❌ Missing packages: {', '.join(missing)}")
+        print("Run: pip install -r requirements.txt")
+        return False
+    
+    print("✅ All dependencies installed")
+    return True
+
+def check_hackrf_tools():
+    """Check if HackRF tools are installed and accessible"""
+    print("🔍 Checking for HackRF tools...\n")
+    
+    # Check for hackrf_transfer (most important tool)
+    hackrf_transfer = shutil.which('hackrf_transfer')
+    hackrf_info = shutil.which('hackrf_info')
+    
+    if hackrf_transfer and hackrf_info:
+        print(f"✅ HackRF tools found:")
+        print(f"   hackrf_transfer: {hackrf_transfer}")
+        print(f"   hackrf_info: {hackrf_info}")
+        return True
+    else:
+        print("❌ HackRF tools not found in PATH")
+        print("\nInstall with:")
+        print("   sudo apt install hackrf libhackrf-dev")
+        return False
+
+def check_hackrf_device():
+    """Check if HackRF device is connected and accessible"""
+    print("\n🔌 Checking for HackRF device...\n")
+    
+    try:
+        result = subprocess.run(
+            ['hackrf_info'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        
+        if result.returncode == 0:
+            print("✅ HackRF device detected:")
+            # Print relevant info
+            for line in result.stdout.split('\n'):
+                if any(keyword in line for keyword in ['Serial', 'Board ID', 'Firmware']):
+                    print(f"   {line.strip()}")
+            return True
+        else:
+            print("❌ HackRF device not responding")
+            print("\nTroubleshooting:")
+            print("1. Check USB connection")
+            print("2. Check permissions: groups (should include 'plugdev')")
+            print("3. Try: sudo udevadm control --reload-rules && sudo udevadm trigger")
+            return False
+            
+    except subprocess.TimeoutExpired:
+        print("❌ HackRF device check timed out")
+        return False
+    except FileNotFoundError:
+        print("❌ hackrf_info command not found")
+        return False
+    except Exception as e:
+        print(f"❌ Error checking device: {e}")
+        return False
+
+def start_streamlit():
+    """Launch the Streamlit application"""
+    print("\n🚀 Starting TPMS Tracker application...\n")
+    print("="*60)
+    print("📱 Access the app at: http://localhost:8501")
+    print("🛑 Press Ctrl+C to stop")
+    print("="*60 + "\n")
+    
+    try:
+        # Launch streamlit
+        subprocess.run([
+            'streamlit', 'run', 'app.py',
+            '--server.address', '0.0.0.0',
+            '--browser.serverAddress', 'localhost'
+        ])
+    except KeyboardInterrupt:
+        print("\n\n👋 Shutting down TPMS Tracker...")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n❌ Error starting application: {e}")
+        sys.exit(1)
+
+
+def main():
+    """Main startup sequence"""
+    print_header()
+    
+    # Check dependencies
+    if not check_dependencies():
+        print("\n❌ Dependency check failed")
+        sys.exit(1)
+    
+    # Check HackRF tools
+    tools_ok = check_hackrf_tools()
+    
+    # Check HackRF device
+    device_ok = check_hackrf_device()
+    
+    if not tools_ok:
+        print("\n⚠️  Cannot continue without HackRF tools")
+        sys.exit(1)
+    
+    if not device_ok:
+        print("\n⚠️  Warning: HackRF device not detected")
+        response = input("Continue anyway? (y/n): ").lower().strip()
+        if response != 'y':
+            print("Exiting...")
+            sys.exit(1)
+    
+    # Everything looks good, start the app
+    start_streamlit()
+
+if __name__ == "__main__":
+    main()
+"""
+TPMS Tracker Startup Script
+Checks for HackRF and starts the application
+"""
+
+import subprocess
+import sys
+import time
+from pathlib import Path
+import re
+import os
+
+def find_hackrf_tools():
+    """Find HackRF tools in common locations"""
+    print("🔍 Searching for HackRF tools...")
+    
+    # Common installation paths
+    search_paths = [
+        Path("C:/hackrf/bin"),
+        Path("C:/Program Files/HackRF/bin"),
+        Path("C:/Program Files (x86)/HackRF/bin"),
+        Path(os.environ.get('PROGRAMFILES', 'C:/Program Files')) / "HackRF/bin",
+        Path(os.environ.get('LOCALAPPDATA', '')) / "Programs/HackRF/bin",
+        # Universal Radio Hacker might bundle it
+        Path(os.environ.get('PROGRAMFILES', 'C:/Program Files')) / "Universal Radio Hacker",
+        Path(os.environ.get('LOCALAPPDATA', '')) / "Programs/urh",
+    ]
+    
+    # Also check PATH
+    path_env = os.environ.get('PATH', '').split(';')
+    for path_dir in path_env:
+        if path_dir:
+            search_paths.append(Path(path_dir))
+    
+    # Search for hackrf_info.exe or hackrf_transfer.exe
+    for search_path in search_paths:
+        if search_path.exists():
+            hackrf_info = search_path / "hackrf_info.exe"
+            hackrf_transfer = search_path / "hackrf_transfer.exe"
+            
+            if hackrf_info.exists() or hackrf_transfer.exists():
+                print(f"✅ Found HackRF tools at: {search_path}")
+                
+                # Add to PATH for this session
+                os.environ['PATH'] = f"{search_path};{os.environ['PATH']}"
+                
+                return search_path
+    
+    return None
+
+def check_hackrf_via_usb():
+    """Check for HackRF using Windows USB detection"""
+    print("\n🔍 Checking USB devices...")
+    
+    try:
+        # Use PowerShell to check for HackRF
+        ps_command = """
+        Get-PnpDevice | Where-Object {
+            $_.FriendlyName -like '*HackRF*' -or 
+            $_.HardwareID -like '*VID_1D50&PID_6089*'
+        } | Select-Object Status, Class, FriendlyName | Format-List
+        """
+        
+        result = subprocess.run(
+            ['powershell', '-Command', ps_command],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        output = result.stdout
+        
+        if 'HackRF' in output or '1D50' in output:
+            print("✅ HackRF One found in USB devices:")
+            print(output)
+            
+            if 'Status      : OK' in output:
+                print("✅ Device status: OK")
+                return True
+            else:
+                print("⚠️  Device found but may have driver issue")
+                return False
+        else:
+            print("❌ HackRF not found in USB devices")
+            return False
+            
+    except Exception as e:
+        print(f"⚠️  Could not check USB devices: {e}")
+        return False
+
+def check_urh_installation():
+    """Check if Universal Radio Hacker is installed and can access HackRF"""
+    print("\n🔍 Checking for Universal Radio Hacker...")
+    
+    urh_paths = [
+        Path(os.environ.get('PROGRAMFILES', 'C:/Program Files')) / "Universal Radio Hacker",
+        Path(os.environ.get('PROGRAMFILES(X86)', 'C:/Program Files (x86)')) / "Universal Radio Hacker",
+        Path(os.environ.get('LOCALAPPDATA', '')) / "Programs/urh",
+    ]
+    
+    for urh_path in urh_paths:
+        if urh_path.exists():
+            print(f"✅ Found Universal Radio Hacker at: {urh_path}")
+            
+            # Check if it has HackRF tools
+            for file in ['hackrf_info.exe', 'hackrf_transfer.exe']:
+                found_files = list(urh_path.rglob(file))
+                if found_files:
+                    tool_path = found_files[0].parent
+                    print(f"✅ Found {file} at: {tool_path}")
+                    
+                    # Add to PATH
+                    os.environ['PATH'] = f"{tool_path};{os.environ['PATH']}"
+                    return tool_path
+    
+    return None
+
+def test_hackrf_direct():
+    """Try to run hackrf_info directly"""
+    print("\n🧪 Testing HackRF access...")
+    
+    try:
+        result = subprocess.run(
+            ['hackrf_info'],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        output = result.stdout + result.stderr
+        print("Output:", output[:500])
+        
+        if 'Found HackRF' in output:
+            return True
+        
+        return False
+        
+    except FileNotFoundError:
+        return False
+    except Exception as e:
+        print(f"Error: {e}")
+        return False
+
+def check_dependencies():
+    """Check if all Python dependencies are installed"""
+    print("\n📦 Checking Python dependencies...")
+    
+    required = {
+        'streamlit': 'streamlit',
+        'pandas': 'pandas',
+        'numpy': 'numpy',
+        'plotly': 'plotly',
+        'sklearn': 'scikit-learn',
+        'scipy': 'scipy'
+    }
+    
+    missing = []
+    for module, package in required.items():
+        try:
+            __import__(module)
+        except ImportError:
+            missing.append(package)
+    
+    if missing:
+        print(f"❌ Missing packages: {', '.join(missing)}")
+        print("\nInstall with:")
+        print("  pip install -r requirements.txt")
+        return False
+    
+    print("✅ All dependencies installed")
+    return True
+
+def start_app():
+    """Start the Streamlit application"""
+    print("\n🚀 Starting TPMS Tracker...")
+    print("=" * 60)
+    print("\n📱 The app will open in your browser at:")
+    print("   http://localhost:8501")
+    print("\n💡 Tips:")
+    print("   - Click 'Start Scan' to begin detection")
+    print("   - Adjust frequency if needed (315 MHz for North America)")
+    print("   - Drive near traffic for best results")
+    print("\n⏹️  Press Ctrl+C to stop the application")
+    print("=" * 60)
+    print()
+    
+    try:
+        subprocess.run([
+            sys.executable,
+            '-m',
+            'streamlit',
+            'run',
+            'app.py',
+            '--server.headless=true',
+            '--browser.gatherUsageStats=false'
+        ])
+    except KeyboardInterrupt:
+        print("\n\n👋 TPMS Tracker stopped")
+    except Exception as e:
+        print(f"\n❌ Error starting app: {e}")
+        sys.exit(1)
+
+def main():
+    print("=" * 60)
+    print("🚗 TPMS Tracker - Startup Script")
+    print("=" * 60)
+    
+    # Check Python dependencies first
+    if not check_dependencies():
+        input("\nPress Enter to exit...")
+        sys.exit(1)
+    
+    # Try to find HackRF tools
+    tools_path = find_hackrf_tools()
+    
+    if not tools_path:
+        # Try URH installation
+        tools_path = check_urh_installation()
+    
+    if not tools_path:
+        print("\n❌ HackRF tools not found in standard locations")
+        print("\nSince Universal Radio Hacker works, you have two options:")
+        print("\n1. Install HackRF tools separately:")
+        print("   python install_hackrf.py")
+        print("\n2. Use mock mode for testing (no hardware required)")
+        
+        response = input("\nUse mock mode? (y/n): ").strip().lower()
+        if response == 'y':
+            print("\n✅ Starting in MOCK MODE (simulated data)")
+            # Create a flag file for mock mode
+            with open('.mock_mode', 'w') as f:
+                f.write('1')
+            start_app()
+            return
+        else:
+            input("\nPress Enter to exit...")
+            sys.exit(1)
+    
+    # Check if device is accessible
+    device_ok = check_hackrf_via_usb()
+    
+    if not device_ok:
+        print("\n⚠️  HackRF detected but may not be accessible")
+        response = input("\nTry to start anyway? (y/n): ").strip().lower()
+        if response != 'y':
+            input("\nPress Enter to exit...")
+            sys.exit(1)
+    
+    # Test direct access
+    if not test_hackrf_direct():
+        print("\n⚠️  Could not communicate with HackRF")
+        print("\nPossible issues:")
+        print("1. WinUSB driver not installed (use Zadig)")
+        print("2. Device in use by another application")
+        print("3. USB connection issue")
+        
+        response = input("\nTry to start anyway? (y/n): ").strip().lower()
+        if response != 'y':
+            input("\nPress Enter to exit...")
+            sys.exit(1)
+    
+    # Remove mock mode flag if it exists
+    if os.path.exists('.mock_mode'):
+        os.remove('.mock_mode')
+    
+    # Start app
+    print("\n✅ All checks passed!")
+    start_app()
+
+if __name__ == "__main__":
+    main()
+"""
+TPMS Signal Decoder with Protocol Detection
+Matching Maurader TPMSRX implementation
+"""
+import numpy as np
+from scipy import signal as scipy_signal
+from dataclasses import dataclass
+from typing import List, Optional, Dict, Tuple
+import time
+from config import config
+# At the top of tpms_decoder.py
+import logging
+import sys
+from pathlib import Path
+
+# Setup logging
+log_dir = Path(__file__).parent / "logs"
+log_dir.mkdir(exist_ok=True)
+
+# Configure root logger to WARNING to suppress DEBUG from other libraries
+logging.basicConfig(
+    level=logging.WARNING,  # Changed from DEBUG
+    format='[%(asctime)s] %(name)s - %(levelname)s - %(message)s',
+)
+
+# Set our logger to INFO
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# Add file handler for our logger only
+file_handler = logging.FileHandler(log_dir / "tpms_decoder.log")
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(logging.Formatter('[%(asctime)s] %(name)s - %(levelname)s - %(message)s'))
+logger.addHandler(file_handler)
+
+# Also log to console
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s - %(message)s'))
+logger.addHandler(console_handler)
+
+logger.info("TPMS Decoder initialized")
+
+@dataclass
+class TPMSSignal:
+    tpms_id: str
+    timestamp: float
+    frequency: float
+    signal_strength: float
+    snr: float
+    pressure_psi: Optional[float]
+    temperature_c: Optional[float]
+    battery_low: bool
+    protocol: str
+    raw_data: bytes
+    confidence: float = 0.0
+
+@dataclass
+class UnknownSignal:
+    timestamp: float
+    frequency: float
+    signal_strength: float
+    modulation_type: str
+    baud_rate: Optional[int]
+    packet_length: int
+    pattern_signature: str
+    raw_samples: np.ndarray
+
+class TPMSDecoder:
+    def __init__(self, sample_rate: int):
+        self.sample_rate = sample_rate
+        self.unknown_signals = []
+        self.protocol_patterns = {}
+        self.learning_engine = None
+        self._init_protocol_patterns()
+
+    def _init_protocol_patterns(self):
+        """Initialize known TPMS protocol patterns matching Maurader"""
+        self.protocol_patterns = {
+            'Schrader_FSK': {
+                'preamble': [0x55, 0x55],  # Alternating pattern
+                'packet_length': 10,
+                'modulation': 'FSK',
+                'symbol_rate': 19200,
+                'deviation': 38400,
+                'min_packet_bits': 64
+            },
+            'Schrader_OOK_8k192': {
+                'preamble': [0xAA, 0xAA],
+                'packet_length': 8,
+                'modulation': 'OOK',
+                'symbol_rate': 8192,
+                'min_packet_bits': 64
+            },
+            'Schrader_OOK_8k4': {
+                'preamble': [0xAA, 0xAA],
+                'packet_length': 8,
+                'modulation': 'OOK',
+                'symbol_rate': 8400,
+                'min_packet_bits': 64
+            },
+            'Toyota': {
+                'preamble': [0x55, 0x55, 0x55],
+                'packet_length': 10,
+                'modulation': 'FSK',
+                'symbol_rate': 10000,
+                'deviation': 20000,
+                'min_packet_bits': 80
+            }
+        }
+
+    def set_learning_engine(self, learning_engine):
+        """Set reference to learning engine for adaptive decoding"""
+        self.learning_engine = learning_engine
+
+    def process_samples(self, iq_samples: np.ndarray, frequency: float) -> List[TPMSSignal]:
+        """Process IQ samples and decode TPMS signals"""
+        signals = []
+        
+        # Calculate signal power and SNR
+        power = np.abs(iq_samples) ** 2
+        avg_power = np.mean(power)
+        signal_strength = 10 * np.log10(avg_power + 1e-10)
+        snr = self._calculate_snr(iq_samples)
+        
+        # Check if signal is strong enough
+        if signal_strength < config.SIGNAL_THRESHOLD:
+            return signals
+        
+        print(f"🔍 Processing signal: {signal_strength:.1f} dBm, SNR: {snr:.1f} dB")
+        
+        # Try each protocol in order of likelihood
+        protocol_order = ['Schrader_FSK', 'Schrader_OOK_8k192', 'Schrader_OOK_8k4', 'Toyota']
+        
+        for protocol_name in protocol_order:
+            pattern = self.protocol_patterns[protocol_name]
+            decoded = self._try_decode_protocol(
+                iq_samples, protocol_name, pattern, frequency, signal_strength, snr
+            )
+            
+            if decoded:
+                signals.append(decoded)
+                print(f"✅ Decoded {protocol_name}: ID={decoded.tpms_id}")
+                
+                # Learn from successful decode
+                if self.learning_engine:
+                    self.learning_engine.learn_from_signal(
+                        {
+                            'frequency': frequency,
+                            'power': signal_strength,
+                            'snr': snr,
+                            'modulation': pattern['modulation'],
+                            'baud_rate': pattern['symbol_rate'],
+                            'characteristics': {}
+                        },
+                        decoded=True,
+                        protocol=protocol_name
+                    )
+                
+                return signals
+        
+        # If no protocol matched, analyze as unknown
+        if config.PROTOCOL_DETECTION_ENABLED:
+            print(f"❓ Unknown signal detected")
+            unknown = self._analyze_unknown_signal(iq_samples, frequency, signal_strength)
+            if unknown:
+                self.unknown_signals.append(unknown)
+                
+                if self.learning_engine:
+                    self.learning_engine.learn_from_signal(
+                        {
+                            'frequency': frequency,
+                            'power': signal_strength,
+                            'snr': snr,
+                            'modulation': unknown.modulation_type,
+                            'baud_rate': unknown.baud_rate or 0,
+                            'characteristics': {}
+                        },
+                        decoded=False,
+                        protocol=None
+                    )
+        
+        return signals
+
+    def _try_decode_protocol(self, iq_samples: np.ndarray, protocol_name: str, 
+                            pattern: dict, frequency: float, signal_strength: float,
+                            snr: float) -> Optional[TPMSSignal]:
+        """Attempt to decode signal with specific protocol"""
+        try:
+            # Demodulate based on modulation type
+            if pattern['modulation'] == 'FSK':
+                bits = self._demodulate_fsk(iq_samples, pattern['symbol_rate'], 
+                                           pattern.get('deviation', pattern['symbol_rate'] * 2))
+            elif pattern['modulation'] == 'OOK':
+                bits = self._demodulate_ook(iq_samples, pattern['symbol_rate'])
+            else:
+                return None
+            
+            if bits is None or len(bits) < pattern['min_packet_bits']:
+                return None
+            
+            # Look for preamble
+            preamble_bits = self._bytes_to_bits(pattern['preamble'])
+            preamble_pos = self._find_preamble(bits, preamble_bits)
+            
+            if preamble_pos == -1:
+                # Try with inverted bits
+                bits = 1 - bits
+                preamble_pos = self._find_preamble(bits, preamble_bits)
+                if preamble_pos == -1:
+                    return None
+            
+            # Extract packet
+            packet_start = preamble_pos + len(preamble_bits)
+            packet_bits = bits[packet_start:packet_start + pattern['packet_length'] * 8]
+            
+            if len(packet_bits) < pattern['min_packet_bits']:
+                return None
+            
+            # Convert to bytes
+            packet_bytes = self._bits_to_bytes(packet_bits)
+            
+            # Validate and decode packet
+            if not self._validate_packet(packet_bytes, protocol_name):
+                return None
+            
+            decoded = self._decode_packet(packet_bytes, protocol_name)
+            
+            if decoded:
+                return TPMSSignal(
+                    tpms_id=decoded['id'],
+                    timestamp=time.time(),
+                    frequency=frequency,
+                    signal_strength=signal_strength,
+                    snr=snr,
+                    pressure_psi=decoded.get('pressure'),
+                    temperature_c=decoded.get('temperature'),
+                    battery_low=decoded.get('battery_low', False),
+                    protocol=protocol_name,
+                    raw_data=packet_bytes,
+                    confidence=decoded.get('confidence', 0.8)
+                )
+        
+        except Exception as e:
+            print(f"⚠️  Error decoding {protocol_name}: {e}")
+            return None
+
+    def _demodulate_fsk(self, iq_samples: np.ndarray, symbol_rate: int, 
+                       deviation: int) -> Optional[np.ndarray]:
+        """
+        FSK demodulation matching Maurader implementation
+        Uses instantaneous frequency detection
+        """
+        if len(iq_samples) < 100:
+            return None
+        
+        # Calculate instantaneous frequency from phase
+        phase = np.angle(iq_samples)
+        unwrapped_phase = np.unwrap(phase)
+        inst_freq = np.diff(unwrapped_phase) * self.sample_rate / (2 * np.pi)
+        
+        # Smooth the frequency
+        samples_per_symbol = int(self.sample_rate / symbol_rate)
+        if samples_per_symbol < 1:
+            samples_per_symbol = 1
+        
+        window_size = max(1, samples_per_symbol // 4)
+        if window_size > 1:
+            kernel = np.ones(window_size) / window_size
+            inst_freq = np.convolve(inst_freq, kernel, mode='same')
+        
+        # Resample to symbol rate
+        num_symbols = len(inst_freq) // samples_per_symbol
+        if num_symbols < 10:
+            return None
+        
+        resampled = np.zeros(num_symbols)
+        for i in range(num_symbols):
+            start = i * samples_per_symbol
+            end = start + samples_per_symbol
+            if end <= len(inst_freq):
+                resampled[i] = np.mean(inst_freq[start:end])
+        
+        # Threshold detection (positive freq = 1, negative = 0)
+        threshold = np.median(resampled)
+        bits = (resampled > threshold).astype(int)
+        
+        return bits
+
+    def _demodulate_ook(self, iq_samples: np.ndarray, symbol_rate: int) -> Optional[np.ndarray]:
+        """
+        OOK (On-Off Keying) demodulation matching Maurader
+        Uses envelope detection
+        """
+        if len(iq_samples) < 100:
+            return None
+        
+        # Calculate amplitude envelope
+        amplitude = np.abs(iq_samples)
+        
+        # Smooth the amplitude
+        samples_per_symbol = int(self.sample_rate / symbol_rate)
+        if samples_per_symbol < 1:
+            samples_per_symbol = 1
+        
+        window_size = max(1, samples_per_symbol // 2)
+        if window_size > 1:
+            kernel = np.ones(window_size) / window_size
+            amplitude = np.convolve(amplitude, kernel, mode='same')
+        
+        # Resample to symbol rate
+        num_symbols = len(amplitude) // samples_per_symbol
+        if num_symbols < 10:
+            return None
+        
+        resampled = np.zeros(num_symbols)
+        for i in range(num_symbols):
+            start = i * samples_per_symbol
+            end = start + samples_per_symbol
+            if end <= len(amplitude):
+                resampled[i] = np.mean(amplitude[start:end])
+        
+        # Adaptive threshold (Otsu's method approximation)
+        hist, bin_edges = np.histogram(resampled, bins=50)
+        threshold = self._otsu_threshold(resampled, hist, bin_edges)
+        
+        bits = (resampled > threshold).astype(int)
+        
+        return bits
+
+    def _otsu_threshold(self, data: np.ndarray, hist: np.ndarray, 
+                       bin_edges: np.ndarray) -> float:
+        """Calculate optimal threshold using Otsu's method"""
+        total = len(data)
+        current_max = 0
+        threshold = 0
+        sum_total = np.sum(data)
+        sum_background = 0
+        weight_background = 0
+        
+        for i in range(len(hist)):
+            weight_background += hist[i]
+            if weight_background == 0:
+                continue
+            
+            weight_foreground = total - weight_background
+            if weight_foreground == 0:
+                break
+            
+            sum_background += bin_edges[i] * hist[i]
+            mean_background = sum_background / weight_background
+            mean_foreground = (sum_total - sum_background) / weight_foreground
+            
+            variance_between = weight_background * weight_foreground * \
+                             (mean_background - mean_foreground) ** 2
+            
+            if variance_between > current_max:
+                current_max = variance_between
+                threshold = bin_edges[i]
+        
+        return threshold
+
+    def _validate_packet(self, packet: bytes, protocol: str) -> bool:
+        """Validate packet structure and checksum"""
+        if len(packet) < 4:
+            return False
+        
+        # Basic validation: check if packet has reasonable values
+        # Most TPMS IDs are non-zero and non-0xFF
+        if packet[0] == 0x00 and packet[1] == 0x00:
+            return False
+        if packet[0] == 0xFF and packet[1] == 0xFF:
+            return False
+        
+        # Protocol-specific validation could go here
+        # For now, basic checks are sufficient
+        
+        return True
+
+    def _decode_packet(self, packet: bytes, protocol: str) -> Optional[Dict]:
+        """Decode packet based on protocol"""
+        if len(packet) < 4:
+            return None
+        
+        try:
+            # Extract ID (first 4 bytes for most protocols)
+            tpms_id = ''.join(f'{b:02X}' for b in packet[:4])
+            
+            pressure = None
+            temperature = None
+            battery_low = False
+            
+            # Schrader protocol decoding
+            if 'Schrader' in protocol:
+                if len(packet) >= 8:
+                    # Pressure: byte 4-5, typically in kPa * 4
+                    pressure_raw = packet[4]
+                    if pressure_raw > 0 and pressure_raw < 255:
+                        pressure = pressure_raw * 1.375  # Convert to PSI (approximate)
+                    
+                    # Temperature: byte 6, offset by 40°C
+                    temp_raw = packet[5]
+                    if temp_raw > 0 and temp_raw < 255:
+                        temperature = temp_raw - 40
+                    
+                    # Status flags: byte 7
+                    if len(packet) > 6:
+                        flags = packet[6]
+                        battery_low = bool(flags & 0x80)
+            
+            # Toyota protocol decoding
+            elif 'Toyota' in protocol:
+                if len(packet) >= 10:
+                    # Toyota uses different byte positions
+                    pressure_raw = packet[6]
+                    if pressure_raw > 0 and pressure_raw < 255:
+                        pressure = pressure_raw * 0.25  # Different scaling
+                    
+                    temp_raw = packet[7]
+                    if temp_raw > 0 and temp_raw < 255:
+                        temperature = temp_raw - 40
+                    
+                    flags = packet[8]
+                    battery_low = bool(flags & 0x40)
+            
+            return {
+                'id': tpms_id,
+                'pressure': pressure,
+                'temperature': temperature,
+                'battery_low': battery_low,
+                'confidence': 0.85
+            }
+        
+        except Exception as e:
+            print(f"⚠️  Packet decode error: {e}")
+            return None
+
+    def _bytes_to_bits(self, bytes_data: List[int]) -> np.ndarray:
+        """Convert bytes to bit array (MSB first)"""
+        bits = []
+        for byte in bytes_data:
+            for i in range(7, -1, -1):
+                bits.append((byte >> i) & 1)
+        return np.array(bits)
+    
+    def _bits_to_bytes(self, bits: np.ndarray) -> bytes:
+        """Convert bit array to bytes (MSB first)"""
+        # Pad to multiple of 8
+        remainder = len(bits) % 8
+        if remainder != 0:
+            bits = np.pad(bits, (0, 8 - remainder), 'constant')
+        
+        bytes_data = []
+        for i in range(0, len(bits), 8):
+            byte = 0
+            for j in range(8):
+                if i + j < len(bits):
+                    byte = (byte << 1) | int(bits[i + j])
+            bytes_data.append(byte)
+        return bytes(bytes_data)
+    
+    def _find_preamble(self, bits: np.ndarray, preamble: np.ndarray, 
+                      max_errors: int = 2) -> int:
+        """Find preamble in bit stream with error tolerance"""
+        preamble_len = len(preamble)
+        
+        for i in range(len(bits) - preamble_len):
+            errors = np.sum(bits[i:i+preamble_len] != preamble)
+            if errors <= max_errors:
+                return i
+        
+        return -1
+    
+    def _calculate_snr(self, iq_samples: np.ndarray) -> float:
+        """Calculate Signal-to-Noise Ratio"""
+        power = np.abs(iq_samples) ** 2
+        
+        # Use top 10% as signal, bottom 50% as noise
+        sorted_power = np.sort(power)
+        signal_power = np.mean(sorted_power[-len(sorted_power)//10:])
+        noise_power = np.mean(sorted_power[:len(sorted_power)//2])
+        
+        if noise_power == 0:
+            return 0
+        
+        snr = 10 * np.log10(signal_power / noise_power)
+        return max(0, snr)
+
+    def _analyze_unknown_signal(self, iq_samples: np.ndarray, frequency: float, 
+                                signal_strength: float) -> Optional[UnknownSignal]:
+        """Analyze unknown signal characteristics"""
+        try:
+            modulation = self._detect_modulation(iq_samples)
+            baud_rate = self._estimate_baud_rate(iq_samples)
+            packet_length = len(iq_samples) // (self.sample_rate // (baud_rate or 10000))
+            pattern_sig = self._create_pattern_signature(iq_samples)
+            
+            return UnknownSignal(
+                timestamp=time.time(),
+                frequency=frequency,
+                signal_strength=signal_strength,
+                modulation_type=modulation,
+                baud_rate=baud_rate,
+                packet_length=packet_length,
+                pattern_signature=pattern_sig,
+                raw_samples=iq_samples[:1000]
+            )
+        
+        except Exception as e:
+            print(f"⚠️  Error analyzing unknown signal: {e}")
+            return None
+    
+    def _detect_modulation(self, iq_samples: np.ndarray) -> str:
+        """Detect modulation type"""
+        phase = np.angle(iq_samples)
+        phase_diff = np.diff(np.unwrap(phase))
+        phase_var = np.var(phase_diff)
+        
+        amplitude = np.abs(iq_samples)
+        amp_var = np.var(amplitude) / (np.mean(amplitude) + 1e-10)
+        
+        if amp_var > 0.3:
+            return "OOK/ASK"
+        elif phase_var > 0.5:
+            return "FSK/PSK"
+        else:
+            return "Unknown"
+    
+    def _estimate_baud_rate(self, iq_samples: np.ndarray) -> Optional[int]:
+        """Estimate symbol/baud rate using autocorrelation"""
+        try:
+            amplitude = np.abs(iq_samples)
+            
+            # Normalize
+            amplitude = amplitude - np.mean(amplitude)
+            
+            # Autocorrelation
+            autocorr = np.correlate(amplitude, amplitude, mode='full')
+            autocorr = autocorr[len(autocorr)//2:]
+            
+            # Find first significant peak after zero lag
+            threshold = 0.5 * np.max(autocorr[10:])
+            peaks, _ = scipy_signal.find_peaks(autocorr[10:], height=threshold, distance=5)
+            
+            if len(peaks) > 0:
+                # First peak indicates symbol period
+                symbol_period = peaks[0] + 10
+                baud_rate = int(self.sample_rate / symbol_period)
+                
+                # Round to common rates
+                common_rates = [8192, 8400, 9600, 10000, 19200, 38400]
+                closest = min(common_rates, key=lambda x: abs(x - baud_rate))
+                
+                if abs(closest - baud_rate) < baud_rate * 0.1:  # Within 10%
+                    return closest
+                
+                return baud_rate
+        
+        except Exception:
+            pass
+        
+        return None
+    
+    def _create_pattern_signature(self, iq_samples: np.ndarray) -> str:
+        """Create a signature for pattern matching"""
+        amplitude = np.abs(iq_samples[:100])
+        amplitude = (amplitude - np.min(amplitude)) / (np.max(amplitude) - np.min(amplitude) + 1e-10)
+        quantized = (amplitude * 3).astype(int)
+        return ''.join(map(str, quantized))
+    
+    def get_unknown_signals(self, max_age: float = 60.0) -> List[UnknownSignal]:
+        """Get recent unknown signals"""
+        current_time = time.time()
+        return [s for s in self.unknown_signals if current_time - s.timestamp < max_age]
+    
+    def get_protocol_statistics(self) -> Dict:
+        """Get statistics on detected protocols"""
+        recent_unknown = self.get_unknown_signals(300)
+        
+        modulation_counts = {}
+        baud_rates = []
+        
+        for signal in recent_unknown:
+            mod = signal.modulation_type
+            modulation_counts[mod] = modulation_counts.get(mod, 0) + 1
+            if signal.baud_rate:
+                baud_rates.append(signal.baud_rate)
+        
+        return {
+            'total_unknown': len(recent_unknown),
+            'modulation_types': modulation_counts,
+            'common_baud_rates': list(set(baud_rates)) if baud_rates else [],
+            'avg_signal_strength': np.mean([s.signal_strength for s in recent_unknown]) if recent_unknown else 0
+        }
+"""Utility functions for TPMS Tracker"""
+
+import numpy as np
+from typing import List, Tuple
+import folium
+from streamlit_folium import folium_static
+
+
+def create_encounter_map(encounters: List[dict]) -> folium.Map:
+    """Create a map showing encounter locations"""
+    if not encounters:
+        return None
+
+    # Filter encounters with location data
+    located_encounters = [e for e in encounters if e.get('latitude') and e.get('longitude')]
+
+    if not located_encounters:
+        return None
+
+    # Calculate center
+    avg_lat = np.mean([e['latitude'] for e in located_encounters])
+    avg_lon = np.mean([e['longitude'] for e in located_encounters])
+
+    # Create map
+    m = folium.Map(location=[avg_lat, avg_lon], zoom_start=12)
+
+    # Add markers
+    for encounter in located_encounters:
+        folium.CircleMarker(
+            location=[encounter['latitude'], encounter['longitude']],
+            radius=5,
+            popup=f"Encounter at {encounter['timestamp']}",
+            color='blue',
+            fill=True
+        ).add_to(m)
+
+    return m
+
+
+def calculate_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Calculate distance between two points in km"""
+    from math import radians, sin, cos, sqrt, atan2
+
+    R = 6371  # Earth radius in km
+
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+
+    a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+
+    return R * c

@@ -29,14 +29,88 @@ class VehicleClusteringEngine:
     Uses DBSCAN for spatial-temporal clustering
     """
     
-    def __init__(self, min_samples: int = 3, eps: float = 0.5):
+    def __init__(self, db, min_samples: int = 3, eps: float = 0.5):
+        self.db = db  # Database reference
         self.min_samples = min_samples
         self.eps = eps
         self.scaler = StandardScaler()
         self.signal_history: List[SignalCharacteristics] = []
         self.clusters: Dict[int, List[str]] = {}
         self.vehicle_profiles: Dict[int, Dict] = {}
+    
+    def process_signals(self, signal_buffer: List[Dict]) -> List[int]:
+        """
+        Process a buffer of signals and identify vehicles
         
+        Args:
+            signal_buffer: List of signal dictionaries with TPMS data
+            
+        Returns:
+            List of vehicle IDs that were detected/updated
+        """
+        if not signal_buffer:
+            return []
+        
+        # Group signals by TPMS ID
+        signals_by_id = {}
+        for signal in signal_buffer:
+            tpms_id = signal.get('tpms_id')
+            if tpms_id:
+                if tpms_id not in signals_by_id:
+                    signals_by_id[tpms_id] = []
+                signals_by_id[tpms_id].append(signal)
+        
+        # Get unique TPMS IDs from this batch
+        tpms_ids = list(signals_by_id.keys())
+        
+        if len(tpms_ids) == 0:
+            return []
+        
+        vehicle_ids = []
+        
+        # If we have 4 sensors detected close together, it's likely one vehicle
+        if len(tpms_ids) == 4:
+            # Check if these 4 sensors form a known vehicle
+            vehicle_id = self.identify_vehicle(tpms_ids)
+            
+            if vehicle_id is None:
+                # New vehicle - create it
+                timestamp = signal_buffer[0]['timestamp']
+                vehicle_id = self.db.upsert_vehicle(tpms_ids, timestamp)
+                print(f"🚗 New vehicle detected: ID={vehicle_id}, sensors={tpms_ids}", flush=True)
+            else:
+                # Known vehicle - update it
+                timestamp = signal_buffer[0]['timestamp']
+                self.db.upsert_vehicle(tpms_ids, timestamp)
+                print(f"🚗 Known vehicle re-detected: ID={vehicle_id}", flush=True)
+            
+            vehicle_ids.append(vehicle_id)
+            self.update_vehicle_profile(vehicle_id, signal_buffer)
+        
+        # Also try clustering if we have enough signals
+        elif len(tpms_ids) >= 2:
+            # Cluster the sensors
+            clusters = self.cluster_sensors(signal_buffer)
+            
+            for cluster_id, sensor_ids in clusters.items():
+                if len(sensor_ids) >= 3:  # At least 3 sensors
+                    vehicle_id = self.identify_vehicle(sensor_ids)
+                    
+                    if vehicle_id is None:
+                        timestamp = signal_buffer[0]['timestamp']
+                        vehicle_id = self.db.upsert_vehicle(sensor_ids, timestamp)
+                        print(f"🚗 Clustered vehicle detected: ID={vehicle_id}, sensors={sensor_ids}", flush=True)
+                    else:
+                        timestamp = signal_buffer[0]['timestamp']
+                        self.db.upsert_vehicle(sensor_ids, timestamp)
+                    
+                    vehicle_ids.append(vehicle_id)
+                    self.update_vehicle_profile(vehicle_id, signal_buffer)
+        
+        return vehicle_ids
+    
+
+
     def add_signal(self, signal: SignalCharacteristics):
         """Add a signal to the history"""
         self.signal_history.append(signal)
@@ -310,7 +384,7 @@ class VehicleClusteringEngine:
             'last_encounter': datetime.fromtimestamp(last_encounter)
         }
 
-
+  
 class AdaptiveLearningEngine:
     """
     Adaptive learning engine for TPMS signal detection

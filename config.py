@@ -31,7 +31,7 @@ class Config:
     ])
     
     # Signal Detection Thresholds
-    SIGNAL_THRESHOLD: float = -70.0  # dBm - lowered for better sensitivity
+    SIGNAL_THRESHOLD: float = -60.0  # dBm - lowered for better sensitivity
     MIN_SNR: float = 6.0  # dB - minimum SNR for valid decode
     
     # Symbol Rates (matching Maurader exactly)
