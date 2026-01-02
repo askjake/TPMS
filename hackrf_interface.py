@@ -1,228 +1,320 @@
 """
-HackRF Interface - Continuous Reception Mode
-No frequency hopping - uses fixed frequency or manual switching
-ESP32 handles LF triggering separately
+HackRF Interface for TPMS Signal Capture
+Optimized for reliable sample capture
 """
-
-import subprocess
 import numpy as np
-import threading
+from typing import Optional, Callable
 import time
+import threading
+from collections import deque
 from config import config
 
-class HackRFInterface:
-    def __init__(self, frequency: float = 314.9e6, sample_rate: int = 2_457_600, gain: int = 20):
-        """
-        Initialize HackRF for continuous reception on a single frequency
-        
-        Args:
-            frequency: Reception frequency in Hz (default 314.9 MHz)
-            sample_rate: Sample rate in Hz (default 2.4576 MS/s)
-            gain: LNA gain in dB (default 20)
-        """
-        self.frequency = frequency
-        self.sample_rate = sample_rate
-        self.gain = gain
-        self.vga_gain = 20
-        self.bandwidth = 1_750_000
-        self.process = None
-        self.running = False
-        self.callback = None
-        self.read_thread = None
-        
-        # Signal tracking
-        self.signal_history = []
-        self.max_history_size = 100
-        
-        # Frequency stats (single frequency)
-        self.current_frequency = frequency
-        self.frequency_stats = {
-            frequency: {
-                'samples': 0,
-                'avg_strength': 0.0,
-                'detections': 0
-            }
-        }
-        
-        print(f"🔧 HackRF configured for continuous reception:")
-        print(f"   Sample Rate: {self.sample_rate:,} Hz")
-        print(f"   Bandwidth: {self.bandwidth:,} Hz")
-        print(f"   Frequency: {self.frequency / 1e6:.1f} MHz (FIXED)")
+try:
+    from hackrf import HackRF, HackRFError
+    HACKRF_AVAILABLE = True
+except ImportError:
+    HACKRF_AVAILABLE = False
+    print("⚠️  PyHackRF not available - using simulation mode")
 
-    def start(self, callback):
-        """
-        Start HackRF continuous reception
+class HackRFInterface:
+    def __init__(self):
+        self.device: Optional[HackRF] = None
+        self.is_streaming = False
+        self.callback: Optional[Callable] = None
+        self.sample_buffer = deque(maxlen=config.NUM_BUFFERS)
+        self.lock = threading.Lock()
+        self.samples_received = 0
+        self.errors = 0
         
-        Args:
-            callback: Function to call with (iq_samples, signal_strength, frequency)
-        """
-        if self.running:
-            print("⚠️  HackRF already running")
+    def open(self) -> bool:
+        """Open HackRF device"""
+        if not HACKRF_AVAILABLE:
+            print("⚠️  HackRF library not available")
             return False
         
-        self.callback = callback
-        
-        cmd = [
-            'hackrf_transfer',
-            '-r', '-',  # Read from stdout
-            '-f', str(int(self.frequency)),
-            '-s', str(self.sample_rate),
-            '-g', str(self.gain),
-            '-l', str(self.vga_gain),
-            '-a', '1',  # Enable RF amp
-            '-b', str(self.bandwidth),
-        ]
-        
-        print(f"🚀 Starting continuous reception on {self.frequency / 1e6:.1f} MHz")
-        print(f"   Command: {' '.join(cmd)}")
-        
         try:
-            self.process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=config.SIGNAL_BUFFER_SIZE
-            )
+            self.device = HackRF()
             
-            self.running = True
+            # Get device info
+            info = self.device.board_id_read()
+            print(f"📻 HackRF detected: {info}")
             
-            self.read_thread = threading.Thread(target=self._read_samples, daemon=True)
-            self.read_thread.start()
+            # Set sample rate
+            self.device.sample_rate = config.SAMPLE_RATE
+            print(f"📊 Sample rate: {config.SAMPLE_RATE / 1e6:.3f} MHz")
             
-            print("✅ HackRF started in continuous mode")
+            # Set baseband filter bandwidth (slightly wider than sample rate)
+            bandwidth = int(config.SAMPLE_RATE * 0.75)
+            self.device.baseband_filter_bandwidth = bandwidth
+            print(f"🔧 Baseband filter: {bandwidth / 1e6:.3f} MHz")
+            
             return True
             
         except Exception as e:
-            print(f"❌ Failed to start HackRF: {e}")
+            print(f"❌ Failed to open HackRF: {e}")
             return False
-
-    def stop(self):
-        """Stop HackRF reception"""
-        if not self.running:
+    
+    def close(self):
+        """Close HackRF device"""
+        self.stop_rx()
+        
+        if self.device:
+            try:
+                self.device.close()
+                print("📻 HackRF closed")
+            except Exception as e:
+                print(f"⚠️  Error closing HackRF: {e}")
+            finally:
+                self.device = None
+    
+    def configure(self, frequency: int, lna_gain: int = None, 
+                  vga_gain: int = None, enable_amp: bool = None):
+        """Configure HackRF parameters"""
+        if not self.device:
+            return False
+        
+        try:
+            # Set frequency
+            self.device.freq = frequency
+            print(f"📡 Frequency: {frequency / 1e6:.3f} MHz")
+            
+            # Set gains
+            if lna_gain is not None:
+                self.device.lna_gain = lna_gain
+                print(f"🔊 LNA Gain: {lna_gain} dB")
+            else:
+                self.device.lna_gain = config.LNA_GAIN
+            
+            if vga_gain is not None:
+                self.device.vga_gain = vga_gain
+                print(f"🔊 VGA Gain: {vga_gain} dB")
+            else:
+                self.device.vga_gain = config.VGA_GAIN
+            
+            # Set RF amp
+            if enable_amp is not None:
+                self.device.enable_amp = enable_amp
+                print(f"📶 RF Amp: {'ON' if enable_amp else 'OFF'}")
+            else:
+                self.device.enable_amp = config.ENABLE_AMP
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Configuration error: {e}")
+            return False
+    
+    def start_rx(self, callback: Callable):
+        """Start receiving samples"""
+        if not self.device:
+            print("❌ Device not opened")
+            return False
+        
+        if self.is_streaming:
+            print("⚠️  Already streaming")
+            return False
+        
+        try:
+            self.callback = callback
+            self.is_streaming = True
+            self.samples_received = 0
+            self.errors = 0
+            
+            # Start streaming with callback
+            self.device.start_rx(self._rx_callback)
+            print("🎯 Started RX streaming")
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Failed to start RX: {e}")
+            self.is_streaming = False
+            return False
+    
+    def stop_rx(self):
+        """Stop receiving samples"""
+        if not self.device or not self.is_streaming:
             return
         
-        print("🛑 Stopping HackRF...")
-        self.running = False
-        
-        if self.process:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-            self.process = None
-        
-        if self.read_thread:
-            self.read_thread.join(timeout=2)
-        
-        print("✅ HackRF stopped")
-
-    def change_frequency(self, new_frequency: float):
-        """
-        Change reception frequency (requires restart)
-        
-        Args:
-            new_frequency: New frequency in Hz
-        """
-        if self.running:
-            print(f"🔄 Changing frequency to {new_frequency / 1e6:.1f} MHz...")
-            callback_backup = self.callback
-            self.stop()
-            time.sleep(0.5)
-            self.frequency = new_frequency
-            self.current_frequency = new_frequency
+        try:
+            self.is_streaming = False
+            self.device.stop_rx()
+            print(f"⏹️  Stopped RX (received {self.samples_received} samples, {self.errors} errors)")
             
-            # Add to stats if not exists
-            if new_frequency not in self.frequency_stats:
-                self.frequency_stats[new_frequency] = {
-                    'samples': 0,
-                    'avg_strength': 0.0,
-                    'detections': 0
-                }
-            
-            self.start(callback_backup)
-        else:
-            self.frequency = new_frequency
-            self.current_frequency = new_frequency
-            print(f"✅ Frequency set to {new_frequency / 1e6:.1f} MHz (will apply on next start)")
-
-    def _read_samples(self):
-        """Read samples continuously"""
-        print("📡 Sample reader thread started")
-        buffer_size = config.SIGNAL_BUFFER_SIZE
+        except Exception as e:
+            print(f"⚠️  Error stopping RX: {e}")
+    
+    def _rx_callback(self, hackrf_transfer):
+        """Internal callback for HackRF data"""
+        if not self.is_streaming:
+            return -1  # Stop streaming
         
-        while self.running and self.process:
-            try:
-                data = self.process.stdout.read(buffer_size)
-                if not data:
-                    break
-                
-                # Convert bytes to IQ samples
-                iq_data = np.frombuffer(data, dtype=np.int8)
-                
-                # Ensure we have pairs of I/Q samples
-                if len(iq_data) % 2 != 0:
-                    iq_data = iq_data[:-1]
-                
-                if len(iq_data) < 2:
-                    continue
-                
-                i_samples = iq_data[0::2].astype(np.float32) / 128.0
-                q_samples = iq_data[1::2].astype(np.float32) / 128.0
-                
-                min_len = min(len(i_samples), len(q_samples))
-                i_samples = i_samples[:min_len]
-                q_samples = q_samples[:min_len]
-                
-                complex_samples = i_samples + 1j * q_samples
-                
-                # Calculate signal metrics
-                power = np.mean(np.abs(complex_samples) ** 2)
-                signal_strength_dbm = 10 * np.log10(power + 1e-10) - 60
-                
-                # Store metrics
-                self.signal_history.append(signal_strength_dbm)
-                if len(self.signal_history) > self.max_history_size:
-                    self.signal_history.pop(0)
-                
-                # Update frequency stats
-                freq_key = self.current_frequency
-                if freq_key in self.frequency_stats:
-                    stats = self.frequency_stats[freq_key]
-                    stats['samples'] += 1
-                    stats['avg_strength'] = (
-                        (stats['avg_strength'] * (stats['samples'] - 1) + signal_strength_dbm) 
-                        / stats['samples']
-                    )
-                
-                # Pass to callback
+        try:
+            # Convert bytes to numpy array
+            # HackRF provides interleaved I/Q as signed 8-bit integers
+            raw_data = np.frombuffer(hackrf_transfer.buffer, dtype=np.int8)
+            
+            # Separate I and Q
+            i_data = raw_data[0::2].astype(np.float32) / 128.0
+            q_data = raw_data[1::2].astype(np.float32) / 128.0
+            
+            # Create complex samples
+            iq_samples = i_data + 1j * q_data
+            
+            self.samples_received += len(iq_samples)
+            
+            # Store in buffer
+            with self.lock:
+                self.sample_buffer.append(iq_samples)
+            
+            # Call user callback if we have enough samples
+            if len(iq_samples) >= config.SAMPLES_PER_SCAN:
                 if self.callback:
-                    self.callback(complex_samples, signal_strength_dbm, self.current_frequency)
-                
-            except Exception as e:
-                if self.running:
-                    print(f"⚠️  Error reading samples: {e}")
-                break
+                    try:
+                        self.callback(iq_samples[:config.SAMPLES_PER_SCAN])
+                    except Exception as e:
+                        print(f"⚠️  Callback error: {e}")
+                        self.errors += 1
+            
+            return 0  # Continue streaming
+            
+        except Exception as e:
+            print(f"❌ RX callback error: {e}")
+            self.errors += 1
+            return -1  # Stop on error
+    
+    def capture_samples(self, num_samples: int = None, timeout: float = 1.0) -> Optional[np.ndarray]:
+        """Capture a specific number of samples (blocking)"""
+        if num_samples is None:
+            num_samples = config.SAMPLES_PER_SCAN
         
-        print("📡 Sample reader thread stopped")
-
-    def increment_detection(self, frequency: float):
-        """Increment detection count for a frequency"""
-        if frequency in self.frequency_stats:
-            self.frequency_stats[frequency]['detections'] += 1
-
-    def get_status(self) -> dict:
-        """Get current receiver status"""
+        if not self.is_streaming:
+            print("⚠️  Not streaming - call start_rx() first")
+            return None
+        
+        # Wait for samples with timeout
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            with self.lock:
+                if len(self.sample_buffer) > 0:
+                    samples = self.sample_buffer.popleft()
+                    if len(samples) >= num_samples:
+                        return samples[:num_samples]
+            time.sleep(0.01)
+        
+        print("⚠️  Capture timeout")
+        return None
+    
+    def get_statistics(self) -> dict:
+        """Get interface statistics"""
         return {
-            'running': self.running,
-            'frequency': self.current_frequency / 1e6,  # MHz
-            'gain': self.gain,
-            'vga_gain': self.vga_gain,
-            'avg_signal_strength': np.mean(self.signal_history[-10:]) if self.signal_history else None,
-            'sample_rate': self.sample_rate,
-            'frequency_hopping': False,  # Always False now
-            'hop_interval': 0,
-            'frequency_stats': {
-                freq / 1e6: stats for freq, stats in self.frequency_stats.items()
-            }
+            'is_streaming': self.is_streaming,
+            'samples_received': self.samples_received,
+            'errors': self.errors,
+            'buffer_size': len(self.sample_buffer),
+            'sample_rate': config.SAMPLE_RATE,
         }
+
+class SimulatedHackRF:
+    """Simulated HackRF for testing without hardware"""
+    
+    def __init__(self):
+        self.is_streaming = False
+        self.callback = None
+        self.frequency = 315_000_000
+        self.thread = None
+        
+    def open(self) -> bool:
+        print("🔧 Using simulated HackRF")
+        return True
+    
+    def close(self):
+        self.stop_rx()
+    
+    def configure(self, frequency: int, **kwargs):
+        self.frequency = frequency
+        print(f"📡 Simulated frequency: {frequency / 1e6:.3f} MHz")
+        return True
+    
+    def start_rx(self, callback: Callable):
+        if self.is_streaming:
+            return False
+        
+        self.callback = callback
+        self.is_streaming = True
+        
+        # Start simulation thread
+        self.thread = threading.Thread(target=self._simulate_samples, daemon=True)
+        self.thread.start()
+        
+        print("🎯 Started simulated RX")
+        return True
+    
+    def stop_rx(self):
+        self.is_streaming = False
+        if self.thread:
+            self.thread.join(timeout=1.0)
+        print("⏹️  Stopped simulated RX")
+    
+    def _simulate_samples(self):
+        """Generate simulated TPMS-like signals"""
+        while self.is_streaming:
+            # Generate noise
+            noise = (np.random.randn(config.SAMPLES_PER_SCAN) + 
+                    1j * np.random.randn(config.SAMPLES_PER_SCAN)) * 0.1
+            
+            # Occasionally add a signal
+            if np.random.random() < 0.1:  # 10% chance
+                # Simulate FSK signal
+                t = np.arange(config.SAMPLES_PER_SCAN) / config.SAMPLE_RATE
+                carrier_freq = 50000  # 50 kHz offset
+                symbol_rate = 19200
+                
+                # Generate random bits
+                num_bits = int(len(t) * symbol_rate / config.SAMPLE_RATE)
+                bits = np.random.randint(0, 2, num_bits)
+                
+                # Upsample bits
+                samples_per_bit = config.SAMPLE_RATE // symbol_rate
+                bit_signal = np.repeat(bits, samples_per_bit)[:len(t)]
+                
+                # FSK modulation
+                freq_deviation = 20000
+                inst_freq = carrier_freq + (bit_signal - 0.5) * 2 * freq_deviation
+                phase = 2 * np.pi * np.cumsum(inst_freq) / config.SAMPLE_RATE
+                signal = 0.5 * np.exp(1j * phase)
+                
+                noise += signal
+            
+            if self.callback:
+                self.callback(noise)
+            
+            time.sleep(config.SCAN_DWELL_TIME)
+    
+    def capture_samples(self, num_samples: int = None, timeout: float = 1.0):
+        if num_samples is None:
+            num_samples = config.SAMPLES_PER_SCAN
+        
+        # Generate and return samples immediately
+        noise = (np.random.randn(num_samples) + 
+                1j * np.random.randn(num_samples)) * 0.1
+        return noise
+    
+    def get_statistics(self):
+        return {
+            'is_streaming': self.is_streaming,
+            'samples_received': 0,
+            'errors': 0,
+            'buffer_size': 0,
+            'sample_rate': config.SAMPLE_RATE,
+        }
+
+# Factory function
+def create_hackrf_interface(use_simulation: bool = False) -> HackRFInterface:
+    """Create HackRF interface (real or simulated)"""
+    if use_simulation or not HACKRF_AVAILABLE:
+        interface = SimulatedHackRF()
+    else:
+        interface = HackRFInterface()
+    
+    return interface
