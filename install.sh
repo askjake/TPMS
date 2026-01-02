@@ -1,12 +1,14 @@
 #!/bin/bash
-# TPMS Tracker - Ubuntu Installation Script
-# ==========================================
 
-set -e  # Exit on error
+# TPMS Tracker - Modern Python Installation Script
+# Supports Python 3.10, 3.11, 3.12
+
+set -e
 
 echo ""
 echo "========================================"
 echo "TPMS Tracker - Installation Script"
+echo "Modern Python (3.10-3.12)"
 echo "========================================"
 echo ""
 
@@ -14,123 +16,200 @@ echo ""
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Check if Python is installed
-echo "[1/7] Checking Python..."
-if ! command -v python3 &> /dev/null; then
-    echo -e "${RED}[ERROR] Python 3 is not installed${NC}"
-    echo "Install with: sudo apt install python3 python3-pip python3-venv"
+# Function to print colored output
+print_status() {
+    echo -e "${GREEN}[✓]${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}[✗]${NC} $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}[!]${NC} $1"
+}
+
+# [1/8] Check Python version
+echo "[1/8] Checking Python..."
+if command -v python3 &> /dev/null; then
+    PYTHON_VERSION=$(python3 --version)
+    PYTHON_MAJOR=$(python3 -c 'import sys; print(sys.version_info.major)')
+    PYTHON_MINOR=$(python3 -c 'import sys; print(sys.version_info.minor)')
+    
+    print_status "Python found: $PYTHON_VERSION"
+    
+    if [ "$PYTHON_MAJOR" -lt 3 ] || [ "$PYTHON_MINOR" -lt 10 ]; then
+        print_error "Python 3.10 or higher required, but found Python $PYTHON_MAJOR.$PYTHON_MINOR"
+        echo ""
+        echo "Please install Python 3.10, 3.11, or 3.12:"
+        echo "  Ubuntu/Debian: sudo apt install python3.11 python3.11-venv python3.11-dev"
+        echo "  Or use pyenv: https://github.com/pyenv/pyenv"
+        exit 1
+    fi
+    
+    if [ "$PYTHON_MINOR" -gt 12 ]; then
+        print_warning "Python 3.$PYTHON_MINOR detected. Some packages may not be compatible yet."
+        print_warning "Python 3.10-3.12 recommended."
+    fi
+else
+    print_error "Python 3 not found!"
     exit 1
 fi
-echo -e "${GREEN}Python found:${NC} $(python3 --version)"
 
-# Check if pip is installed
+# [2/8] Check pip
 echo ""
-echo "[2/7] Checking pip..."
-if ! command -v pip3 &> /dev/null; then
-    echo -e "${YELLOW}[WARNING] pip3 not found, installing...${NC}"
-    sudo apt install -y python3-pip
+echo "[2/8] Checking pip..."
+if python3 -m pip --version &> /dev/null; then
+    PIP_VERSION=$(python3 -m pip --version)
+    print_status "pip found: $PIP_VERSION"
+else
+    print_error "pip not found! Installing..."
+    python3 -m ensurepip --upgrade
 fi
-echo -e "${GREEN}pip found:${NC} $(pip3 --version)"
 
-# Remove old venv if it exists and is broken
+# [3/8] Setup virtual environment
 echo ""
-echo "[3/7] Setting up virtual environment..."
+echo "[3/8] Setting up virtual environment..."
 if [ -d "venv" ]; then
-    if [ ! -f "venv/bin/activate" ]; then
-        echo -e "${YELLOW}Removing broken virtual environment...${NC}"
+    print_warning "Virtual environment already exists"
+    read -p "Remove and recreate? (y/N): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
         rm -rf venv
+        print_status "Removed old virtual environment"
+        python3 -m venv venv
+        print_status "Created new virtual environment"
     else
-        echo "Virtual environment exists and looks good"
+        print_status "Using existing virtual environment"
+    fi
+else
+    python3 -m venv venv
+    print_status "Created virtual environment"
+fi
+
+# [4/8] Activate virtual environment
+echo ""
+echo "[4/8] Activating virtual environment..."
+source venv/bin/activate
+print_status "Virtual environment activated"
+
+# [5/8] Upgrade pip
+echo ""
+echo "[5/8] Upgrading pip and tools..."
+pip install --upgrade pip setuptools wheel
+print_status "pip upgraded"
+
+# [6/8] Install Python dependencies
+echo ""
+echo "[6/8] Installing Python dependencies..."
+pip install -r requirements.txt
+print_status "Python packages installed"
+
+# [7/8] Install HackRF support
+echo ""
+echo "[7/8] Installing HackRF support..."
+
+# Check if libhackrf is installed
+if ldconfig -p | grep -q libhackrf; then
+    print_status "libhackrf found"
+else
+    print_warning "libhackrf not found"
+    echo ""
+    echo "To use HackRF hardware, install libhackrf:"
+    echo "  Ubuntu/Debian: sudo apt install libhackrf-dev libusb-1.0-0-dev"
+    echo "  Fedora/RHEL: sudo dnf install hackrf-devel libusb-devel"
+    echo ""
+    echo "The application will work in simulation mode without it."
+fi
+
+# Install PyHackRF from source (since it's not on PyPI)
+echo ""
+echo "Installing PyHackRF..."
+if [ -d "pyhackrf_temp" ]; then
+    rm -rf pyhackrf_temp
+fi
+
+git clone https://github.com/ckuethe/pyhackrf.git pyhackrf_temp 2>/dev/null || {
+    print_warning "Could not clone PyHackRF repository"
+    print_warning "HackRF support will be limited to simulation mode"
+}
+
+if [ -d "pyhackrf_temp" ]; then
+    cd pyhackrf_temp
+    pip install . || {
+        print_warning "PyHackRF installation failed"
+        print_warning "Continuing without HackRF support"
+    }
+    cd ..
+    rm -rf pyhackrf_temp
+    print_status "PyHackRF installed"
+fi
+
+# [8/8] Setup permissions and directories
+echo ""
+echo "[8/8] Final setup..."
+
+# Create necessary directories
+mkdir -p logs
+mkdir -p data
+mkdir -p models
+print_status "Created directories"
+
+# Setup HackRF permissions (Linux only)
+if [ "$(uname)" == "Linux" ]; then
+    echo ""
+    echo "Setting up HackRF permissions..."
+    
+    # Check if user is in plugdev group
+    if ! groups | grep -q plugdev; then
+        print_warning "User not in plugdev group"
+        echo "Adding user to plugdev group..."
+        sudo usermod -a -G plugdev $USER
+        print_warning "You need to log out and back in for group changes to take effect"
+    else
+        print_status "User already in plugdev group"
+    fi
+    
+    # Create udev rule if it doesn't exist
+    if [ ! -f /etc/udev/rules.d/53-hackrf.rules ]; then
+        echo "Creating udev rule for HackRF..."
+        echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="1d50", ATTR{idProduct}=="6089", MODE="0666", GROUP="plugdev"' | sudo tee /etc/udev/rules.d/53-hackrf.rules > /dev/null
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger
+        print_status "udev rule created"
+    else
+        print_status "udev rule already exists"
     fi
 fi
 
-# Create virtual environment
-if [ ! -d "venv" ]; then
-    echo "Creating new virtual environment..."
-    python3 -m venv venv
-    echo -e "${GREEN}Virtual environment created successfully${NC}"
-fi
-
-# Activate virtual environment
+# Test HackRF connection
 echo ""
-echo "[4/7] Activating virtual environment..."
-source venv/bin/activate
-
-# Upgrade pip
-echo "Upgrading pip..."
-pip install --upgrade pip
-
-# Install Python dependencies
-echo ""
-echo "[5/7] Installing Python dependencies..."
-if [ -f "requirements.txt" ]; then
-    pip install -r requirements.txt
-    echo -e "${GREEN}Dependencies installed successfully${NC}"
-else
-    echo -e "${RED}[ERROR] requirements.txt not found${NC}"
-    exit 1
-fi
-
-# Install HackRF tools
-echo ""
-echo "[6/7] Installing HackRF tools..."
-if ! command -v hackrf_info &> /dev/null; then
-    echo "Installing HackRF tools from apt..."
-    sudo apt update
-    sudo apt install -y hackrf libhackrf-dev libhackrf0
-    echo -e "${GREEN}HackRF tools installed${NC}"
-else
-    echo -e "${GREEN}HackRF tools already installed${NC}"
-fi
-
-# Test HackRF installation
-echo ""
-echo "Testing HackRF installation..."
+echo "Testing HackRF connection..."
 if command -v hackrf_info &> /dev/null; then
-    echo -e "${GREEN}hackrf_info found in PATH${NC}"
-    hackrf_info --version 2>/dev/null || echo "Version info not available"
+    if timeout 2 hackrf_info &> /dev/null; then
+        print_status "HackRF device detected!"
+    else
+        print_warning "HackRF device not detected (will use simulation mode)"
+    fi
 else
-    echo -e "${RED}[ERROR] hackrf_info not found in PATH${NC}"
-    exit 1
+    print_warning "hackrf_info not found (install hackrf package for hardware support)"
 fi
 
-# Create/update udev rules for HackRF
-echo ""
-echo "[7/7] Setting up udev rules for HackRF..."
-UDEV_RULE='ATTR{idVendor}=="1d50", ATTR{idProduct}=="6089", SYMLINK+="hackrf-%k", MODE="0666", GROUP="plugdev"'
-
-if [ ! -f "/etc/udev/rules.d/53-hackrf.rules" ]; then
-    echo "Creating udev rules..."
-    echo "$UDEV_RULE" | sudo tee /etc/udev/rules.d/53-hackrf.rules > /dev/null
-    sudo udevadm control --reload-rules
-    sudo udevadm trigger
-    echo -e "${GREEN}udev rules created${NC}"
-else
-    echo "udev rules already exist"
-fi
-
-# Add user to plugdev group
-echo ""
-echo "Checking group membership..."
-if groups $USER | grep -q '\bplugdev\b'; then
-    echo -e "${GREEN}User already in plugdev group${NC}"
-else
-    echo "Adding user to plugdev group..."
-    sudo usermod -a -G plugdev $USER
-    echo -e "${YELLOW}[IMPORTANT] You must log out and log back in for group changes to take effect${NC}"
-fi
-
+# Summary
 echo ""
 echo "========================================"
 echo -e "${GREEN}Installation Complete!${NC}"
 echo "========================================"
 echo ""
-echo "NEXT STEPS:"
-echo "1. If you just joined the plugdev group, log out and log back in"
-echo "2. Unplug and replug your HackRF One"
-echo "3. Test with: hackrf_info"
-echo "4. Run: ./start.sh"
+echo "Python version: $PYTHON_VERSION"
+echo "Virtual environment: $(pwd)/venv"
 echo ""
+echo "To start the application:"
+echo "  ./start.sh"
+echo ""
+if ! groups | grep -q plugdev; then
+    echo -e "${YELLOW}⚠️  IMPORTANT: Log out and back in for HackRF permissions${NC}"
+    echo ""
+fi
