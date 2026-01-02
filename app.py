@@ -427,6 +427,33 @@ def show_vehicle_database():
                     st.write(prediction['predicted_datetime'].strftime('%Y-%m-%d %H:%M'))
                     st.progress(prediction['confidence'])
                     st.caption(f"Confidence: {prediction['confidence'] * 100:.0f}%")
+                    
+def safe_float_convert(value, default=0.0):
+    """Safely convert various types to float"""
+    if value is None:
+        return default
+    
+    # If it's bytes, try to decode and convert
+    if isinstance(value, bytes):
+        try:
+            # Try to decode as UTF-8 string first
+            value = value.decode('utf-8')
+        except:
+            try:
+                # Try to interpret as raw float bytes
+                import struct
+                if len(value) == 4:
+                    return struct.unpack('f', value)[0]
+                elif len(value) == 8:
+                    return struct.unpack('d', value)[0]
+            except:
+                return default
+    
+    # Try direct conversion
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
 
 
 def render_sensor_database_tab(db):
@@ -530,25 +557,26 @@ def render_sensor_database_tab(db):
 
             with stat_col2:
                 # Convert to float safely
-                avg_rssi = float(stats['avg_rssi']) if stats['avg_rssi'] is not None else 0
-                min_rssi = float(stats['min_rssi']) if stats['min_rssi'] is not None else 0
-                max_rssi = float(stats['max_rssi']) if stats['max_rssi'] is not None else 0
-                
+                avg_rssi = safe_float_convert(stats['avg_rssi'])
+                min_rssi = safe_float_convert(stats['min_rssi'])
+                max_rssi = safe_float_convert(stats['max_rssi'])
+    
                 st.metric("Avg RSSI", f"{avg_rssi:.1f} dBm")
-                st.metric("RSSI Range", f"{min_rssi:.1f} to {max_rssi:.1f}")
-                
-                if stats['avg_pressure']:
-                    avg_pressure = float(stats['avg_pressure'])
+                st.metric("RSSI Range", f"{min_rssi:.1f} to {max_rssi:.1f} dBm")
+    
+                if stats.get('avg_pressure'):
+                    avg_pressure = safe_float_convert(stats['avg_pressure'])
                     st.metric("Avg Pressure", f"{avg_pressure:.1f} PSI")
 
             with stat_col3:
                 st.metric("Last Seen", format_timestamp(stats['last_seen'], "%Y-%m-%d %H:%M"))
                 age_minutes = (time.time() - stats['last_seen']) / 60
                 st.metric("Age", f"{age_minutes:.0f} min ago")
-                
-                if stats['avg_temp']:
-                    avg_temp = float(stats['avg_temp'])
+    
+                if stats.get('avg_temp'):
+                    avg_temp = safe_float_convert(stats['avg_temp'])
                     st.metric("Avg Temperature", f"{avg_temp:.1f} °C")
+
 
             # Signal strength over time
             st.markdown("### Signal Strength History")
