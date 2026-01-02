@@ -15,9 +15,9 @@ HackRF = None
 HackRFError = None
 
 try:
-    from pyhackrf import HackRF, HackRFError
+    from hackrf import HackRF, HackRFError
     HACKRF_AVAILABLE = True
-    print("✅ PyHackRF library loaded")
+    print("✅ HackRF library loaded")
 except ImportError:
     try:
         from hackrf import HackRF, HackRFError
@@ -383,3 +383,4 @@ def create_hackrf_interface(use_simulation: bool = False):
         return SimulatedHackRF()
     else:
         return HackRFInterface()
+
