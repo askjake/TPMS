@@ -8,26 +8,40 @@ import time
 import threading
 import subprocess
 from config import config
+import sys
 
 DEBUG = True
 
 def debug_print(msg):
     if DEBUG:
-        print(f"[{time.time():.3f}] {msg}", flush=True)
+        print(f"[{time.time():.3f}] {msg}", file=sys.stderr, flush=True)
 
 # Check if hackrf_transfer command is available
 HACKRF_AVAILABLE = False
 
+debug_print("🔍 Checking for hackrf_transfer command...")
+
 try:
-    result = subprocess.run(['hackrf_info'], capture_output=True, timeout=2.0)
+    result = subprocess.run(['hackrf_info'], capture_output=True, timeout=2.0, text=True)
+    debug_print(f"   hackrf_info return code: {result.returncode}")
+    if result.stdout:
+        debug_print(f"   stdout: {result.stdout[:100]}")
+    if result.stderr:
+        debug_print(f"   stderr: {result.stderr[:100]}")
+    
     if result.returncode == 0:
         HACKRF_AVAILABLE = True
         debug_print("✅ hackrf_transfer command available")
     else:
-        debug_print("⚠️  hackrf_info failed")
+        debug_print(f"⚠️  hackrf_info failed with code {result.returncode}")
+except FileNotFoundError:
+    debug_print("❌ hackrf_info command not found")
+except subprocess.TimeoutExpired:
+    debug_print("⚠️  hackrf_info timeout")
 except Exception as e:
-    debug_print(f"⚠️  hackrf_info not found: {e}")
+    debug_print(f"⚠️  hackrf_info error: {e}")
 
+debug_print(f"HACKRF_AVAILABLE = {HACKRF_AVAILABLE}")
 class HackRFInterface:
     """HackRF interface using hackrf_transfer command-line tool"""
     
