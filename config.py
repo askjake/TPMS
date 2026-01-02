@@ -61,6 +61,7 @@ class Config:
     # Display Settings
     MAX_DISPLAY_SENSORS: int = 20
     SENSOR_TIMEOUT: float = 300.0  # 5 minutes
+    SIGNAL_HISTORY_SIZE: int = 1000  # Number of signals to keep in history
     
     # Logging
     LOG_ENABLED: bool = True
