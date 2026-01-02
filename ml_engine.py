@@ -163,6 +163,154 @@ class VehicleClusteringEngine:
             }
         }
 
+    def find_patterns(self, days: int = 30) -> Dict:
+        """
+        Find patterns in vehicle encounters
+    
+        Args:
+            days: Number of days to analyze
+        
+        Returns:
+            Dictionary with pattern analysis
+        """
+        from datetime import datetime, timedelta
+    
+        cutoff_time = datetime.now().timestamp() - (days * 86400)
+    
+        # Get vehicles from database
+        if not hasattr(self, 'db') or self.db is None:
+            return {
+                'frequent_vehicles': [],
+                'time_patterns': {},
+                'location_clusters': {}
+            }
+    
+        vehicles = self.db.get_all_vehicles(min_encounters=2)
+    
+        # Filter by time window
+        frequent_vehicles = []
+       for vehicle in vehicles:
+            if vehicle['last_seen'] >= cutoff_time:
+                history = self.db.get_vehicle_history(vehicle['id'])
+            
+                # Count encounters in time window
+                recent_encounters = [
+                    e for e in history['encounters'] 
+                    if e['timestamp'] >= cutoff_time
+                ]
+            
+                if len(recent_encounters) >= 3:
+                    frequent_vehicles.append({
+                        'id': vehicle['id'],
+                        'nickname': vehicle.get('nickname', f"Vehicle {vehicle['id']}"),
+                        'encounter_count': len(recent_encounters),
+                        'first_seen': datetime.fromtimestamp(vehicle['first_seen']),
+                        'last_seen': datetime.fromtimestamp(vehicle['last_seen']),
+                        'tpms_ids': vehicle['tpms_ids']
+                    })
+    
+        # Sort by encounter count
+        frequent_vehicles.sort(key=lambda x: x['encounter_count'], reverse=True)
+    
+        return {
+            'frequent_vehicles': frequent_vehicles,
+            'time_patterns': self._analyze_time_patterns(frequent_vehicles),
+            'location_clusters': {}
+        }
+
+    def _analyze_time_patterns(self, vehicles: List[Dict]) -> Dict:
+        """Analyze temporal patterns in vehicle encounters"""
+        patterns = {
+            'peak_hours': [],
+            'peak_days': [],
+            'regular_commuters': []
+        }
+    
+        if not vehicles:
+            return patterns
+    
+        # Analyze hour-of-day patterns
+        hour_counts = {}
+        for vehicle in vehicles:
+            if hasattr(self, 'db') and self.db:
+                history = self.db.get_vehicle_history(vehicle['id'])
+                for encounter in history['encounters']:
+                    from datetime import datetime
+                    dt = datetime.fromtimestamp(encounter['timestamp'])
+                    hour = dt.hour
+                    hour_counts[hour] = hour_counts.get(hour, 0) + 1
+    
+        if hour_counts:
+            # Find peak hours
+            sorted_hours = sorted(hour_counts.items(), key=lambda x: x[1], reverse=True)
+            patterns['peak_hours'] = [
+                {'hour': h, 'count': c} for h, c in sorted_hours[:3]
+            ]
+    
+        return patterns
+
+    def predict_next_encounter(self, vehicle_id: int) -> Dict:
+        """
+        Predict next encounter time for a vehicle
+    
+        Args:
+            vehicle_id: Vehicle ID
+        
+        Returns:
+            Dictionary with prediction details
+        """
+        from datetime import datetime, timedelta
+    
+        if not hasattr(self, 'db') or self.db is None:
+            return {
+                'prediction': 'insufficient_data',
+                'confidence': 0.0
+            }
+    
+        history = self.db.get_vehicle_history(vehicle_id)
+        encounters = history['encounters']
+    
+        if len(encounters) < 3:
+            return {
+                'prediction': 'insufficient_data',
+                'confidence': 0.0
+            }
+        
+        # Calculate average time between encounters
+        timestamps = sorted([e['timestamp'] for e in encounters])
+        intervals = [timestamps[i+1] - timestamps[i] for i in range(len(timestamps)-1)]
+    
+        if not intervals:
+            return {
+                'prediction': 'insufficient_data',
+                'confidence': 0.0
+            }
+    
+        avg_interval = sum(intervals) / len(intervals)
+        std_interval = (sum((x - avg_interval)**2 for x in intervals) / len(intervals)) ** 0.5
+    
+        # Predict next encounter
+        last_encounter = timestamps[-1]
+        predicted_time = last_encounter + avg_interval
+        predicted_datetime = datetime.fromtimestamp(predicted_time)
+    
+        # Calculate confidence based on consistency
+        if std_interval > 0:
+            coefficient_of_variation = std_interval / avg_interval
+            confidence = max(0.0, min(1.0, 1.0 - coefficient_of_variation))
+        else:
+            confidence = 0.9
+    
+        return {
+            'prediction': 'estimated',
+            'predicted_datetime': predicted_datetime,
+            'predicted_timestamp': predicted_time,
+            'confidence': confidence,
+            'avg_interval_hours': avg_interval / 3600,
+            'last_encounter': datetime.fromtimestamp(last_encounter)
+        }
+
+
 class AdaptiveLearningEngine:
     """
     Adaptive learning engine for TPMS signal detection
@@ -282,3 +430,4 @@ def create_learning_engine() -> AdaptiveLearningEngine:
 def create_clustering_engine() -> VehicleClusteringEngine:
     """Factory function to create clustering engine"""
     return VehicleClusteringEngine(min_samples=3, eps=0.5)
+
