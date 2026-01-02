@@ -1,6 +1,6 @@
 """
 HackRF Interface for TPMS Signal Capture
-Optimized for reliable sample capture
+Modern Python (3.10+) compatible
 """
 import numpy as np
 from typing import Optional, Callable
@@ -9,12 +9,26 @@ import threading
 from collections import deque
 from config import config
 
+# Try to import HackRF library
+HACKRF_AVAILABLE = False
+HackRF = None
+HackRFError = None
+
 try:
-    from hackrf import HackRF, HackRFError
+    # Try pyhackrf first
+    from pyhackrf import HackRF, HackRFError
     HACKRF_AVAILABLE = True
+    print("✅ PyHackRF library loaded")
 except ImportError:
-    HACKRF_AVAILABLE = False
-    print("⚠️  PyHackRF not available - using simulation mode")
+    try:
+        # Fallback to hackrf
+        from hackrf import HackRF, HackRFError
+        HACKRF_AVAILABLE = True
+        print("✅ HackRF library loaded")
+    except ImportError:
+        print("⚠️  HackRF library not available - using simulation mode")
+        print("   Install with: pip install pyhackrf")
+        print("   Or install from: https://github.com/ckuethe/pyhackrf")
 
 class HackRFInterface:
     def __init__(self):
@@ -29,21 +43,24 @@ class HackRFInterface:
     def open(self) -> bool:
         """Open HackRF device"""
         if not HACKRF_AVAILABLE:
-            print("⚠️  HackRF library not available")
+            print("⚠️  HackRF library not available - using simulation mode")
             return False
         
         try:
             self.device = HackRF()
             
             # Get device info
-            info = self.device.board_id_read()
-            print(f"📻 HackRF detected: {info}")
+            try:
+                info = self.device.board_id_read()
+                print(f"📻 HackRF detected: {info}")
+            except:
+                print(f"📻 HackRF detected")
             
             # Set sample rate
             self.device.sample_rate = config.SAMPLE_RATE
             print(f"📊 Sample rate: {config.SAMPLE_RATE / 1e6:.3f} MHz")
             
-            # Set baseband filter bandwidth (slightly wider than sample rate)
+            # Set baseband filter bandwidth
             bandwidth = int(config.SAMPLE_RATE * 0.75)
             self.device.baseband_filter_bandwidth = bandwidth
             print(f"🔧 Baseband filter: {bandwidth / 1e6:.3f} MHz")
@@ -120,7 +137,7 @@ class HackRFInterface:
             self.samples_received = 0
             self.errors = 0
             
-            # Start streaming with callback
+            # Start streaming
             self.device.start_rx(self._rx_callback)
             print("🎯 Started RX streaming")
             
@@ -147,11 +164,10 @@ class HackRFInterface:
     def _rx_callback(self, hackrf_transfer):
         """Internal callback for HackRF data"""
         if not self.is_streaming:
-            return -1  # Stop streaming
+            return -1
         
         try:
             # Convert bytes to numpy array
-            # HackRF provides interleaved I/Q as signed 8-bit integers
             raw_data = np.frombuffer(hackrf_transfer.buffer, dtype=np.int8)
             
             # Separate I and Q
@@ -167,7 +183,7 @@ class HackRFInterface:
             with self.lock:
                 self.sample_buffer.append(iq_samples)
             
-            # Call user callback if we have enough samples
+            # Call user callback
             if len(iq_samples) >= config.SAMPLES_PER_SCAN:
                 if self.callback:
                     try:
@@ -176,23 +192,22 @@ class HackRFInterface:
                         print(f"⚠️  Callback error: {e}")
                         self.errors += 1
             
-            return 0  # Continue streaming
+            return 0
             
         except Exception as e:
             print(f"❌ RX callback error: {e}")
             self.errors += 1
-            return -1  # Stop on error
+            return -1
     
     def capture_samples(self, num_samples: int = None, timeout: float = 1.0) -> Optional[np.ndarray]:
-        """Capture a specific number of samples (blocking)"""
+        """Capture samples (blocking)"""
         if num_samples is None:
             num_samples = config.SAMPLES_PER_SCAN
         
         if not self.is_streaming:
-            print("⚠️  Not streaming - call start_rx() first")
+            print("⚠️  Not streaming")
             return None
         
-        # Wait for samples with timeout
         start_time = time.time()
         while time.time() - start_time < timeout:
             with self.lock:
@@ -202,7 +217,6 @@ class HackRFInterface:
                         return samples[:num_samples]
             time.sleep(0.01)
         
-        print("⚠️  Capture timeout")
         return None
     
     def get_statistics(self) -> dict:
@@ -216,7 +230,7 @@ class HackRFInterface:
         }
 
 class SimulatedHackRF:
-    """Simulated HackRF for testing without hardware"""
+    """Simulated HackRF for testing"""
     
     def __init__(self):
         self.is_streaming = False
@@ -225,7 +239,7 @@ class SimulatedHackRF:
         self.thread = None
         
     def open(self) -> bool:
-        print("🔧 Using simulated HackRF")
+        print("🔧 Using simulated HackRF (no hardware detected)")
         return True
     
     def close(self):
@@ -243,7 +257,6 @@ class SimulatedHackRF:
         self.callback = callback
         self.is_streaming = True
         
-        # Start simulation thread
         self.thread = threading.Thread(target=self._simulate_samples, daemon=True)
         self.thread.start()
         
@@ -257,28 +270,23 @@ class SimulatedHackRF:
         print("⏹️  Stopped simulated RX")
     
     def _simulate_samples(self):
-        """Generate simulated TPMS-like signals"""
+        """Generate simulated signals"""
         while self.is_streaming:
-            # Generate noise
             noise = (np.random.randn(config.SAMPLES_PER_SCAN) + 
                     1j * np.random.randn(config.SAMPLES_PER_SCAN)) * 0.1
             
             # Occasionally add a signal
-            if np.random.random() < 0.1:  # 10% chance
-                # Simulate FSK signal
+            if np.random.random() < 0.1:
                 t = np.arange(config.SAMPLES_PER_SCAN) / config.SAMPLE_RATE
-                carrier_freq = 50000  # 50 kHz offset
+                carrier_freq = 50000
                 symbol_rate = 19200
                 
-                # Generate random bits
                 num_bits = int(len(t) * symbol_rate / config.SAMPLE_RATE)
                 bits = np.random.randint(0, 2, num_bits)
                 
-                # Upsample bits
                 samples_per_bit = config.SAMPLE_RATE // symbol_rate
                 bit_signal = np.repeat(bits, samples_per_bit)[:len(t)]
                 
-                # FSK modulation
                 freq_deviation = 20000
                 inst_freq = carrier_freq + (bit_signal - 0.5) * 2 * freq_deviation
                 phase = 2 * np.pi * np.cumsum(inst_freq) / config.SAMPLE_RATE
@@ -295,7 +303,6 @@ class SimulatedHackRF:
         if num_samples is None:
             num_samples = config.SAMPLES_PER_SCAN
         
-        # Generate and return samples immediately
         noise = (np.random.randn(num_samples) + 
                 1j * np.random.randn(num_samples)) * 0.1
         return noise
@@ -309,12 +316,9 @@ class SimulatedHackRF:
             'sample_rate': config.SAMPLE_RATE,
         }
 
-# Factory function
 def create_hackrf_interface(use_simulation: bool = False) -> HackRFInterface:
-    """Create HackRF interface (real or simulated)"""
+    """Create HackRF interface"""
     if use_simulation or not HACKRF_AVAILABLE:
-        interface = SimulatedHackRF()
+        return SimulatedHackRF()
     else:
-        interface = HackRFInterface()
-    
-    return interface
+        return HackRFInterface()
