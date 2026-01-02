@@ -175,7 +175,7 @@ def show_signal_histogram():
         height=300
     )
     
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
     
     # Statistics
     col1, col2, col3, col4 = st.columns(4)
@@ -291,7 +291,7 @@ def show_live_detection():
             st.dataframe(
                 signal_df[['tpms_id', 'timestamp', 'signal_strength', 'frequency']],
                 hide_index=True,
-                use_container_width=True
+                width="stretch"
             )
         else:
             st.info("Waiting for signals...")
@@ -352,7 +352,7 @@ def show_protocol_monitoring():
             for s in unknown_signals[-10:]
         ])
         
-        st.dataframe(unknown_df, use_container_width=True, hide_index=True)
+        st.dataframe(unknown_df, width="stretch", hide_index=True)
 
 def show_vehicle_database():
     """Vehicle database tab"""
@@ -490,7 +490,7 @@ def render_sensor_database_tab(db):
 
         st.dataframe(
             display_df,
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
 
@@ -564,7 +564,7 @@ def render_sensor_database_tab(db):
                     title=f"RSSI Over Time - {selected_sensor}",
                     labels={'timestamp': 'Time', 'signal_strength': 'RSSI (dBm)'}
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
             # Pressure/Temperature over time (if available)
             if 'pressure_psi' in history_df.columns and history_df['pressure_psi'].notna().any():
@@ -580,13 +580,13 @@ def render_sensor_database_tab(db):
                     title=f"Tire Pressure Over Time - {selected_sensor}",
                     labels={'timestamp': 'Time', 'pressure_psi': 'Pressure (PSI)'}
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
             # Raw signal history table
             with st.expander("📊 View Raw Signal History"):
                 display_history = history_df.copy()
                 display_history['timestamp'] = pandas_timestamp_to_mountain(display_history['timestamp'])
-                st.dataframe(display_history, use_container_width=True)
+                st.dataframe(display_history, width="stretch")
 
     with sensor_tab3:
         st.subheader("Unassigned Sensors")
@@ -600,7 +600,7 @@ def render_sensor_database_tab(db):
             # Display orphaned sensors
             display_orphaned = orphaned_df.copy()
             display_orphaned['last_seen'] = pandas_timestamp_to_mountain(display_orphaned['last_seen'])
-            st.dataframe(display_orphaned, use_container_width=True)
+            st.dataframe(display_orphaned, width="stretch")
 
             # Manual assignment interface
             st.markdown("### Assign Sensor to Vehicle")
@@ -703,7 +703,7 @@ def show_frequency_status():
             for freq, stats in freq_stats.items()
         ])
         
-        st.dataframe(freq_df, use_container_width=True, hide_index=True)
+        st.dataframe(freq_df, width="stretch", hide_index=True)
         
         # Bar chart of detections per frequency
         if any(stats['detections'] > 0 for stats in freq_stats.values()):
@@ -720,7 +720,7 @@ def show_frequency_status():
                 yaxis_title='Detections',
                 height=300
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
 
 def show_analytics():
@@ -763,7 +763,7 @@ def show_analytics():
                 title='Daily Vehicle Encounters',
                 labels={'date': 'Date', 'encounters': 'Number of Vehicles'}
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
             df['hour'] = df['timestamp'].dt.hour
             df['day_of_week'] = df['timestamp'].dt.day_name()
@@ -788,7 +788,7 @@ def show_analytics():
                 xaxis_title='Hour of Day',
                 yaxis_title='Day of Week'
             )
-            st.plotly_chart(fig_heatmap, use_container_width=True)
+            st.plotly_chart(fig_heatmap, width="stretch")
 
     with col2:
         st.subheader("Top Vehicles")
@@ -813,7 +813,7 @@ def show_analytics():
             color='Encounters',
             color_continuous_scale='Blues'
         )
-        st.plotly_chart(fig_bar, use_container_width=True)
+        st.plotly_chart(fig_bar, width="stretch")
 
         st.subheader("Recent Activity")
         recent_vehicles = sorted(vehicles, key=lambda x: x['last_seen'], reverse=True)[:5]
