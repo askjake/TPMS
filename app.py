@@ -129,6 +129,16 @@ if 'esp32_trigger' not in st.session_state:
 def signal_callback(iq_samples, signal_strength, frequency):
     """Callback for processing HackRF samples - queue-based"""
     try:
+        # Debug first few callbacks
+        if not hasattr(signal_callback, 'count'):
+            signal_callback.count = 0
+        signal_callback.count += 1
+        
+        if signal_callback.count <= 3 or signal_callback.count % 10 == 0:
+            print(f"[{time.time():.3f}] signal_callback #{signal_callback.count}: "
+                  f"samples={len(iq_samples)}, strength={signal_strength:.1f} dBm, "
+                  f"freq={frequency/1e6:.1f} MHz", flush=True)
+        
         # Put data in queue instead of processing directly
         signal_queue.put({
             'iq_samples': iq_samples,
@@ -136,8 +146,16 @@ def signal_callback(iq_samples, signal_strength, frequency):
             'frequency': frequency,
             'timestamp': time.time()
         }, block=False)
+        
+        if signal_callback.count <= 3:
+            print(f"  Queued successfully (queue size: {signal_queue.qsize()})", flush=True)
+            
     except queue.Full:
-        pass  # Drop samples if queue is full
+        if signal_callback.count <= 3:
+            print(f"  ⚠️  Queue full, dropping sample", flush=True)
+    except Exception as e:
+        print(f"  ❌ Callback error: {e}", flush=True)
+
 
 def show_signal_histogram():
     """Display real-time signal strength histogram"""
