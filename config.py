@@ -2,7 +2,7 @@
 Configuration settings for TPMS Scanner
 Optimized for Maurader TPMSRX compatibility
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List
 
 @dataclass
@@ -16,12 +16,12 @@ class Config:
     VGA_GAIN: int = 30  # 0-62 dB (start moderate)
     ENABLE_AMP: bool = True  # RF amp on
     
-    # TPMS Frequency Bands
-    TPMS_FREQUENCIES: List[int] = [
+    # TPMS Frequency Bands - using default_factory for mutable default
+    TPMS_FREQUENCIES: List[int] = field(default_factory=lambda: [
         314_900_000,  # 314.9 MHz (US)
         315_000_000,  # 315.0 MHz (US)
         433_920_000,  # 433.92 MHz (EU)
-    ]
+    ])
     
     # Signal Detection Thresholds
     SIGNAL_THRESHOLD: float = -70.0  # dBm - lowered for better sensitivity
