@@ -445,7 +445,7 @@ def render_sensor_database_tab(db):
     with col1:
         st.metric("Total Sensors", len(sensors_df))
     with col2:
-        st.metric("Total Signals", sensors_df['signal_count'].sum())
+        st.metric("Total Signals", int(sensors_df['signal_count'].sum()))
     with col3:
         active_sensors = len(sensors_df[sensors_df['last_seen'] > time.time() - 3600])
         st.metric("Active (1hr)", active_sensors)
@@ -467,10 +467,13 @@ def render_sensor_database_tab(db):
         display_df = sensors_df.copy()
         display_df['first_seen'] = pandas_timestamp_to_mountain(display_df['first_seen'])
         display_df['last_seen'] = pandas_timestamp_to_mountain(display_df['last_seen'])
-        display_df['avg_rssi'] = display_df['avg_rssi'].round(1)
-        display_df['avg_pressure'] = display_df['avg_pressure'].round(1)
-        display_df['avg_temperature'] = display_df['avg_temperature'].round(1)
-        display_df['frequency'] = (display_df['frequency'] / 1e6).round(2)
+        
+        # Convert to float and round
+        display_df['avg_rssi'] = pd.to_numeric(display_df['avg_rssi'], errors='coerce').round(1)
+        display_df['avg_pressure'] = pd.to_numeric(display_df['avg_pressure'], errors='coerce').round(1)
+        display_df['avg_temperature'] = pd.to_numeric(display_df['avg_temperature'], errors='coerce').round(1)
+        display_df['frequency'] = pd.to_numeric(display_df['frequency'], errors='coerce') / 1e6
+        display_df['frequency'] = display_df['frequency'].round(2)
 
         # Rename columns for display
         display_df = display_df.rename(columns={
@@ -526,23 +529,33 @@ def render_sensor_database_tab(db):
                 st.metric("First Seen", format_timestamp(stats['first_seen'], "%Y-%m-%d %H:%M"))
 
             with stat_col2:
-                st.metric("Avg RSSI", f"{stats['avg_rssi']:.1f} dBm")
-                st.metric("RSSI Range", f"{stats['min_rssi']:.1f} to {stats['max_rssi']:.1f}")
+                # Convert to float safely
+                avg_rssi = float(stats['avg_rssi']) if stats['avg_rssi'] is not None else 0
+                min_rssi = float(stats['min_rssi']) if stats['min_rssi'] is not None else 0
+                max_rssi = float(stats['max_rssi']) if stats['max_rssi'] is not None else 0
+                
+                st.metric("Avg RSSI", f"{avg_rssi:.1f} dBm")
+                st.metric("RSSI Range", f"{min_rssi:.1f} to {max_rssi:.1f}")
+                
                 if stats['avg_pressure']:
-                    st.metric("Avg Pressure", f"{stats['avg_pressure']:.1f} PSI")
+                    avg_pressure = float(stats['avg_pressure'])
+                    st.metric("Avg Pressure", f"{avg_pressure:.1f} PSI")
 
             with stat_col3:
                 st.metric("Last Seen", format_timestamp(stats['last_seen'], "%Y-%m-%d %H:%M"))
                 age_minutes = (time.time() - stats['last_seen']) / 60
-                st.metric("Last Seen", f"{age_minutes:.0f} min ago")
+                st.metric("Age", f"{age_minutes:.0f} min ago")
+                
                 if stats['avg_temp']:
-                    st.metric("Avg Temperature", f"{stats['avg_temp']:.1f} °C")
+                    avg_temp = float(stats['avg_temp'])
+                    st.metric("Avg Temperature", f"{avg_temp:.1f} °C")
 
             # Signal strength over time
             st.markdown("### Signal Strength History")
             if not history_df.empty:
                 chart_df = history_df[['timestamp', 'signal_strength']].copy()
                 chart_df['timestamp'] = pandas_timestamp_to_mountain(chart_df['timestamp'])
+                chart_df['signal_strength'] = pd.to_numeric(chart_df['signal_strength'], errors='coerce')
 
                 fig = px.line(
                     chart_df,
@@ -558,6 +571,7 @@ def render_sensor_database_tab(db):
                 st.markdown("### Pressure History")
                 pressure_df = history_df[history_df['pressure_psi'].notna()][['timestamp', 'pressure_psi']].copy()
                 pressure_df['timestamp'] = pandas_timestamp_to_mountain(pressure_df['timestamp'])
+                pressure_df['pressure_psi'] = pd.to_numeric(pressure_df['pressure_psi'], errors='coerce')
 
                 fig = px.line(
                     pressure_df,
@@ -590,9 +604,9 @@ def render_sensor_database_tab(db):
 
             # Manual assignment interface
             st.markdown("### Assign Sensor to Vehicle")
-            vehicles_list = db.get_all_vehicles()  # FIXED: This returns a list, not DataFrame
+            vehicles_list = db.get_all_vehicles()
 
-            if vehicles_list:  # FIXED: Check if list is not empty
+            if vehicles_list:
                 # Convert to DataFrame for easier handling
                 vehicles_df = pd.DataFrame(vehicles_list)
 
