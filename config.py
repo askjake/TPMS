@@ -8,6 +8,12 @@ from pathlib import Path
 
 @dataclass
 class Config:
+    # Add to Config class
+    HISTOGRAM_BINS: int = 50  # Number of bins for signal histogram
+    DEFAULT_FREQUENCY: int = 315_000_000  # Default frequency
+    BANDWIDTH: int = 1_750_000  # 1.75 MHz bandwidth
+    DEFAULT_GAIN: int = 32  # Default LNA gain
+
     # HackRF Settings - matching Maurader baseband
     SAMPLE_RATE: int = 2_457_600  # 2.4576 MHz - exact Maurader rate
     CENTER_FREQ: int = 315_000_000  # 315 MHz default
@@ -162,3 +168,4 @@ def ensure_directories():
 
 # Call on import
 ensure_directories()
+
