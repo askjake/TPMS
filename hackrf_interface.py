@@ -15,20 +15,16 @@ HackRF = None
 HackRFError = None
 
 try:
-    # Try pyhackrf first
     from pyhackrf import HackRF, HackRFError
     HACKRF_AVAILABLE = True
     print("✅ PyHackRF library loaded")
 except ImportError:
     try:
-        # Fallback to hackrf
         from hackrf import HackRF, HackRFError
         HACKRF_AVAILABLE = True
         print("✅ HackRF library loaded")
     except ImportError:
         print("⚠️  HackRF library not available - using simulation mode")
-        print("   Install with: pip install pyhackrf")
-        print("   Or install from: https://github.com/ckuethe/pyhackrf")
 
 class HackRFInterface:
     def __init__(self):
@@ -43,24 +39,20 @@ class HackRFInterface:
     def open(self) -> bool:
         """Open HackRF device"""
         if not HACKRF_AVAILABLE:
-            print("⚠️  HackRF library not available - using simulation mode")
             return False
         
         try:
             self.device = HackRF()
             
-            # Get device info
             try:
                 info = self.device.board_id_read()
                 print(f"📻 HackRF detected: {info}")
             except:
                 print(f"📻 HackRF detected")
             
-            # Set sample rate
             self.device.sample_rate = config.SAMPLE_RATE
             print(f"📊 Sample rate: {config.SAMPLE_RATE / 1e6:.3f} MHz")
             
-            # Set baseband filter bandwidth
             bandwidth = int(config.SAMPLE_RATE * 0.75)
             self.device.baseband_filter_bandwidth = bandwidth
             print(f"🔧 Baseband filter: {bandwidth / 1e6:.3f} MHz")
@@ -91,27 +83,21 @@ class HackRFInterface:
             return False
         
         try:
-            # Set frequency
             self.device.freq = frequency
             print(f"📡 Frequency: {frequency / 1e6:.3f} MHz")
             
-            # Set gains
             if lna_gain is not None:
                 self.device.lna_gain = lna_gain
-                print(f"🔊 LNA Gain: {lna_gain} dB")
             else:
                 self.device.lna_gain = config.LNA_GAIN
             
             if vga_gain is not None:
                 self.device.vga_gain = vga_gain
-                print(f"🔊 VGA Gain: {vga_gain} dB")
             else:
                 self.device.vga_gain = config.VGA_GAIN
             
-            # Set RF amp
             if enable_amp is not None:
                 self.device.enable_amp = enable_amp
-                print(f"📶 RF Amp: {'ON' if enable_amp else 'OFF'}")
             else:
                 self.device.enable_amp = config.ENABLE_AMP
             
@@ -128,7 +114,6 @@ class HackRFInterface:
             return False
         
         if self.is_streaming:
-            print("⚠️  Already streaming")
             return False
         
         try:
@@ -137,7 +122,6 @@ class HackRFInterface:
             self.samples_received = 0
             self.errors = 0
             
-            # Start streaming
             self.device.start_rx(self._rx_callback)
             print("🎯 Started RX streaming")
             
@@ -156,10 +140,59 @@ class HackRFInterface:
         try:
             self.is_streaming = False
             self.device.stop_rx()
-            print(f"⏹️  Stopped RX (received {self.samples_received} samples, {self.errors} errors)")
+            print(f"⏹️  Stopped RX")
             
         except Exception as e:
             print(f"⚠️  Error stopping RX: {e}")
+    
+    def start(self, callback: Callable):
+        """Start scanning (wrapper)"""
+        return self.start_rx(callback)
+    
+    def stop(self):
+        """Stop scanning (wrapper)"""
+        return self.stop_rx()
+    
+    def get_status(self) -> dict:
+        """Get current status"""
+        freq = config.DEFAULT_FREQUENCY
+        if self.device:
+            try:
+                freq = self.device.freq
+            except:
+                pass
+        
+        return {
+            'is_streaming': self.is_streaming,
+            'frequency': freq / 1e6,
+            'frequency_hopping': False,
+            'hop_interval': 30.0,
+            'frequency_stats': {}
+        }
+    
+    def change_frequency(self, frequency: int):
+        """Change frequency"""
+        if self.device:
+            try:
+                self.device.freq = frequency
+                print(f"📡 Changed to {frequency / 1e6:.3f} MHz")
+                return True
+            except Exception as e:
+                print(f"❌ Failed to change frequency: {e}")
+                return False
+        return False
+    
+    def set_frequency_hopping(self, enabled: bool):
+        """Enable/disable frequency hopping"""
+        return False
+    
+    def set_hop_interval(self, interval: float):
+        """Set hop interval"""
+        return False
+    
+    def increment_detection(self, frequency: float):
+        """Increment detection count"""
+        pass
     
     def _rx_callback(self, hackrf_transfer):
         """Internal callback for HackRF data"""
@@ -167,23 +200,18 @@ class HackRFInterface:
             return -1
         
         try:
-            # Convert bytes to numpy array
             raw_data = np.frombuffer(hackrf_transfer.buffer, dtype=np.int8)
             
-            # Separate I and Q
             i_data = raw_data[0::2].astype(np.float32) / 128.0
             q_data = raw_data[1::2].astype(np.float32) / 128.0
             
-            # Create complex samples
             iq_samples = i_data + 1j * q_data
             
             self.samples_received += len(iq_samples)
             
-            # Store in buffer
             with self.lock:
                 self.sample_buffer.append(iq_samples)
             
-            # Call user callback
             if len(iq_samples) >= config.SAMPLES_PER_SCAN:
                 if self.callback:
                     try:
@@ -205,7 +233,6 @@ class HackRFInterface:
             num_samples = config.SAMPLES_PER_SCAN
         
         if not self.is_streaming:
-            print("⚠️  Not streaming")
             return None
         
         start_time = time.time()
@@ -239,7 +266,7 @@ class SimulatedHackRF:
         self.thread = None
         
     def open(self) -> bool:
-        print("🔧 Using simulated HackRF (no hardware detected)")
+        print("🔧 Using simulated HackRF")
         return True
     
     def close(self):
@@ -247,7 +274,6 @@ class SimulatedHackRF:
     
     def configure(self, frequency: int, **kwargs):
         self.frequency = frequency
-        print(f"📡 Simulated frequency: {frequency / 1e6:.3f} MHz")
         return True
     
     def start_rx(self, callback: Callable):
@@ -269,13 +295,48 @@ class SimulatedHackRF:
             self.thread.join(timeout=1.0)
         print("⏹️  Stopped simulated RX")
     
+    def start(self, callback: Callable):
+        """Start scanning (wrapper)"""
+        return self.start_rx(callback)
+    
+    def stop(self):
+        """Stop scanning (wrapper)"""
+        return self.stop_rx()
+    
+    def get_status(self) -> dict:
+        """Get current status"""
+        return {
+            'is_streaming': self.is_streaming,
+            'frequency': self.frequency / 1e6,
+            'frequency_hopping': False,
+            'hop_interval': 30.0,
+            'frequency_stats': {}
+        }
+    
+    def change_frequency(self, frequency: int):
+        """Change frequency"""
+        self.frequency = frequency
+        print(f"📡 Simulated: {frequency / 1e6:.3f} MHz")
+        return True
+    
+    def set_frequency_hopping(self, enabled: bool):
+        """Enable/disable frequency hopping"""
+        return False
+    
+    def set_hop_interval(self, interval: float):
+        """Set hop interval"""
+        return False
+    
+    def increment_detection(self, frequency: float):
+        """Increment detection count"""
+        pass
+    
     def _simulate_samples(self):
         """Generate simulated signals"""
         while self.is_streaming:
             noise = (np.random.randn(config.SAMPLES_PER_SCAN) + 
                     1j * np.random.randn(config.SAMPLES_PER_SCAN)) * 0.1
             
-            # Occasionally add a signal
             if np.random.random() < 0.1:
                 t = np.arange(config.SAMPLES_PER_SCAN) / config.SAMPLE_RATE
                 carrier_freq = 50000
@@ -316,7 +377,7 @@ class SimulatedHackRF:
             'sample_rate': config.SAMPLE_RATE,
         }
 
-def create_hackrf_interface(use_simulation: bool = False) -> HackRFInterface:
+def create_hackrf_interface(use_simulation: bool = False):
     """Create HackRF interface"""
     if use_simulation or not HACKRF_AVAILABLE:
         return SimulatedHackRF()
