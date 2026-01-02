@@ -4,6 +4,7 @@ Optimized for Maurader TPMSRX compatibility
 """
 from dataclasses import dataclass, field
 from typing import List
+from pathlib import Path
 
 @dataclass
 class Config:
@@ -63,14 +64,51 @@ class Config:
     SENSOR_TIMEOUT: float = 300.0  # 5 minutes
     SIGNAL_HISTORY_SIZE: int = 1000  # Number of signals to keep in history
     
+    # Database Settings
+    DB_PATH: str = "tpms_tracker.db"  # SQLite database path
+    DB_BACKUP_ENABLED: bool = True
+    DB_BACKUP_INTERVAL: int = 3600  # seconds (1 hour)
+    
     # Logging
     LOG_ENABLED: bool = True
     LOG_UNKNOWN_SIGNALS: bool = True
     LOG_RAW_SAMPLES: bool = False  # Warning: creates large files
+    LOG_DIR: str = "logs"
+    LOG_FILE: str = "tpms_scanner.log"
+    LOG_MAX_SIZE: int = 10_485_760  # 10 MB
+    LOG_BACKUP_COUNT: int = 5
     
     # Performance
     USE_MULTIPROCESSING: bool = True
     MAX_WORKERS: int = 2  # CPU cores for processing
+    
+    # UI Settings
+    REFRESH_RATE: float = 1.0  # seconds
+    PLOT_HISTORY_SECONDS: int = 60  # seconds of history to plot
+    ENABLE_ANIMATIONS: bool = True
+    
+    # Advanced Settings
+    DEBUG_MODE: bool = False
+    SIMULATION_MODE: bool = False  # Force simulation mode
+    SAVE_RAW_IQ: bool = False  # Save raw IQ samples
+    IQ_SAVE_DIR: str = "iq_samples"
+    
+    # ESP32 Trigger Settings (if using ESP32 trigger)
+    ESP32_ENABLED: bool = False
+    ESP32_PORT: str = "/dev/ttyUSB0"
+    ESP32_BAUD: int = 115200
+    ESP32_TRIGGER_DURATION: float = 0.5  # seconds
+    
+    # Alert Settings
+    ENABLE_ALERTS: bool = False
+    ALERT_ON_NEW_SENSOR: bool = True
+    ALERT_SOUND: bool = False
+    
+    # Export Settings
+    EXPORT_FORMAT: str = "csv"  # csv, json, or both
+    EXPORT_DIR: str = "exports"
+    AUTO_EXPORT: bool = False
+    AUTO_EXPORT_INTERVAL: int = 3600  # seconds
 
 # Global config instance
 config = Config()
@@ -107,3 +145,20 @@ PROTOCOL_PARAMS = {
         'packet_bytes': 10,
     },
 }
+
+# Ensure directories exist
+def ensure_directories():
+    """Create necessary directories if they don't exist"""
+    directories = [
+        config.LOG_DIR,
+        config.IQ_SAVE_DIR,
+        config.EXPORT_DIR,
+        "data",
+        "models",
+    ]
+    
+    for directory in directories:
+        Path(directory).mkdir(parents=True, exist_ok=True)
+
+# Call on import
+ensure_directories()
