@@ -46,7 +46,7 @@ class VehicleClusteringEngine:
             signal_buffer: List of signal dictionaries with TPMS data
 
         Returns:
-            List of vehicle IDs that were detected/updated
+            List of vehicle IDs that were detected/updated (empty list if none)
         """
         if not signal_buffer:
             return []
@@ -105,6 +105,7 @@ class VehicleClusteringEngine:
             # Cluster the sensors
             clusters = self.cluster_sensors(sensor_data_for_clustering)
 
+            # Process each cluster
             for cluster_id, sensor_ids in clusters.items():
                 if len(sensor_ids) >= 3:  # At least 3 sensors
                     vehicle_id = self.identify_vehicle(sensor_ids)
@@ -121,6 +122,7 @@ class VehicleClusteringEngine:
                     vehicle_ids.append(vehicle_id)
                     self.update_vehicle_profile(vehicle_id, signal_buffer)
 
+        # CRITICAL FIX: Always return a list, even if empty
         return vehicle_ids
 
     def add_signal(self, signal: SignalCharacteristics):
@@ -178,26 +180,38 @@ class VehicleClusteringEngine:
 
     def identify_vehicle(self, sensor_ids: List[str]) -> Optional[int]:
         """
-        Identify which vehicle a set of sensors belongs to
+        Identify which vehicle a set of sensors belongs to by checking database
 
         Args:
             sensor_ids: List of TPMS sensor IDs
 
         Returns:
-            Vehicle cluster ID or None if no match
+            Vehicle ID from database or None if no match
         """
-        # Find cluster with most matching sensors
+        if not sensor_ids:
+            return None
+
+        # Query database for vehicles with matching sensors
+        all_vehicles = self.db.get_all_vehicles()
+
         best_match = None
         best_score = 0
 
-        for cluster_id, cluster_sensors in self.clusters.items():
-            # Calculate overlap
-            overlap = len(set(sensor_ids) & set(cluster_sensors))
-            score = overlap / len(sensor_ids) if sensor_ids else 0
+        for vehicle in all_vehicles:
+            vehicle_sensors = set(vehicle.get('tpms_ids', []))
+            input_sensors = set(sensor_ids)
 
-            if score > best_score and score >= 0.5:  # At least 50% match
-                best_score = score
-                best_match = cluster_id
+            # Calculate overlap
+            overlap = len(vehicle_sensors & input_sensors)
+
+            # Score based on overlap with input sensors
+            if len(input_sensors) > 0:
+                score = overlap / len(input_sensors)
+
+                # Require at least 50% match
+                if score > best_score and score >= 0.5:
+                    best_score = score
+                    best_match = vehicle['id']
 
         return best_match
 
