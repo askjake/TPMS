@@ -18,9 +18,14 @@ except Exception as e:
 
 logger = logging.getLogger(__name__)
 
+_hackrf_singleton = None
+_hackrf_lock = threading.Lock()
+
 
 class HackRFInterface:
     def __init__(self):
+        global _hackrf_singleton
+
         logger.info("HackRFInterface.__init__ called")
 
         self.device = None
@@ -42,18 +47,24 @@ class HackRFInterface:
             logger.warning("HackRF library not available - simulation mode")
             return
 
-        # Try to open device
-        try:
-            self.device = HackRFDevice()
-            if self.device.open():
-                logger.info("✅ HackRF device opened successfully")
+            # Use singleton device
+        with _hackrf_lock:
+            if _hackrf_singleton is None:
+                try:
+                    _hackrf_singleton = HackRFDevice()
+                    if _hackrf_singleton.open():
+                        logger.info("✅ HackRF device opened successfully (singleton)")
+                    else:
+                        logger.error("❌ Failed to open HackRF device")
+                        _hackrf_singleton = None
+                except Exception as e:
+                    logger.error(f"❌ Error initializing HackRF: {e}")
+                    _hackrf_singleton = None
+
+            self.device = _hackrf_singleton
+
+            if self.device:
                 self._configure_device()
-            else:
-                logger.error("❌ Failed to open HackRF device")
-                self.device = None
-        except Exception as e:
-            logger.error(f"❌ Error initializing HackRF: {e}")
-            self.device = None
 
     def _configure_device(self):
         """Configure device with default settings"""
@@ -268,13 +279,121 @@ class SimulatedHackRF:
         self.is_running = False
         self.callback = None
         self.frequency = 315_000_000
+        self.sample_rate = 2_457_600
         self.thread = None
 
-    def start(self, callback: Callable):
+        # Pipeline support
+        self._pipeline_db = None
+        self._pipeline_decoder = None
+        self._pipeline_on_signal = None
+        self._pipeline_q: "queue.Queue[tuple]" = queue.Queue(maxsize=200)
+        self._pipeline_stop = threading.Event()
+        self._pipeline_thread: Optional[threading.Thread] = None
+
+    def attach_pipeline(self, db, decoder, on_signal=None):
+        """Attach TPMS decode→DB pipeline"""
+        self._pipeline_db = db
+        self._pipeline_decoder = decoder
+        self._pipeline_on_signal = on_signal
+        logger.info("Pipeline attached to SimulatedHackRF")
+        return True
+
+    def _pipeline_worker(self):
+        """Worker thread for decode→DB pipeline"""
+        while not self._pipeline_stop.is_set():
+            try:
+                iq_complex, rssi, freq_hz, ts = self._pipeline_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            try:
+                dec = self._pipeline_decoder
+                db = self._pipeline_db
+                if dec is None or db is None:
+                    continue
+
+                signals = dec.process_samples(iq_complex, freq_hz)
+                if not signals:
+                    continue
+
+                rows = []
+                now_ts = ts or time.time()
+                for s in signals:
+                    try:
+                        s.signal_strength = rssi
+                    except Exception:
+                        pass
+
+                    rows.append({
+                        "tpms_id": getattr(s, "tpms_id", None),
+                        "timestamp": getattr(s, "timestamp", None) or now_ts,
+                        "frequency": getattr(s, "frequency", None) or freq_hz,
+                        "signal_strength": getattr(s, "signal_strength", None) or rssi,
+                        "snr": getattr(s, "snr", None),
+                        "pressure_psi": getattr(s, "pressure_psi", None),
+                        "temperature_c": getattr(s, "temperature_c", None),
+                        "battery_low": getattr(s, "battery_low", None),
+                        "protocol": getattr(s, "protocol", None),
+                        "raw_data": getattr(s, "raw_data", None),
+                    })
+
+                # Insert batch
+                if hasattr(db, "insert_signals_batch"):
+                    db.insert_signals_batch(rows)
+                else:
+                    for r in rows:
+                        db.insert_signal(r)
+
+                # Optional hook
+                if self._pipeline_on_signal:
+                    for r in rows:
+                        try:
+                            self._pipeline_on_signal(r)
+                        except Exception:
+                            pass
+
+            except Exception as e:
+                logger.error(f"Pipeline worker error: {e}")
+
+    def _start_pipeline(self):
+        """Start pipeline worker thread"""
+        if self._pipeline_thread and self._pipeline_thread.is_alive():
+            return
+        self._pipeline_stop.clear()
+        self._pipeline_thread = threading.Thread(target=self._pipeline_worker, daemon=True)
+        self._pipeline_thread.start()
+        logger.info("Pipeline worker started")
+
+    def _stop_pipeline(self):
+        """Stop pipeline worker thread"""
+        self._pipeline_stop.set()
+        if self._pipeline_thread:
+            self._pipeline_thread.join(timeout=2.0)
+
+    def start(self, callback: Optional[Callable] = None):
         if self.is_running:
             return False
 
-        self.callback = callback
+        # Set up callback
+        if callback is None:
+            if self._pipeline_db is None or self._pipeline_decoder is None:
+                raise ValueError(
+                    "start() called with no callback, but no pipeline attached. "
+                    "Call attach_pipeline(db, decoder) first, or pass a callback."
+                )
+
+            self._start_pipeline()
+
+            def _enqueue(iq_complex, rssi, freq_hz):
+                try:
+                    self._pipeline_q.put_nowait((iq_complex, rssi, freq_hz, time.time()))
+                except queue.Full:
+                    pass
+
+            self.callback = _enqueue
+        else:
+            self.callback = callback
+
         self.is_running = True
         self.thread = threading.Thread(target=self._simulate, daemon=True)
         self.thread.start()
@@ -285,6 +404,10 @@ class SimulatedHackRF:
         self.is_running = False
         if self.thread:
             self.thread.join(timeout=1.0)
+
+        # Stop pipeline
+        self._stop_pipeline()
+
         logger.info("Simulation stopped")
 
     def _simulate(self):
@@ -323,6 +446,7 @@ class SimulatedHackRF:
 
     def change_frequency(self, freq):
         self.frequency = freq
+        logger.info(f"Simulated frequency change to {freq / 1e6:.1f} MHz")
         return True
 
     def set_frequency_hopping(self, enabled):
@@ -335,10 +459,25 @@ class SimulatedHackRF:
         pass
 
     def get_status(self):
-        return {'frequency': self.frequency / 1e6, 'is_streaming': self.is_running}
+        return {
+            'frequency': self.frequency / 1e6,
+            'is_streaming': self.is_running,
+            'sample_rate': self.sample_rate,
+            'lna_gain': 32,
+            'vga_gain': 40,
+            'frequency_hopping': False,
+            'hop_interval': 30.0,
+            'frequency_stats': {}
+        }
 
     def get_statistics(self):
-        return {'is_streaming': self.is_running, 'samples_received': 0}
+        return {
+            'is_streaming': self.is_running,
+            'samples_received': 0,
+            'errors': 0,
+            'buffer_size': 0,
+            'sample_rate': self.sample_rate
+        }
 
 
 def create_hackrf_interface(use_simulation=False):

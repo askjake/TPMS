@@ -3,7 +3,7 @@ import json
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple, Any
 import numpy as np
-import pandas as pd  # ADDED
+import pandas as pd
 
 
 class TPMSDatabase:
@@ -52,14 +52,11 @@ class TPMSDatabase:
         # Raw TPMS signals
         cursor.execute('''
                        CREATE TABLE IF NOT EXISTS tpms_signals
-
                        (
                            id              INTEGER PRIMARY KEY AUTOINCREMENT,
                            tpms_id         TEXT NOT NULL,
-
                            timestamp       REAL NOT NULL,
                            latitude        REAL,
-
                            longitude       REAL,
                            frequency       REAL,
                            signal_strength REAL,
@@ -160,9 +157,47 @@ class TPMSDatabase:
         conn.close()
         return signal_id
 
+    def insert_signals_batch(self, signals: List[Dict]) -> int:
+        """Insert multiple signals in a batch for better performance"""
+        if not signals:
+            return 0
+        
+        conn = self._connect()
+        cursor = conn.cursor()
+        
+        rows = []
+        for signal_data in signals:
+            rows.append((
+                signal_data.get('tpms_id'),
+                signal_data.get('timestamp'),
+                signal_data.get('latitude'),
+                signal_data.get('longitude'),
+                signal_data.get('frequency'),
+                signal_data.get('signal_strength'),
+                signal_data.get('snr'),
+                signal_data.get('pressure_psi'),
+                signal_data.get('temperature_c'),
+                signal_data.get('battery_low', 0),
+                signal_data.get('protocol', 'unknown'),
+                signal_data.get('raw_data')
+            ))
+        
+        cursor.executemany('''
+            INSERT INTO tpms_signals
+            (tpms_id, timestamp, latitude, longitude, frequency,
+             signal_strength, snr, pressure_psi, temperature_c,
+             battery_low, protocol, raw_data)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', rows)
+        
+        count = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return count
+
     def get_recent_signals(self, time_window: int = 30) -> List[Dict]:
         """Get signals from the last N seconds"""
-        conn = self._connect()
+        conn = self._connect(read_only=True)
         cursor = conn.cursor()
 
         cutoff_time = datetime.now().timestamp() - time_window
@@ -183,20 +218,20 @@ class TPMSDatabase:
     def get_all_unique_sensors(self):
         """Get all unique TPMS sensors ever seen"""
         query = """
-                SELECT tpms_id, \
-                       protocol, \
-                       COUNT(*)             as signal_count, \
-                       MIN(timestamp)       as first_seen, \
-                       MAX(timestamp)       as last_seen, \
-                       AVG(signal_strength) as avg_rssi, \
-                       AVG(pressure_psi)    as avg_pressure, \
-                       AVG(temperature_c)   as avg_temperature, \
+                SELECT tpms_id,
+                       protocol,
+                       COUNT(*)             as signal_count,
+                       MIN(timestamp)       as first_seen,
+                       MAX(timestamp)       as last_seen,
+                       AVG(signal_strength) as avg_rssi,
+                       AVG(pressure_psi)    as avg_pressure,
+                       AVG(temperature_c)   as avg_temperature,
                        MAX(frequency)       as frequency
                 FROM tpms_signals
                 GROUP BY tpms_id
-                ORDER BY last_seen DESC \
+                ORDER BY last_seen DESC
                 """
-        conn = self._connect()
+        conn = self._connect(read_only=True)
         result = pd.read_sql_query(query, conn)
         conn.close()
         return result
@@ -207,9 +242,9 @@ class TPMSDatabase:
                 SELECT *
                 FROM tpms_signals
                 WHERE tpms_id = ?
-                ORDER BY timestamp DESC \
+                ORDER BY timestamp DESC
                 """
-        conn = self._connect()
+        conn = self._connect(read_only=True)
         result = pd.read_sql_query(query, conn, params=(tpms_id,))
         conn.close()
         return result
@@ -217,23 +252,23 @@ class TPMSDatabase:
     def get_sensor_statistics(self, tpms_id):
         """Get detailed statistics for a sensor"""
         query = """
-                SELECT COUNT(*)             as total_signals, \
-                       MIN(timestamp)       as first_seen, \
-                       MAX(timestamp)       as last_seen, \
-                       AVG(signal_strength) as avg_rssi, \
-                       MIN(signal_strength) as min_rssi, \
-                       MAX(signal_strength) as max_rssi, \
-                       AVG(pressure_psi)    as avg_pressure, \
-                       MIN(pressure_psi)    as min_pressure, \
-                       MAX(pressure_psi)    as max_pressure, \
-                       AVG(temperature_c)   as avg_temp, \
-                       MIN(temperature_c)   as min_temp, \
-                       MAX(temperature_c)   as max_temp, \
+                SELECT COUNT(*)             as total_signals,
+                       MIN(timestamp)       as first_seen,
+                       MAX(timestamp)       as last_seen,
+                       AVG(signal_strength) as avg_rssi,
+                       MIN(signal_strength) as min_rssi,
+                       MAX(signal_strength) as max_rssi,
+                       AVG(pressure_psi)    as avg_pressure,
+                       MIN(pressure_psi)    as min_pressure,
+                       MAX(pressure_psi)    as max_pressure,
+                       AVG(temperature_c)   as avg_temp,
+                       MIN(temperature_c)   as min_temp,
+                       MAX(temperature_c)   as max_temp,
                        protocol
                 FROM tpms_signals
-                WHERE tpms_id = ? \
+                WHERE tpms_id = ?
                 """
-        conn = self._connect()
+        conn = self._connect(read_only=True)
         conn.row_factory = sqlite3.Row
         result = conn.execute(query, (tpms_id,)).fetchone()
         conn.close()
@@ -244,14 +279,14 @@ class TPMSDatabase:
         query = """
                 SELECT DISTINCT ts.tpms_id, ts.protocol, MAX(ts.timestamp) as last_seen
                 FROM tpms_signals ts
-                         LEFT JOIN vehicles v ON ts.tpms_id IN (SELECT json_each.value \
-                                                                FROM vehicles, json_each(vehicles.tpms_ids) \
+                         LEFT JOIN vehicles v ON ts.tpms_id IN (SELECT json_each.value
+                                                                FROM vehicles, json_each(vehicles.tpms_ids)
                                                                 WHERE vehicles.id = v.id)
                 WHERE v.id IS NULL
                 GROUP BY ts.tpms_id
-                ORDER BY last_seen DESC \
+                ORDER BY last_seen DESC
                 """
-        conn = self._connect()
+        conn = self._connect(read_only=True)
         result = pd.read_sql_query(query, conn)
         conn.close()
         return result
@@ -280,7 +315,6 @@ class TPMSDatabase:
 
         conn.close()
         return False
-
 
     def upsert_vehicle(self, tpms_ids: List[str], timestamp: float,
                        location: Optional[Tuple[float, float]] = None) -> int:
@@ -316,7 +350,6 @@ class TPMSDatabase:
                        VALUES (?, ?, ?, ?)
                        ''', (vehicle_id, timestamp,
                              location[0] if location else None,
-
                              location[1] if location else None))
 
         conn.commit()
@@ -325,7 +358,7 @@ class TPMSDatabase:
 
     def get_vehicle_history(self, vehicle_id: int) -> Dict:
         """Get complete history for a vehicle"""
-        conn = self._connect()
+        conn = self._connect(read_only=True)
         cursor = conn.cursor()
 
         # Vehicle info
@@ -367,7 +400,7 @@ class TPMSDatabase:
 
     def get_all_vehicles(self, min_encounters: int = 1) -> List[Dict]:
         """Get all known vehicles"""
-        conn = self._connect()
+        conn = self._connect(read_only=True)
         cursor = conn.cursor()
 
         cursor.execute('''
@@ -389,13 +422,17 @@ class TPMSDatabase:
 
     def analyze_maintenance(self, vehicle_id: int, days: int = 30) -> Dict:
         """Analyze tire maintenance for a vehicle"""
-        conn = self._connect()
+        conn = self._connect(read_only=True)
         cursor = conn.cursor()
 
         # Get TPMS IDs for this vehicle
         cursor.execute('SELECT tpms_ids FROM vehicles WHERE id = ?', (vehicle_id,))
-        tpms_ids = json.loads(cursor.fetchone()[0])
-
+        result = cursor.fetchone()
+        if not result:
+            conn.close()
+            return {}
+        
+        tpms_ids = json.loads(result[0])
         cutoff_time = datetime.now().timestamp() - (days * 86400)
 
         # Get pressure and temperature trends
@@ -465,7 +502,6 @@ class TPMSDatabase:
                        (nickname, vehicle_id))
         conn.commit()
         conn.close()
-
 
     # -----------------------------
     # Fast, UI-friendly helpers
@@ -542,7 +578,7 @@ class TPMSDatabase:
                 snr,
                 latitude,
                 longitude,
-                raw_payload
+                raw_data
             FROM tpms_signals
             WHERE rowid > ?
             ORDER BY rowid ASC

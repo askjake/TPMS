@@ -25,7 +25,7 @@ from ml_engine import VehicleClusteringEngine, OnlinePatternLearner
 # -----------------------------
 
 APP_TITLE = "TPMS Tracker - Intelligent Vehicle Pattern Recognition"
-DEFAULT_PORT = 8507
+#EFAULT_PORT = 8507
 
 # A safe default list; if your config.py defines FREQUENCIES_MHZ, we use it.
 DEFAULT_FREQUENCIES = [314.9, 315.0, 433.92]
@@ -82,23 +82,22 @@ def cached_realtime_stats(db_path: str) -> Dict[str, Any]:
     return db.get_realtime_stats()
 
 
-def ensure_models(db_path: str):
-    """Ensure expensive models are created once per session."""
-    # Session-state defaults (avoid KeyError/AttributeError on first run or after hot-reload)
-    if "last_model_update" not in st.session_state:
-        st.session_state.last_model_update = None
-    if "last_rowid" not in st.session_state:
-        st.session_state.last_rowid = 0
-
+def ensure_models():
+    db = tpms_tracker.db
     if "online_learner" not in st.session_state:
         st.session_state.online_learner = OnlinePatternLearner()
     if "vehicle_engine" not in st.session_state:
-        db = get_db(db_path)
+        # Vehicle clustering uses co-occurrence; keep it lightweight
         st.session_state.vehicle_engine = VehicleClusteringEngine(db)
+    if "last_rowid" not in st.session_state:
+        st.session_state.last_rowid = 0
+    if "last_model_update" not in st.session_state:
+        st.session_state.last_model_update = 0.0
+
 
 def process_online_learning(db_path: str, limit: int = 5000) -> int:
     """Pull new rows from DB and update online learner + vehicle co-occurrence."""
-    ensure_models(db_path)
+    ensure_models()
     db = get_db(db_path)
 
     rows = db.get_signals_since_rowid(last_rowid=int(st.session_state.last_rowid), limit=int(limit))
@@ -196,15 +195,10 @@ def sidebar_control_panel(db_path: str):
 
     stats = cached_realtime_stats(db_path)
 
-    if isinstance(stats, dict) and stats.get("ok") is False:
-        st.sidebar.warning(f"Stats error: {stats.get('error', 'unknown')}")
-
-
-
     # Requested stats
-    st.sidebar.metric("Rate (signals/hr)", int(stats.get("rate_per_hour_last_min", 0)))
-    st.sidebar.metric("Signals (last hour)", int(stats.get("n_last_hour", stats.get("signals_last_hour", 0))))
-    st.sidebar.metric("Repeated signals (last hour)", int(stats.get("repeats_last_hour", stats.get("repeated_signals_last_hour", 0))))
+    st.sidebar.metric("Rate (signals/hr)", int(stats["rate_per_hour_last_min"]))
+    st.sidebar.metric("Signals (last hour)", int(stats["n_last_hour"]))
+    st.sidebar.metric("Repeated signals (last hour)", int(stats["repeats_last_hour"]))
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 🧾 Inventory")
@@ -213,7 +207,7 @@ def sidebar_control_panel(db_path: str):
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 🧠 Learning")
-    ensure_models(db_path)
+    ensure_models()
     st.sidebar.checkbox("Auto-learn (small batch each rerun)", value=True, key="auto_learn")
     st.sidebar.write(f"Last model update: **{fmt_ts(st.session_state.last_model_update)}**")
     if st.sidebar.button("Update model now"):
@@ -229,247 +223,48 @@ def sidebar_control_panel(db_path: str):
 # -----------------------------
 
 def page_live_detection(db_path: str):
-    st.header("🎯 Live Detection - Multi-Scanner")
+    st.header("🎯 Live Detection")
 
     st.info(
-        "Scan multiple frequencies simultaneously with multiple SDR devices. "
-        "Perfect for determining which frequency your car uses!"
+        "This page is where your HackRF/RTL-SDR scanning integration usually lives. "
+        "To keep Analytics/ML/Maintenance fast, hardware modules are imported lazily here."
     )
 
-    # Initialize multi-scanner manager in session state
-    if 'multi_scanner' not in st.session_state:
-        st.session_state.multi_scanner = None
-    if 'scanner_counter' not in st.session_state:
-        st.session_state.scanner_counter = 0
-
-    # Initialize multi-scanner manager
-    if st.session_state.multi_scanner is None:
-        try:
-            import tpms_decoder
-            from config import config
-
-            db = get_db(db_path)
-            DecoderCls = getattr(tpms_decoder, "TPMSDecoder", None)
-            if DecoderCls is None:
-                st.error("tpms_decoder.TPMSDecoder not found")
-                return
-
-            sample_rate = getattr(config, "SAMPLE_RATE", 2_457_600)
-
-            from multi_scanner_manager import MultiScannerManager
-            st.session_state.multi_scanner = MultiScannerManager(
-                db=db,
-                decoder_class=DecoderCls,
-                sample_rate=sample_rate
-            )
-            st.success("Multi-scanner manager initialized!")
-        except Exception as e:
-            st.error(f"Failed to initialize multi-scanner manager: {e}")
-            return
-
-    manager = st.session_state.multi_scanner
-
-    # Add new scanner section
-    with st.expander("➕ Add New Scanner", expanded=manager.get_scanner_count() == 0):
-        st.write("Configure and add a new SDR scanner")
-
-        col1, col2, col3 = st.columns(3)
-
-        with col1:
-            hw_type = st.selectbox(
-                "Hardware Type",
-                options=["Auto-detect", "HackRF", "RTL-SDR", "Simulation"],
-                key="new_hw_type"
-            )
-
-        with col2:
-            freq_mhz = st.selectbox(
-                "Frequency (MHz)",
-                options=FREQUENCIES,
-                key="new_freq"
-            )
-
-        with col3:
-            scanner_name = st.text_input(
-                "Scanner Name (optional)",
-                placeholder=f"Scanner {st.session_state.scanner_counter + 1}",
-                key="new_scanner_name"
-            )
-
-        if st.button("🔌 Add Scanner", type="primary"):
+    # Attempt to import scanner modules only when needed
+    with st.expander("Scanner wiring (optional)"):
+        st.write("If your repo includes hackrf_interface / tpms_decoder, this will attach them to session_state.")
+        if st.button("Attach scanner modules"):
             try:
-                import hardware_manager
+                # Local imports – won't slow down the rest of the app
+                import hackrf_interface  # type: ignore
+                import tpms_decoder  # type: ignore
 
-                hw_map = {
-                    "Auto-detect": None,
-                    "HackRF": "hackrf",
-                    "RTL-SDR": "rtlsdr",
-                    "Simulation": "simulation"
-                }
+                # Your project may have a scanner/controller class. We try a couple names.
+                scanner = None
+                if hasattr(hackrf_interface, "HackRFScanner"):
+                    scanner = hackrf_interface.HackRFScanner()
+                elif hasattr(hackrf_interface, "Scanner"):
+                    scanner = hackrf_interface.Scanner()
 
-                preferred = hw_map[hw_type]
-                hw_manager = hardware_manager.HardwareManager(preferred=preferred)
-                scanner = hw_manager.get_interface()
-                actual_hw_type = hw_manager.get_hardware_type()
-
-                if scanner is None or actual_hw_type is None:
-                    st.error(f"❌ Hardware initialization failed for {hw_type}.")
-                    st.info("If HackRF shows as plugged in but cannot be opened, select RTL-SDR or Simulation from the dropdown.")
-                    return
-
-                # Generate scanner ID
-                if scanner_name and scanner_name.strip():
-                    scanner_id = scanner_name.strip()
+                if scanner is not None:
+                    st.session_state.scanner = scanner
+                    st.success("Scanner attached to session_state.scanner")
                 else:
-                    st.session_state.scanner_counter += 1
-                    scanner_id = f"scanner_{st.session_state.scanner_counter}"
-
-                # Add to manager
-                freq_hz = float(freq_mhz) * 1e6
-                if manager.add_scanner(scanner_id, actual_hw_type, freq_hz, scanner):
-                    st.success(f"✅ Added {scanner_id}: {actual_hw_type.upper()} @ {freq_mhz} MHz")
-                    st.rerun()
-                else:
-                    st.error(f"Failed to add scanner (ID may already exist)")
-
+                    st.warning("Couldn't find HackRFScanner/Scanner class in hackrf_interface.")
             except Exception as e:
-                st.error(f"Error adding scanner: {e}")
-                import traceback
-                st.code(traceback.format_exc())
+                st.error(f"Attach failed: {e}")
 
-    # Display active scanners
-    st.markdown("---")
-    st.subheader("📡 Active Scanners")
-
-    status = manager.get_status()
-
-    if not status:
-        st.info("No scanners configured. Add a scanner above to get started!")
-        return
-
-    # Create a row for each scanner
-    for scanner_id, info in status.items():
-        with st.container():
-            col1, col2, col3, col4, col5, col6 = st.columns([2, 1.5, 1, 1, 1, 1])
-
-            with col1:
-                # Safe hardware type handling
-                hw_type_str = info.get('hardware_type') or 'unknown'
-                hw_icon = {"hackrf": "🔴", "rtlsdr": "📻", "simulation": "🎮"}.get(hw_type_str, "❓")
-                st.write(f"{hw_icon} **{scanner_id}**")
-                st.caption(f"{hw_type_str.upper()}")
-
-            with col2:
-                freq = info.get('frequency', 0)
-                st.metric("Frequency", f"{freq:.2f} MHz")
-
-            with col3:
-                is_running = info.get('is_running', False)
-                if is_running:
-                    st.success("🟢 Active")
-                else:
-                    st.info("⚪ Idle")
-
-            with col4:
-                if is_running:
-                    if st.button("⏹️ Stop", key=f"stop_{scanner_id}"):
-                        if manager.stop_scanner(scanner_id):
-                            st.success(f"Stopped {scanner_id}")
-                            st.rerun()
-                else:
-                    if st.button("▶️ Start", key=f"start_{scanner_id}"):
-                        if manager.start_scanner(scanner_id):
-                            st.success(f"Started {scanner_id}")
-                            st.rerun()
-
-            with col5:
-                # Change frequency
-                freq = info.get('frequency', FREQUENCIES[0])
-                try:
-                    current_idx = FREQUENCIES.index(freq) if freq in FREQUENCIES else 0
-                except (ValueError, IndexError):
-                    current_idx = 0
-
-                new_freq = st.selectbox(
-                    "Freq",
-                    options=FREQUENCIES,
-                    index=current_idx,
-                    key=f"freq_{scanner_id}",
-                    label_visibility="collapsed"
-                )
-                if new_freq != freq:
-                    if manager.change_frequency(scanner_id, float(new_freq) * 1e6):
-                        st.rerun()
-
-            with col6:
-                if st.button("🗑️", key=f"remove_{scanner_id}", help="Remove scanner"):
-                    if manager.remove_scanner(scanner_id):
-                        st.success(f"Removed {scanner_id}")
-                        st.rerun()
-
-            # Show error if present
-            if 'error' in info:
-                st.error(f"Error: {info['error']}")
-
-            st.markdown("---")
-
-    # Global controls
-    st.subheader("🎛️ Global Controls")
-    col1, col2, col3, col4 = st.columns(4)
-
-    with col1:
-        if st.button("▶️ Start All", type="primary"):
-            results = manager.start_all()
-            success_count = sum(1 for v in results.values() if v)
-            st.success(f"Started {success_count}/{len(results)} scanners")
-            st.rerun()
-
-    with col2:
-        if st.button("⏹️ Stop All"):
-            results = manager.stop_all()
-            st.info("All scanners stopped")
-            st.rerun()
-
-    with col3:
-        st.metric("Total Scanners", manager.get_scanner_count())
-
-    with col4:
-        st.metric("Running", manager.get_running_count())
-
-    # Show recent signals grouped by frequency
-    st.markdown("---")
-    st.subheader("📊 Recent Detections (Last 2 Minutes)")
-
+    # Show most recent signals (quick)
     db = get_db(db_path)
-    recent = db.get_recent_signals(time_window=120)
+    recent = db.get_recent_signals(seconds=120)
     df = pd.DataFrame(recent)
-
     if df.empty:
-        st.write("No recent signals detected.")
+        st.write("No recent signals.")
         return
 
     df["time"] = df["timestamp"].apply(fmt_ts)
-
-    # Group by frequency
-    if "frequency" in df.columns:
-        for freq in sorted(df["frequency"].unique()):
-            freq_df = df[df["frequency"] == freq].copy()
-
-            with st.expander(f"📡 {freq / 1e6:.2f} MHz ({len(freq_df)} signals)", expanded=True):
-                show_cols = [c for c in ["time", "tpms_id", "protocol", "pressure_psi", "temperature_c",
-                                         "battery_low", "signal_strength", "snr"]
-                             if c in freq_df.columns]
-                st.dataframe(
-                    freq_df[show_cols].sort_values("time", ascending=False),
-                    use_container_width=True,
-                    height=min(300, len(freq_df) * 35 + 38)
-                )
-    else:
-        show_cols = [c for c in ["time", "tpms_id", "protocol", "pressure_psi", "temperature_c",
-                                 "battery_low", "signal_strength", "snr", "frequency"]
-                     if c in df.columns]
-        st.dataframe(df[show_cols].sort_values("time", ascending=False),
-                     use_container_width=True, height=420)
+    show_cols = [c for c in ["time", "tpms_id", "protocol", "pressure_psi", "temperature_c", "battery_low", "signal_strength", "snr", "frequency"] if c in df.columns]
+    st.dataframe(df[show_cols].sort_values("time", ascending=False), use_container_width=True, height=420)
 
 
 def page_sensor_database(db_path: str):
@@ -486,13 +281,13 @@ def page_sensor_database(db_path: str):
     cur.execute(
         """
         SELECT tpms_id,
-               COUNT(*)             AS signals,
-               MIN(timestamp)       AS first_ts,
-               MAX(timestamp)       AS last_ts,
+               COUNT(*) AS signals,
+               MIN(timestamp) AS first_ts,
+               MAX(timestamp) AS last_ts,
                AVG(signal_strength) AS avg_rssi,
-               AVG(pressure_psi)    AS avg_pressure,
-               AVG(temperature_c)   AS avg_temp,
-               AVG(frequency)       AS avg_freq
+               AVG(pressure_psi) AS avg_pressure,
+               AVG(temperature_c) AS avg_temp,
+               AVG(frequency) AS avg_freq
         FROM tpms_signals
         WHERE timestamp >= ?
         GROUP BY tpms_id
@@ -512,8 +307,7 @@ def page_sensor_database(db_path: str):
     df["first_seen"] = df["first_ts"].apply(fmt_ts)
     df["last_seen"] = df["last_ts"].apply(fmt_ts)
 
-    display_cols = ["tpms_id", "signals", "first_seen", "last_seen", "avg_rssi",
-                    "avg_pressure", "avg_temp", "avg_freq"]
+    display_cols = ["tpms_id", "signals", "first_seen", "last_seen", "avg_rssi", "avg_pressure", "avg_temp", "avg_freq"]
     st.dataframe(df[display_cols], use_container_width=True, height=560)
 
 
@@ -716,7 +510,7 @@ def page_maintenance(db_path: str):
 
 def page_ml_insights(db_path: str):
     st.header("🧠 ML Insights")
-    ensure_models(db_path)
+    ensure_models()
 
     db = get_db(db_path)
 
@@ -910,3 +704,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
