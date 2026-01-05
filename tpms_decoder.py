@@ -35,7 +35,7 @@ logger.addHandler(file_handler)
 
 # Also log to console
 console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setLevel(logging.INFO)
+console_handler.setLevel(logging.DEBUG)
 console_handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s - %(message)s'))
 logger.addHandler(console_handler)
 
@@ -114,36 +114,33 @@ class TPMSDecoder:
         self.learning_engine = learning_engine
 
     def process_samples(self, iq_samples: np.ndarray, frequency: float) -> List[TPMSSignal]:
-        """Process IQ samples and decode TPMS signals"""
-        signals = []
+        signals: List[TPMSSignal] = []
 
-        # Calculate signal power and SNR
         power = np.abs(iq_samples) ** 2
-        avg_power = np.mean(power)
-        signal_strength = 10 * np.log10(avg_power + 1e-10)
-        snr = self._calculate_snr(iq_samples)
+        avg_power = float(np.mean(power))
+        signal_strength = 10 * np.log10(avg_power + 1e-10)  # dBFS-ish, not calibrated dBm
+        snr = float(self._calculate_snr(iq_samples))
 
-        # Check if signal is strong enough
         if signal_strength < config.SIGNAL_THRESHOLD:
             return signals
 
-        # Try each protocol in order of likelihood
         protocol_order = ['Schrader_FSK', 'Schrader_OOK_8k192', 'Schrader_OOK_8k4', 'Toyota']
 
+        decoded_any = None
         for protocol_name in protocol_order:
             pattern = self.protocol_patterns[protocol_name]
             decoded = self._try_decode_protocol(
                 iq_samples, protocol_name, pattern, frequency, signal_strength, snr
             )
-
             if decoded:
+                decoded_any = decoded
                 signals.append(decoded)
-                # Only log successful decodes
-                print(f"✅ {protocol_name}: {decoded.tpms_id} | "
-                      f"{decoded.pressure_psi:.1f} PSI | "
-                      f"{signal_strength:.1f} dBm", flush=True)
 
-                # Learn from successful decode
+                # safer print (pressure can be None)
+                p = decoded.pressure_psi
+                p_str = f"{p:.1f} PSI" if p is not None else "PSI=?"
+                logger.info(f"✅ {protocol_name}: {decoded.tpms_id} | {p_str} | {signal_strength:.1f} dB")
+
                 if self.learning_engine:
                     self.learning_engine.learn_from_signal(
                         {
@@ -157,24 +154,18 @@ class TPMSDecoder:
                         decoded=True,
                         protocol=protocol_name
                     )
+                break  # stop after first successful decode
 
-                return signals
-
-            # If no protocol matched, only log occasionally
-            if not hasattr(self, '_failed_count'):
-                self._failed_count = 0
-            self._failed_count += 1
-
-            # Log every 100th failure
+        if decoded_any is None:
+            # count failures once per call, not once per protocol
+            self._failed_count = getattr(self, "_failed_count", 0) + 1
             if self._failed_count % 100 == 0:
-                print(f"⚠️  {self._failed_count} signals failed to decode", flush=True)
+                logger.info(f"⚠️  {self._failed_count} signals failed to decode")
 
-            # Analyze as unknown (but don't spam logs)
             if config.PROTOCOL_DETECTION_ENABLED:
                 unknown = self._analyze_unknown_signal(iq_samples, frequency, signal_strength)
                 if unknown:
                     self.unknown_signals.append(unknown)
-
                     if self.learning_engine:
                         self.learning_engine.learn_from_signal(
                             {
@@ -189,7 +180,7 @@ class TPMSDecoder:
                             protocol=None
                         )
 
-                return signals
+        return signals
 
     def _try_decode_protocol(self, iq_samples: np.ndarray, protocol_name: str,
                             pattern: dict, frequency: float, signal_strength: float,
@@ -382,14 +373,19 @@ class TPMSDecoder:
              return False
 
          # Check for pressure sanity (byte 4 in Schrader)
-         if 'Schrader' in protocol and len(packet) >= 5:
-             pressure_raw = packet[4]
-             # Pressure byte should be in reasonable range
-             # Typical: 20-60 (which converts to ~27-82 PSI)
-             if pressure_raw < 10 or pressure_raw > 100:
+         if 'Schrader' in protocol and len(packet) >= 6:
+             p = self._decode_schrader_pressure_psi(packet[4])
+             if p is None:
+                 return False
+             if not (5.0 <= p <= 80.0):  # pick your expected physical range
                  return False
 
          return True
+
+    def _decode_schrader_pressure_psi(self, pressure_raw: int) -> Optional[float]:
+        if not (0 < pressure_raw < 255):
+            return None
+        return float(pressure_raw) * 0.25
 
     def _decode_packet(self, packet: bytes, protocol: str) -> Optional[Dict]:
         """Decode packet based on protocol"""
@@ -409,11 +405,7 @@ class TPMSDecoder:
                 if len(packet) >= 8:
                     # Pressure: byte 4-5, typically in kPa * 4
                     pressure_raw = packet[4]
-                    if pressure_raw > 0 and pressure_raw < 255:
-                        # To one of these (try each):
-                        pressure = pressure_raw * 0.25      # Option 1: Quarter PSI
-                        #pressure = (pressure_raw - 40) * 0.5  # Option 2: Offset and half PSI
-                        #pressure = pressure_raw / 4.0       # Option 3: Divide by 4
+                    pressure = self._decode_schrader_pressure_psi(pressure_raw)
 
                     # Temperature: byte 6, offset by 40°C
                     temp_raw = packet[5]

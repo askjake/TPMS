@@ -2,13 +2,13 @@
 Machine Learning Engine for TPMS Signal Analysis
 Modern Python (3.10+) compatible
 """
-import numpy as np
-from sklearn.cluster import DBSCAN
-from sklearn.preprocessing import StandardScaler
-from typing import List, Dict, Optional, Tuple
+
 import time
 from dataclasses import dataclass, field
-from collections import defaultdict
+from collections import defaultdict, deque
+from typing import List, Dict, Optional, Tuple, Set, Any
+import math
+
 
 @dataclass
 class SignalCharacteristics:
@@ -25,392 +25,426 @@ class SignalCharacteristics:
 
 class VehicleClusteringEngine:
     """
-    ML engine for clustering TPMS sensors by vehicle
-    Uses DBSCAN for spatial-temporal clustering
+    Mate-graph vehicle clustering:
+
+    - Any two sensors detected within base_mate_window_s are "potential mates" and get a score bump.
+    - If a pair becomes "suspected" (score >= suspect_score), the mate window relaxes to relaxed_mate_window_s.
+    - Vehicles are inferred as connected components over strong mate edges.
+
+    This matches the mental model:
+      "I think these sensors belong together; later sightings confirm it (and the confirmation window is wider)."
     """
-    
-    def __init__(self, db, min_samples: int = 3, eps: float = 0.5):
-        self.db = db  # Database reference
-        self.min_samples = min_samples
-        self.eps = eps
-        self.scaler = StandardScaler()
-        self.signal_history: List[SignalCharacteristics] = []
-        self.clusters: Dict[int, List[str]] = {}
+
+    def __init__(
+        self,
+        db,
+        # --- temporal mate logic ---
+        base_mate_window_s: float = 1.0,        # strict "mate" window
+        relaxed_mate_window_s: float = 3.0,     # used once pair is suspected
+        observation_window_s: float = 1.0,      # which sensors count as "currently together"
+        min_same_sensor_gap_s: float = 0.25,    # debounce repeats from same sensor
+
+        # --- scoring / thresholds ---
+        suspect_score: float = 2.0,             # when we start relaxing the window for that pair
+        link_score: float = 4.0,                # edge threshold for building vehicle components
+        stable_pair_ratio: float = 0.60,        # % of pairs that must be strong to create a *new* vehicle
+
+        # --- forgetting ---
+        decay_halflife_s: float = 180.0,        # decay old associations
+
+        # --- safety gates ---
+        max_vehicle_size: int = 8,
+        min_vehicle_size: int = 3,
+
+        # --- DB cache ---
+        refresh_vehicle_cache_s: float = 30.0,
+    ):
+        self.db = db
+
+        self.base_mate_window_s = float(base_mate_window_s)
+        self.relaxed_mate_window_s = float(relaxed_mate_window_s)
+        self.observation_window_s = float(observation_window_s)
+        self.min_same_sensor_gap_s = float(min_same_sensor_gap_s)
+
+        self.suspect_score = float(suspect_score)
+        self.link_score = float(link_score)
+        self.stable_pair_ratio = float(stable_pair_ratio)
+
+        self.decay_halflife_s = float(decay_halflife_s)
+
+        self.max_vehicle_size = int(max_vehicle_size)
+        self.min_vehicle_size = int(min_vehicle_size)
+
+        # (a,b) -> score (decayed)
+        self.pair_scores = defaultdict(float)
+        self._last_decay_ts = time.time()
+
+        # recent detections for mate matching: (tpms_id, ts)
+        # kept only for the last relaxed_mate_window_s window
+        self._recent_detections = deque()
+
+        # debounce repeats per sensor to avoid score inflation
+        self._last_seen_sensor_ts = {}
+
+        # vehicle cache for identify_vehicle()
+        self._vehicle_cache = []
+        self._vehicle_cache_ts = 0.0
+        self._vehicle_cache_ttl = float(refresh_vehicle_cache_s)
+
+        # Debuggable outputs
+        self.recent_windows = deque(maxlen=300)  # (ts, frozenset(ids_observed))
         self.vehicle_profiles: Dict[int, Dict] = {}
+        self.clusters: Dict[int, List[str]] = {}
+
+    # -----------------------------
+    # Utilities
+    # -----------------------------
+
+    @staticmethod
+    def _pair_key(a: str, b: str) -> Tuple[str, str]:
+        return (a, b) if a <= b else (b, a)
+
+    def _decay(self, now: float):
+        """Exponentially decay pair scores over time."""
+        dt = max(0.0, now - self._last_decay_ts)
+        if dt <= 0:
+            return
+        decay_factor = 0.5 ** (dt / self.decay_halflife_s)
+        if decay_factor < 0.999:
+            for k in list(self.pair_scores.keys()):
+                self.pair_scores[k] *= decay_factor
+                if self.pair_scores[k] < 0.05:
+                    del self.pair_scores[k]
+        self._last_decay_ts = now
+
+    def _effective_window(self, a: str, b: str) -> float:
+        """Relax mate window if this pair is already suspected."""
+        score = self.pair_scores.get(self._pair_key(a, b), 0.0)
+        return self.relaxed_mate_window_s if score >= self.suspect_score else self.base_mate_window_s
+
+    def get_pair_likelihood(self, a: str, b: str) -> float:
+        """
+        Map raw score -> [0,1) likelihood.
+        This is just a convenience scalar for UI/debug.
+        """
+        s = self.pair_scores.get(self._pair_key(a, b), 0.0)
+        # saturating curve: 0->0, 4->~0.63, 8->~0.86, ...
+        return 1.0 - math.exp(-s / max(1e-6, self.link_score))
+
+    # -----------------------------
+    # Ingestion: "mates within 1s"
+    # -----------------------------
+
+    def _ingest_detection(self, sid: str, ts: float):
+        """
+        For each new detection:
+          - compare against other detections within relaxed_mate_window_s
+          - if dt <= effective_window(pair), bump the pair score
+        """
+        if not sid:
+            return
+
+        # debounce same sensor spam
+        last = self._last_seen_sensor_ts.get(sid)
+        if last is not None and (ts - last) < self.min_same_sensor_gap_s:
+            return
+        self._last_seen_sensor_ts[sid] = ts
+
+        self._decay(ts)
+
+        # purge stale detections
+        cutoff = ts - self.relaxed_mate_window_s
+        while self._recent_detections and self._recent_detections[0][1] < cutoff:
+            self._recent_detections.popleft()
+
+        # compare to recent detections (iterate newest->oldest)
+        # deque is time-ordered as we append
+        for other_sid, other_ts in reversed(self._recent_detections):
+            dt = ts - other_ts
+            if dt > self.relaxed_mate_window_s:
+                break
+            if other_sid == sid:
+                continue
+
+            window = self._effective_window(sid, other_sid)
+            if dt <= window:
+                k = self._pair_key(sid, other_sid)
+                self.pair_scores[k] += 1.0
+
+        self._recent_detections.append((sid, ts))
+
+    def _ingest_signal_buffer(self, signal_buffer: List[Dict]) -> float:
+        """
+        Ingest all signals in time order.
+        Returns a robust window timestamp (max ts).
+        """
+        events: List[Tuple[str, float]] = []
+        now = time.time()
+
+        for s in signal_buffer:
+            sid = s.get("tpms_id")
+            if not sid:
+                continue
+            ts = float(s.get("timestamp", now))
+            events.append((sid, ts))
+
+        if not events:
+            return now
+
+        events.sort(key=lambda x: x[1])
+        for sid, ts in events:
+            self._ingest_detection(sid, ts)
+
+        return max(ts for _, ts in events)
+
+    # -----------------------------
+    # Graph building / grouping
+    # -----------------------------
+
+    def _adjacency(self, min_score: float) -> Dict[str, Set[str]]:
+        adj = defaultdict(set)
+        for (a, b), score in self.pair_scores.items():
+            if score >= min_score:
+                adj[a].add(b)
+                adj[b].add(a)
+        return adj
+
+    def _components(self, min_score: float) -> List[List[str]]:
+        """Connected components among edges with score >= min_score."""
+        adj = self._adjacency(min_score)
+        seen = set()
+        comps: List[List[str]] = []
+
+        for node in adj.keys():
+            if node in seen:
+                continue
+            stack = [node]
+            seen.add(node)
+            comp = []
+
+            while stack:
+                x = stack.pop()
+                comp.append(x)
+                for y in adj[x]:
+                    if y not in seen:
+                        seen.add(y)
+                        stack.append(y)
+
+            comps.append(sorted(comp))
+
+        return comps
+
+    def _is_group_stable(self, ids: List[str]) -> bool:
+        """
+        Stable group heuristic:
+          require at least stable_pair_ratio of all pairs to be >= link_score
+        """
+        ids = sorted(set(ids))
+        n = len(ids)
+        if n < 2:
+            return False
+
+        good = 0
+        total = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                total += 1
+                if self.pair_scores.get(self._pair_key(ids[i], ids[j]), 0.0) >= self.link_score:
+                    good += 1
+
+        return total > 0 and (good / total) >= self.stable_pair_ratio
+
+    def _observed_ids(self, now_ts: float) -> List[str]:
+        """Sensors seen within observation_window_s of now_ts."""
+        cutoff = now_ts - self.observation_window_s
+        obs = {sid for sid, ts in self._recent_detections if ts >= cutoff}
+        return sorted(obs)
+
+    def _expand_with_suspected_mates(self, ids: List[str]) -> List[str]:
+        """
+        If we already suspect mates, expand the set by one-hop mate edges.
+        This models: "I saw a car, I think I know its sensor set, but I can't verify until it moves."
+        """
+        if not ids:
+            return ids
+
+        adj_suspect = self._adjacency(self.suspect_score)
+
+        expanded = set(ids)
+        changed = True
+        # iterative expansion (cap depth to avoid explosions)
+        for _ in range(2):
+            if not changed:
+                break
+            changed = False
+            for sid in list(expanded):
+                for mate in adj_suspect.get(sid, set()):
+                    if mate not in expanded:
+                        expanded.add(mate)
+                        changed = True
+
+        return sorted(expanded)
+
+    # -----------------------------
+    # Public API
+    # -----------------------------
 
     def process_signals(self, signal_buffer: List[Dict]) -> List[int]:
         """
-        Process a buffer of signals and identify vehicles
-
-        Args:
-            signal_buffer: List of signal dictionaries with TPMS data
-
-        Returns:
-            List of vehicle IDs that were detected/updated (empty list if none)
+        Called with a short list of decoded signals (your app already buffers).
+        We:
+          1) ingest detections -> update mate likelihoods
+          2) form candidates from strong components + current observation expanded with suspected mates
+          3) identify/upsert vehicles
         """
         if not signal_buffer:
             return []
 
-        # Group signals by TPMS ID
-        signals_by_id = {}
-        for signal in signal_buffer:
-            tpms_id = signal.get('tpms_id')
-            if tpms_id:
-                if tpms_id not in signals_by_id:
-                    signals_by_id[tpms_id] = []
-                signals_by_id[tpms_id].append(signal)
+        # (1) update mate graph
+        window_ts = self._ingest_signal_buffer(signal_buffer)
 
-        # Get unique TPMS IDs from this batch
-        tpms_ids = list(signals_by_id.keys())
+        # (2) candidates
+        strong_components = self._components(self.link_score)
 
-        if len(tpms_ids) == 0:
-            return []
+        observed = self._observed_ids(window_ts)
+        observed_expanded = self._expand_with_suspected_mates(observed)
 
-        vehicle_ids = []
+        # record for debugging
+        if observed:
+            self.recent_windows.append((window_ts, frozenset(observed)))
 
-        # If we have 4 sensors detected close together, it's likely one vehicle
-        if len(tpms_ids) == 4:
-            # Check if these 4 sensors form a known vehicle
-            vehicle_id = self.identify_vehicle(tpms_ids)
+        candidates: List[List[str]] = []
+        candidates.extend(strong_components)
+        if observed_expanded:
+            candidates.append(observed_expanded)
+
+        # de-dupe candidates by set
+        uniq = []
+        seen_sets = set()
+        for c in candidates:
+            cset = tuple(sorted(set(c)))
+            if cset not in seen_sets:
+                seen_sets.add(cset)
+                uniq.append(list(cset))
+        candidates = uniq
+
+        vehicle_ids: List[int] = []
+        self.clusters = {}
+
+        # optional location passthrough
+        lat = next((s.get("latitude") for s in signal_buffer if s.get("latitude") is not None), None)
+        lon = next((s.get("longitude") for s in signal_buffer if s.get("longitude") is not None), None)
+        location = (lat, lon) if (lat is not None and lon is not None) else None
+
+        for idx, ids in enumerate(candidates):
+            if len(ids) < self.min_vehicle_size:
+                continue
+            if len(ids) > self.max_vehicle_size:
+                continue
+
+            stable = self._is_group_stable(ids)
+            vehicle_id = self.identify_vehicle(ids)
 
             if vehicle_id is None:
-                # New vehicle - create it
-                timestamp = signal_buffer[0]['timestamp']
-                vehicle_id = self.db.upsert_vehicle(tpms_ids, timestamp)
-                print(f"🚗 New vehicle detected: ID={vehicle_id}, sensors={tpms_ids}", flush=True)
+                # only create new vehicles from stable groups
+                if not stable:
+                    continue
+                vehicle_id = self.db.upsert_vehicle(ids, window_ts, location=location)
+                print(f"🚗 New vehicle (stable mates): ID={vehicle_id}, sensors={ids}", flush=True)
             else:
-                # Known vehicle - update it
-                timestamp = signal_buffer[0]['timestamp']
-                self.db.upsert_vehicle(tpms_ids, timestamp)
-                print(f"🚗 Known vehicle re-detected: ID={vehicle_id}, sensors={tpms_ids}", flush=True)
+                self.db.upsert_vehicle(ids, window_ts, location=location)
+                # print(f"🚗 Known vehicle: ID={vehicle_id}, sensors={ids}", flush=True)
 
             vehicle_ids.append(vehicle_id)
-            self.update_vehicle_profile(vehicle_id, signal_buffer)
+            self.update_vehicle_profile(vehicle_id, ids, window_ts, signal_buffer)
+            self.clusters[idx] = ids
 
-        # Also try clustering if we have 2-3 sensors (partial vehicle detection)
-        elif len(tpms_ids) >= 2:
-            # Format data properly for clustering
-            sensor_data_for_clustering = []
-            for tpms_id, signals in signals_by_id.items():
-                # Use the most recent signal for each sensor
-                latest_signal = signals[-1]
-                sensor_data_for_clustering.append({
-                    'id': tpms_id,
-                    'timestamp': latest_signal['timestamp'],
-                    'signal_strength': latest_signal['signal_strength'],
-                    'frequency': latest_signal['frequency'],
-                    'snr': latest_signal.get('snr', 0)
-                })
+        return sorted(set(vehicle_ids))
 
-            # Cluster the sensors
-            clusters = self.cluster_sensors(sensor_data_for_clustering)
+    # -----------------------------
+    # Matching (unchanged-ish)
+    # -----------------------------
 
-            # Process each cluster
-            for cluster_id, sensor_ids in clusters.items():
-                if len(sensor_ids) >= 3:  # At least 3 sensors
-                    vehicle_id = self.identify_vehicle(sensor_ids)
-
-                    if vehicle_id is None:
-                        timestamp = signal_buffer[0]['timestamp']
-                        vehicle_id = self.db.upsert_vehicle(sensor_ids, timestamp)
-                        print(f"🚗 Clustered vehicle detected: ID={vehicle_id}, sensors={sensor_ids}", flush=True)
-                    else:
-                        timestamp = signal_buffer[0]['timestamp']
-                        self.db.upsert_vehicle(sensor_ids, timestamp)
-                        print(f"🚗 Known vehicle re-detected: ID={vehicle_id}, sensors={sensor_ids}", flush=True)
-
-                    vehicle_ids.append(vehicle_id)
-                    self.update_vehicle_profile(vehicle_id, signal_buffer)
-
-        # CRITICAL FIX: Always return a list, even if empty
-        return vehicle_ids
-
-    def add_signal(self, signal: SignalCharacteristics):
-        """Add a signal to the history"""
-        self.signal_history.append(signal)
-
-        # Keep only recent signals (last 1000)
-        if len(self.signal_history) > 1000:
-            self.signal_history = self.signal_history[-1000:]
-
-    def cluster_sensors(self, sensor_data: List[Dict]) -> Dict[int, List[str]]:
-        """
-        Cluster TPMS sensors by vehicle using DBSCAN
-
-        Args:
-            sensor_data: List of sensor readings with timestamps and signal characteristics
-
-        Returns:
-            Dictionary mapping cluster_id to list of sensor IDs
-        """
-        if len(sensor_data) < self.min_samples:
-            return {}
-
-        # Extract features for clustering
-        features = []
-        sensor_ids = []
-
-        for sensor in sensor_data:
-            # Features: time_of_day, signal_strength, frequency_offset, etc.
-            features.append([
-                sensor.get('timestamp', 0) % 86400,  # Time of day in seconds
-                sensor.get('signal_strength', 0),
-                sensor.get('frequency', 0),
-                sensor.get('snr', 0),
-            ])
-            sensor_ids.append(sensor.get('id', ''))
-
-        features = np.array(features)
-
-        # Normalize features
-        features_scaled = self.scaler.fit_transform(features)
-
-        # Perform DBSCAN clustering
-        clustering = DBSCAN(eps=self.eps, min_samples=self.min_samples)
-        labels = clustering.fit_predict(features_scaled)
-
-        # Group sensors by cluster
-        clusters = defaultdict(list)
-        for sensor_id, label in zip(sensor_ids, labels):
-            if label != -1:  # -1 is noise in DBSCAN
-                clusters[label].append(sensor_id)
-
-        self.clusters = dict(clusters)
-        return self.clusters
+    def _refresh_vehicle_cache(self):
+        now = time.time()
+        if now - self._vehicle_cache_ts > self._vehicle_cache_ttl:
+            self._vehicle_cache = self.db.get_all_vehicles(min_encounters=1)
+            self._vehicle_cache_ts = now
 
     def identify_vehicle(self, sensor_ids: List[str]) -> Optional[int]:
         """
-        Identify which vehicle a set of sensors belongs to by checking database
-
-        Args:
-            sensor_ids: List of TPMS sensor IDs
-
-        Returns:
-            Vehicle ID from database or None if no match
+        Match sensors to an existing vehicle using Jaccard score.
         """
         if not sensor_ids:
             return None
 
-        # Query database for vehicles with matching sensors
-        all_vehicles = self.db.get_all_vehicles()
+        self._refresh_vehicle_cache()
 
-        best_match = None
-        best_score = 0
+        input_sensors = set(sensor_ids)
+        best_id = None
+        best_score = 0.0
 
-        for vehicle in all_vehicles:
-            vehicle_sensors = set(vehicle.get('tpms_ids', []))
-            input_sensors = set(sensor_ids)
+        for v in self._vehicle_cache:
+            v_sensors = set(v.get("tpms_ids", []))
+            if not v_sensors:
+                continue
 
-            # Calculate overlap
-            overlap = len(vehicle_sensors & input_sensors)
+            overlap = len(v_sensors & input_sensors)
+            if overlap < 2:
+                continue
 
-            # Score based on overlap with input sensors
-            if len(input_sensors) > 0:
-                score = overlap / len(input_sensors)
+            union = len(v_sensors | input_sensors)
+            score = overlap / union
 
-                # Require at least 50% match
-                if score > best_score and score >= 0.5:
-                    best_score = score
-                    best_match = vehicle['id']
+            if score > best_score and score >= 0.35:
+                best_score = score
+                best_id = v["id"]
 
-        return best_match
+        return best_id
 
-    def get_vehicle_profile(self, cluster_id: int) -> Optional[Dict]:
-        """Get the profile for a vehicle cluster"""
-        return self.vehicle_profiles.get(cluster_id)
+    # -----------------------------
+    # Profiles / stats (keep your old behavior)
+    # -----------------------------
 
-    def update_vehicle_profile(self, cluster_id: int, sensor_data: List[Dict]):
-        """Update vehicle profile with new sensor data"""
-        if cluster_id not in self.vehicle_profiles:
-            self.vehicle_profiles[cluster_id] = {
-                'sensor_ids': [],
-                'first_seen': time.time(),
-                'last_seen': time.time(),
-                'detection_count': 0,
-                'avg_signal_strength': 0,
-                'typical_frequency': 0,
+    def update_vehicle_profile(self, vehicle_id: int, sensor_ids: List[str], ts: float, signal_buffer: List[Dict]):
+        if vehicle_id not in self.vehicle_profiles:
+            self.vehicle_profiles[vehicle_id] = {
+                "sensor_ids": [],
+                "first_seen": ts,
+                "last_seen": ts,
+                "detection_count": 0,
+                "avg_signal_strength": None,
+                "avg_snr": None,
+                "typical_frequency": None,
             }
 
-        profile = self.vehicle_profiles[cluster_id]
+        p = self.vehicle_profiles[vehicle_id]
+        p["last_seen"] = max(p["last_seen"], ts)
+        p["first_seen"] = min(p["first_seen"], ts)
+        p["detection_count"] += 1
 
-        # Update profile
-        profile['last_seen'] = time.time()
-        profile['detection_count'] += 1
+        for sid in sensor_ids:
+            if sid not in p["sensor_ids"]:
+                p["sensor_ids"].append(sid)
 
-        # Update sensor IDs
-        for sensor in sensor_data:
-            sensor_id = sensor.get('id', '')
-            if sensor_id and sensor_id not in profile['sensor_ids']:
-                profile['sensor_ids'].append(sensor_id)
+        rel = [s for s in signal_buffer if s.get("tpms_id") in set(sensor_ids)]
+        if rel:
+            vals_rssi = [s.get("signal_strength") for s in rel if s.get("signal_strength") is not None]
+            vals_snr = [s.get("snr") for s in rel if s.get("snr") is not None]
+            vals_f = [s.get("frequency") for s in rel if s.get("frequency") is not None]
 
-        # Update statistics
-        if sensor_data:
-            profile['avg_signal_strength'] = np.mean([
-                s.get('signal_strength', 0) for s in sensor_data
-            ])
-            profile['typical_frequency'] = np.mean([
-                s.get('frequency', 0) for s in sensor_data
-            ])
+            p["avg_signal_strength"] = float(np.mean(vals_rssi)) if vals_rssi else p["avg_signal_strength"]
+            p["avg_snr"] = float(np.mean(vals_snr)) if vals_snr else p["avg_snr"]
+            p["typical_frequency"] = float(np.mean(vals_f)) if vals_f else p["typical_frequency"]
 
     def get_statistics(self) -> Dict:
-        """Get clustering statistics"""
         return {
-            'total_signals': len(self.signal_history),
-            'num_clusters': len(self.clusters),
-            'num_vehicles': len(self.vehicle_profiles),
-            'signals_per_cluster': {
-                cid: len(sensors) for cid, sensors in self.clusters.items()
-            }
+            "pair_edges": len(self.pair_scores),
+            "num_components_strong": len(self._components(self.link_score)),
+            "num_vehicle_profiles": len(self.vehicle_profiles),
+            "clusters_last_run": {k: len(v) for k, v in self.clusters.items()},
         }
-
-    def find_patterns(self, days: int = 30) -> Dict:
-        """
-        Find patterns in vehicle encounters
-
-        Args:
-            days: Number of days to analyze
-
-        Returns:
-            Dictionary with pattern analysis
-        """
-        from datetime import datetime, timedelta
-
-        cutoff_time = datetime.now().timestamp() - (days * 86400)
-
-        # Get vehicles from database
-        if not hasattr(self, 'db') or self.db is None:
-            return {
-                'frequent_vehicles': [],
-                'time_patterns': {},
-                'location_clusters': {}
-            }
-
-        vehicles = self.db.get_all_vehicles(min_encounters=2)
-
-        # Filter by time window
-        frequent_vehicles = []
-        for vehicle in vehicles:
-            if vehicle['last_seen'] >= cutoff_time:
-                history = self.db.get_vehicle_history(vehicle['id'])
-
-                # Count encounters in time window
-                recent_encounters = [
-                    e for e in history['encounters']
-                    if e['timestamp'] >= cutoff_time
-                ]
-
-                if len(recent_encounters) >= 3:
-                    frequent_vehicles.append({
-                        'id': vehicle['id'],
-                        'nickname': vehicle.get('nickname', f"Vehicle {vehicle['id']}"),
-                        'encounter_count': len(recent_encounters),
-                        'first_seen': datetime.fromtimestamp(vehicle['first_seen']),
-                        'last_seen': datetime.fromtimestamp(vehicle['last_seen']),
-                        'tpms_ids': vehicle['tpms_ids']
-                    })
-
-        # Sort by encounter count
-        frequent_vehicles.sort(key=lambda x: x['encounter_count'], reverse=True)
-
-        return {
-            'frequent_vehicles': frequent_vehicles,
-            'time_patterns': self._analyze_time_patterns(frequent_vehicles),
-            'location_clusters': {}
-        }
-
-    def _analyze_time_patterns(self, vehicles: List[Dict]) -> Dict:
-        """Analyze temporal patterns in vehicle encounters"""
-        patterns = {
-            'peak_hours': [],
-            'peak_days': [],
-            'regular_commuters': []
-        }
-
-        if not vehicles:
-            return patterns
-
-        # Analyze hour-of-day patterns
-        hour_counts = {}
-        for vehicle in vehicles:
-            if hasattr(self, 'db') and self.db:
-                history = self.db.get_vehicle_history(vehicle['id'])
-                for encounter in history['encounters']:
-                    from datetime import datetime
-                    dt = datetime.fromtimestamp(encounter['timestamp'])
-                    hour = dt.hour
-                    hour_counts[hour] = hour_counts.get(hour, 0) + 1
-
-        if hour_counts:
-            # Find peak hours
-            sorted_hours = sorted(hour_counts.items(), key=lambda x: x[1], reverse=True)
-            patterns['peak_hours'] = [
-                {'hour': h, 'count': c} for h, c in sorted_hours[:3]
-            ]
-
-        return patterns
-
-    def predict_next_encounter(self, vehicle_id: int) -> Dict:
-        """
-        Predict next encounter time for a vehicle
-
-        Args:
-            vehicle_id: Vehicle ID
-
-        Returns:
-            Dictionary with prediction details
-        """
-        from datetime import datetime, timedelta
-
-        if not hasattr(self, 'db') or self.db is None:
-            return {
-                'prediction': 'insufficient_data',
-                'confidence': 0.0
-            }
-
-        history = self.db.get_vehicle_history(vehicle_id)
-        encounters = history['encounters']
-
-        if len(encounters) < 3:
-            return {
-                'prediction': 'insufficient_data',
-                'confidence': 0.0
-            }
-
-        # Calculate average time between encounters
-        timestamps = sorted([e['timestamp'] for e in encounters])
-        intervals = [timestamps[i+1] - timestamps[i] for i in range(len(timestamps)-1)]
-
-        if not intervals:
-            return {
-                'prediction': 'insufficient_data',
-                'confidence': 0.0
-            }
-
-        avg_interval = sum(intervals) / len(intervals)
-        std_interval = (sum((x - avg_interval)**2 for x in intervals) / len(intervals)) ** 0.5
-
-        # Predict next encounter
-        last_encounter = timestamps[-1]
-        predicted_time = last_encounter + avg_interval
-        predicted_datetime = datetime.fromtimestamp(predicted_time)
-
-        # Calculate confidence based on consistency
-        if std_interval > 0:
-            coefficient_of_variation = std_interval / avg_interval
-            confidence = max(0.0, min(1.0, 1.0 - coefficient_of_variation))
-        else:
-            confidence = 0.9
-
-        return {
-            'prediction': 'estimated',
-            'predicted_datetime': predicted_datetime,
-            'predicted_timestamp': predicted_time,
-            'confidence': confidence,
-            'avg_interval_hours': avg_interval / 3600,
-            'last_encounter': datetime.fromtimestamp(last_encounter)
-        }
-
-
+    
 class AdaptiveLearningEngine:
     """
     Adaptive learning engine for TPMS signal detection
@@ -527,7 +561,233 @@ def create_learning_engine() -> AdaptiveLearningEngine:
     """Factory function to create learning engine"""
     return AdaptiveLearningEngine(learning_rate=0.1)
 
-def create_clustering_engine() -> VehicleClusteringEngine:
-    """Factory function to create clustering engine"""
-    return VehicleClusteringEngine(min_samples=3, eps=0.5)
+def create_clustering_engine(db) -> VehicleClusteringEngine:
+    return VehicleClusteringEngine(
+        db=db,
+        base_mate_window_s=1.0,
+        relaxed_mate_window_s=3.0,
+        observation_window_s=1.0,
+        suspect_score=2.0,
+        link_score=4.0,
+        decay_halflife_s=180.0,
+        max_vehicle_size=6,   # I’d start tighter than 8
+        min_vehicle_size=3,
+    )
+
+
+
+
+# ======================================================================================
+# Online Pattern Learning (mixed real-time + batch-friendly)
+# ======================================================================================
+
+from dataclasses import dataclass
+import numpy as np
+import math
+from typing import DefaultDict
+
+@dataclass
+class _EWMA:
+    alpha: float
+    mean: float = 0.0
+    var: float = 0.0
+    n: int = 0
+    last_ts: float = 0.0
+
+    def update(self, x: float, ts: float):
+        if x is None or (isinstance(x, float) and np.isnan(x)):
+            return
+        x = float(x)
+        if self.n == 0:
+            self.mean = x
+            self.var = 0.0
+            self.n = 1
+            self.last_ts = float(ts)
+            return
+
+        # Exponential moving stats
+        delta = x - self.mean
+        self.mean += self.alpha * delta
+        # EW variance update (approx; good enough for anomaly scoring)
+        self.var = (1 - self.alpha) * (self.var + self.alpha * delta * delta)
+        self.n += 1
+        self.last_ts = float(ts)
+
+    def std(self) -> float:
+        return float(np.sqrt(max(self.var, 1e-9)))
+
+class OnlinePatternLearner:
+    """Lightweight online learner for relationships across time/location/sensor/value.
+
+    What it learns (incrementally, per incoming signal):
+      - Per-sensor EWMA mean/std for pressure & temperature
+      - Per-sensor *hour-of-day* EWMA mean/std (captures commute / daily cycles)
+      - Per-location-cell EWMA mean/std (captures 'hotspots' like parking lots)
+
+    What it can do:
+      - Predict expected pressure/temp for a sensor at a given time/location
+      - Compute anomaly z-scores ("this reading is weird for this sensor/time/place")
+    """
+
+    def __init__(self, alpha_sensor: float = 0.03, alpha_context: float = 0.05,
+                 cell_deg: float = 0.01):
+        self.alpha_sensor = float(alpha_sensor)
+        self.alpha_context = float(alpha_context)
+        self.cell_deg = float(cell_deg)
+
+        # sensor_id -> {'p': _EWMA, 't': _EWMA}
+        self.sensor_stats: Dict[str, Dict[str, _EWMA]] = {}
+
+        # (sensor_id, hour) -> {'p': _EWMA, 't': _EWMA}
+        self.sensor_hour_stats: Dict[Tuple[str, int], Dict[str, _EWMA]] = {}
+
+        # (cell_lat, cell_lon) -> {'p': _EWMA, 't': _EWMA}
+        self.cell_stats: Dict[Tuple[int, int], Dict[str, _EWMA]] = {}
+
+        self.last_rowid: int = 0
+        self.total_updates: int = 0
+
+    def _cell_key(self, lat: Optional[float], lon: Optional[float]) -> Optional[Tuple[int, int]]:
+        if lat is None or lon is None:
+            return None
+        try:
+            lat_f = float(lat); lon_f = float(lon)
+        except Exception:
+            return None
+        if np.isnan(lat_f) or np.isnan(lon_f):
+            return None
+        return (int(np.floor(lat_f / self.cell_deg)), int(np.floor(lon_f / self.cell_deg)))
+
+    def update_rows(self, rows: List[Dict[str, Any]]):
+        """Update model from a list of DB rows produced by get_signals_since_rowid."""
+        for r in rows:
+            try:
+                rowid = int(r.get("rowid", 0))
+                sensor = str(r.get("tpms_id", "") or "")
+                ts = float(r.get("timestamp", 0.0) or 0.0)
+                p = r.get("pressure_psi", None)
+                t = r.get("temperature_c", None)
+                lat = r.get("latitude", None)
+                lon = r.get("longitude", None)
+            except Exception:
+                continue
+
+            if not sensor:
+                continue
+
+            self.last_rowid = max(self.last_rowid, rowid)
+            self.total_updates += 1
+
+            # --- per-sensor stats ---
+            if sensor not in self.sensor_stats:
+                self.sensor_stats[sensor] = {
+                    "p": _EWMA(self.alpha_sensor),
+                    "t": _EWMA(self.alpha_sensor),
+                }
+            self.sensor_stats[sensor]["p"].update(p, ts)
+            self.sensor_stats[sensor]["t"].update(t, ts)
+
+            # --- per-sensor-hour stats ---
+            try:
+                hour = int(datetime.fromtimestamp(ts).hour)
+            except Exception:
+                hour = 0
+            hk = (sensor, hour)
+            if hk not in self.sensor_hour_stats:
+                self.sensor_hour_stats[hk] = {
+                    "p": _EWMA(self.alpha_context),
+                    "t": _EWMA(self.alpha_context),
+                }
+            self.sensor_hour_stats[hk]["p"].update(p, ts)
+            self.sensor_hour_stats[hk]["t"].update(t, ts)
+
+            # --- per-location-cell stats ---
+            ck = self._cell_key(lat, lon)
+            if ck is not None:
+                if ck not in self.cell_stats:
+                    self.cell_stats[ck] = {
+                        "p": _EWMA(self.alpha_context),
+                        "t": _EWMA(self.alpha_context),
+                    }
+                self.cell_stats[ck]["p"].update(p, ts)
+                self.cell_stats[ck]["t"].update(t, ts)
+
+    def predict(self, sensor_id: str, ts: Optional[float] = None,
+                lat: Optional[float] = None, lon: Optional[float] = None) -> Dict[str, Any]:
+        """Return predicted (pressure,temp) + simple confidence numbers."""
+        import time as _time
+        ts = float(ts if ts is not None else _time.time())
+
+        # Base: per-sensor
+        base = self.sensor_stats.get(sensor_id)
+        if not base or base["p"].n == 0:
+            return {"ok": False, "reason": "No learned history for this sensor yet."}
+
+        # Context: hour-of-day
+        hour = int(datetime.fromtimestamp(ts).hour)
+        hk = (sensor_id, hour)
+        hour_stats = self.sensor_hour_stats.get(hk)
+
+        # Context: location cell
+        ck = self._cell_key(lat, lon)
+        cell_stats = self.cell_stats.get(ck) if ck is not None else None
+
+        # Weighted blending
+        def blend(key: str):
+            parts = []
+            weights = []
+
+            # sensor baseline
+            parts.append(base[key].mean); weights.append(0.65)
+
+            if hour_stats and hour_stats[key].n >= 3:
+                parts.append(hour_stats[key].mean); weights.append(0.25)
+
+            if cell_stats and cell_stats[key].n >= 5:
+                parts.append(cell_stats[key].mean); weights.append(0.10)
+
+            wsum = float(np.sum(weights))
+            est = float(np.dot(parts, weights) / wsum)
+            # confidence: more samples + lower std is higher confidence (heuristic)
+            std = base[key].std()
+            conf = float(np.clip((math.log10(base[key].n + 1) / (1 + std)), 0.0, 1.0))
+            return est, std, conf
+
+        p_est, p_std, p_conf = blend("p")
+        t_est, t_std, t_conf = blend("t")
+
+        return {
+            "ok": True,
+            "pressure_pred": p_est,
+            "pressure_std": p_std,
+            "pressure_conf": p_conf,
+            "temp_pred": t_est,
+            "temp_std": t_std,
+            "temp_conf": t_conf,
+            "hour": hour,
+            "cell": ck,
+        }
+
+    def anomaly_scores(self, sensor_id: str, pressure: Optional[float], temp: Optional[float],
+                       ts: Optional[float] = None) -> Dict[str, Any]:
+        """Return z-scores vs learned baseline."""
+        base = self.sensor_stats.get(sensor_id)
+        if not base or base["p"].n < 5:
+            return {"ok": False, "reason": "Not enough data for anomaly scoring."}
+
+        z_p = None
+        z_t = None
+        try:
+            if pressure is not None and not (isinstance(pressure, float) and np.isnan(pressure)):
+                z_p = (float(pressure) - base["p"].mean) / base["p"].std()
+        except Exception:
+            pass
+
+        try:
+            if temp is not None and not (isinstance(temp, float) and np.isnan(temp)):
+                z_t = (float(temp) - base["t"].mean) / base["t"].std()
+        except Exception:
+            pass
+
+        return {"ok": True, "z_pressure": z_p, "z_temp": z_t, "n": base["p"].n}
 

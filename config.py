@@ -12,14 +12,14 @@ class Config:
     HISTOGRAM_BINS: int = 50  # Number of bins for signal histogram
     DEFAULT_FREQUENCY: int = 315_000_000  # Default frequency
     BANDWIDTH: int = 1_750_000  # 1.75 MHz bandwidth
-    DEFAULT_GAIN: int = 32  # Default LNA gain
+    DEFAULT_GAIN: int = 24  # Default LNA gain
 
     # HackRF Settings - matching Maurader baseband
     SAMPLE_RATE: int = 2_457_600  # 2.4576 MHz - exact Maurader rate
     CENTER_FREQ: int = 315_000_000  # 315 MHz default
     
     # Gain Settings (conservative defaults)
-    LNA_GAIN: int = 32  # 0-40 dB (start moderate)
+    LNA_GAIN: int = 36  # 0-40 dB (start moderate)
     VGA_GAIN: int = 30  # 0-62 dB (start moderate)
     ENABLE_AMP: bool = True  # RF amp on
     
@@ -73,11 +73,11 @@ class Config:
     # Database Settings
     DB_PATH: str = "tpms_tracker.db"  # SQLite database path
     DB_BACKUP_ENABLED: bool = True
-    DB_BACKUP_INTERVAL: int = 3600  # seconds (1 hour)
+    DB_BACKUP_INTERVAL: int = 1800  # seconds (.5 hour)
     
     # Logging
-    LOG_ENABLED: bool = True
-    LOG_UNKNOWN_SIGNALS: bool = True
+    LOG_ENABLED: bool = False
+    LOG_UNKNOWN_SIGNALS: bool = False
     LOG_RAW_SAMPLES: bool = False  # Warning: creates large files
     LOG_DIR: str = "logs"
     LOG_FILE: str = "tpms_scanner.log"
@@ -86,10 +86,10 @@ class Config:
     
     # Performance
     USE_MULTIPROCESSING: bool = True
-    MAX_WORKERS: int = 2  # CPU cores for processing
+    MAX_WORKERS: int = 4  # CPU cores for processing
     
     # UI Settings
-    REFRESH_RATE: float = 1.0  # seconds
+    REFRESH_RATE: float = 30.0  # seconds
     PLOT_HISTORY_SECONDS: int = 60  # seconds of history to plot
     ENABLE_ANIMATIONS: bool = True
     
@@ -106,7 +106,7 @@ class Config:
     ESP32_TRIGGER_DURATION: float = 0.5  # seconds
     
     # Alert Settings
-    ENABLE_ALERTS: bool = False
+    ENABLE_ALERTS: bool = True
     ALERT_ON_NEW_SENSOR: bool = True
     ALERT_SOUND: bool = False
     

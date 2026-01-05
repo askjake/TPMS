@@ -1,7 +1,7 @@
 import sqlite3
 import json
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 import numpy as np
 import pandas as pd  # ADDED
 
@@ -11,19 +11,55 @@ class TPMSDatabase:
         self.db_path = db_path
         self.init_database()
 
+    def _connect(self, read_only: bool = False) -> sqlite3.Connection:
+        """
+        Centralized SQLite connection helper.
+
+        - Enables WAL + reasonable pragmas for better concurrency and reduced corruption risk.
+        - Uses busy_timeout so readers don't instantly fail while scanner writes.
+        """
+        if read_only:
+            # Best-effort read-only mode (works on newer SQLite). Falls back to normal connect.
+            try:
+                conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, timeout=30, check_same_thread=False)
+            except Exception:
+                conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
+        else:
+            conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
+
+        conn.row_factory = sqlite3.Row
+
+        try:
+            conn.execute("PRAGMA busy_timeout=5000;")
+            conn.execute("PRAGMA foreign_keys=ON;")
+            # These pragmas materially reduce the chance of corruption on abrupt shutdown
+            # and improve write/read concurrency for the Streamlit UI.
+            if not read_only:
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA synchronous=NORMAL;")
+                conn.execute("PRAGMA temp_store=MEMORY;")
+        except Exception:
+            # If a particular SQLite build rejects a pragma, don't kill the app.
+            pass
+
+        return conn
+
     def init_database(self):
         """Initialize database schema"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cursor = conn.cursor()
 
         # Raw TPMS signals
         cursor.execute('''
                        CREATE TABLE IF NOT EXISTS tpms_signals
+
                        (
                            id              INTEGER PRIMARY KEY AUTOINCREMENT,
                            tpms_id         TEXT NOT NULL,
+
                            timestamp       REAL NOT NULL,
                            latitude        REAL,
+
                            longitude       REAL,
                            frequency       REAL,
                            signal_strength REAL,
@@ -95,7 +131,7 @@ class TPMSDatabase:
 
     def insert_signal(self, signal_data: Dict) -> int:
         """Insert a raw TPMS signal"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cursor = conn.cursor()
 
         cursor.execute('''
@@ -126,7 +162,7 @@ class TPMSDatabase:
 
     def get_recent_signals(self, time_window: int = 30) -> List[Dict]:
         """Get signals from the last N seconds"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cursor = conn.cursor()
 
         cutoff_time = datetime.now().timestamp() - time_window
@@ -160,7 +196,7 @@ class TPMSDatabase:
                 GROUP BY tpms_id
                 ORDER BY last_seen DESC \
                 """
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         result = pd.read_sql_query(query, conn)
         conn.close()
         return result
@@ -173,7 +209,7 @@ class TPMSDatabase:
                 WHERE tpms_id = ?
                 ORDER BY timestamp DESC \
                 """
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         result = pd.read_sql_query(query, conn, params=(tpms_id,))
         conn.close()
         return result
@@ -197,7 +233,7 @@ class TPMSDatabase:
                 FROM tpms_signals
                 WHERE tpms_id = ? \
                 """
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         conn.row_factory = sqlite3.Row
         result = conn.execute(query, (tpms_id,)).fetchone()
         conn.close()
@@ -215,14 +251,14 @@ class TPMSDatabase:
                 GROUP BY ts.tpms_id
                 ORDER BY last_seen DESC \
                 """
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         result = pd.read_sql_query(query, conn)
         conn.close()
         return result
 
     def assign_sensor_to_vehicle(self, tpms_id, vehicle_id):
         """Manually assign a sensor to a vehicle"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
 
         # Get current tpms_ids for vehicle
         vehicle = conn.execute(
@@ -251,7 +287,7 @@ class TPMSDatabase:
         """Create or update a vehicle cluster"""
         vehicle_hash = self._generate_vehicle_hash(tpms_ids)
 
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cursor = conn.cursor()
 
         # Check if vehicle exists
@@ -280,6 +316,7 @@ class TPMSDatabase:
                        VALUES (?, ?, ?, ?)
                        ''', (vehicle_id, timestamp,
                              location[0] if location else None,
+
                              location[1] if location else None))
 
         conn.commit()
@@ -288,7 +325,7 @@ class TPMSDatabase:
 
     def get_vehicle_history(self, vehicle_id: int) -> Dict:
         """Get complete history for a vehicle"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cursor = conn.cursor()
 
         # Vehicle info
@@ -330,7 +367,7 @@ class TPMSDatabase:
 
     def get_all_vehicles(self, min_encounters: int = 1) -> List[Dict]:
         """Get all known vehicles"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cursor = conn.cursor()
 
         cursor.execute('''
@@ -352,7 +389,7 @@ class TPMSDatabase:
 
     def analyze_maintenance(self, vehicle_id: int, days: int = 30) -> Dict:
         """Analyze tire maintenance for a vehicle"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cursor = conn.cursor()
 
         # Get TPMS IDs for this vehicle
@@ -422,9 +459,127 @@ class TPMSDatabase:
 
     def update_vehicle_nickname(self, vehicle_id: int, nickname: str):
         """Set a friendly name for a vehicle"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cursor = conn.cursor()
         cursor.execute('UPDATE vehicles SET nickname = ? WHERE id = ?',
                        (nickname, vehicle_id))
         conn.commit()
         conn.close()
+
+
+    # -----------------------------
+    # Fast, UI-friendly helpers
+    # -----------------------------
+
+    def get_realtime_stats(self, now_ts: Optional[float] = None,
+                           minute_window_s: int = 60,
+                           hour_window_s: int = 3600) -> Dict[str, Any]:
+        """Return lightweight stats for the sidebar (fast, indexed queries)."""
+        import time as _time
+        now_ts = float(now_ts if now_ts is not None else _time.time())
+        ts_min = now_ts - float(minute_window_s)
+        ts_hr = now_ts - float(hour_window_s)
+
+        conn = self._connect(read_only=True)
+        cur = conn.cursor()
+
+        cur.execute("SELECT COUNT(*) AS n FROM tpms_signals WHERE timestamp >= ?", (ts_min,))
+        n_last_min = int(cur.fetchone()[0] or 0)
+
+        cur.execute("SELECT COUNT(*) AS n FROM tpms_signals WHERE timestamp >= ?", (ts_hr,))
+        n_last_hour = int(cur.fetchone()[0] or 0)
+
+        cur.execute("SELECT COUNT(DISTINCT tpms_id) AS n FROM tpms_signals WHERE timestamp >= ?", (ts_hr,))
+        unique_sensors_last_hour = int(cur.fetchone()[0] or 0)
+
+        repeats_last_hour = max(0, n_last_hour - unique_sensors_last_hour)
+        rate_per_hour_last_min = n_last_min * 60
+
+        # Best-effort counts that should be fast even on large DBs
+        try:
+            cur.execute("SELECT COUNT(*) FROM vehicles")
+            known_vehicles = int(cur.fetchone()[0] or 0)
+        except Exception:
+            known_vehicles = 0
+
+        try:
+            cur.execute("SELECT COUNT(DISTINCT tpms_id) FROM tpms_signals")
+            known_sensors = int(cur.fetchone()[0] or 0)
+        except Exception:
+            known_sensors = 0
+
+        conn.close()
+
+        return {
+            "now_ts": now_ts,
+            "n_last_min": n_last_min,
+            "n_last_hour": n_last_hour,
+            "signals_last_hour": n_last_hour,
+            "unique_sensors_last_hour": unique_sensors_last_hour,
+            "repeats_last_hour": repeats_last_hour,
+            "repeated_signals_last_hour": repeats_last_hour,
+            "rate_per_hour_last_min": rate_per_hour_last_min,
+            "known_vehicles": known_vehicles,
+            "known_sensors": known_sensors,
+        }
+
+    def get_signals_since_rowid(self, last_rowid: int = 0, limit: int = 5000) -> List[Dict[str, Any]]:
+        """Fetch signals incrementally for online learning (ordered by rowid)."""
+        conn = self._connect(read_only=True)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                rowid,
+                tpms_id,
+                protocol,
+                timestamp,
+                frequency,
+                pressure_psi,
+                temperature_c,
+                battery_low,
+                signal_strength,
+                snr,
+                latitude,
+                longitude,
+                raw_payload
+            FROM tpms_signals
+            WHERE rowid > ?
+            ORDER BY rowid ASC
+            LIMIT ?
+            """,
+            (int(last_rowid), int(limit)),
+        )
+        rows = cur.fetchall()
+        conn.close()
+
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            # sqlite3.Row supports mapping-like access
+            out.append(dict(r))
+        return out
+
+    def ensure_performance_indexes(self) -> None:
+        """Create extra indexes that make dashboard queries fast."""
+        conn = self._connect()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tpms_signals_timestamp ON tpms_signals(timestamp)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tpms_signals_tpmsid ON tpms_signals(tpms_id)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tpms_signals_timestamp_tpmsid ON tpms_signals(timestamp, tpms_id)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tpms_signals_tpmsid_timestamp ON tpms_signals(tpms_id, timestamp)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_encounters_timestamp ON encounters(timestamp)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
