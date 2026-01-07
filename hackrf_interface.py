@@ -1,464 +1,451 @@
-import subprocess
-import numpy as np
-from typing import Optional, Callable
-import threading
+# hackrf_interface.py
+"""
+HackRF interface wrapper used by the Streamlit TPMS tracker.
+
+Key behavior:
+- Provides HackRFInterface.start(callback=None).
+  * If callback is provided: callback(iq_complex, rssi_dbm, freq_hz) is invoked for each RX chunk.
+  * If callback is None: a decode→DB pipeline is used (requires attach_pipeline(db, decoder)).
+- Exposes HackRFScanner and Scanner classes for backward compatibility with older app wiring.
+"""
+
+from __future__ import annotations
+
+import logging
 import time
-from queue import Queue
-from config import config
-import os
-import shutil
+import threading
+import queue
+from typing import Callable, Optional, Any
+
+import numpy as np
+
+# Import our wrapper
+try:
+    from hackrf_wrapper import HackRFDevice, is_available
+
+    HACKRF_AVAILABLE = is_available()
+except Exception as e:
+    logging.getLogger(__name__).error(f"Failed to import HackRF wrapper: {e}")
+    HACKRF_AVAILABLE = False
+    HackRFDevice = None  # type: ignore
+
+logger = logging.getLogger(__name__)
+
 
 class HackRFInterface:
+    """
+    Thin wrapper around HackRFDevice.
+
+    Notes:
+    - `frequency` is stored in Hz.
+    - `start()` is safe to call with no args if you previously called `attach_pipeline(db, decoder)`.
+    """
+
     def __init__(self):
-        self.process: Optional[subprocess.Popen] = None
-        self.current_frequency = config.FREQUENCIES[0]
-        self.current_gain = config.DEFAULT_GAIN
+        logger.info("HackRFInterface.__init__ called")
+
+        self.device = None
         self.is_running = False
-        self.is_hopping = False  # NEW: separate flag for hopping
-        self.data_queue = Queue(maxsize=1000)
-        self.callback: Optional[Callable] = None
-        
-        # Thread safety
-        self.restart_lock = threading.Lock()
-        self.restart_pending = False
-        
-        # Find hackrf_transfer
-        self.hackrf_transfer_path = self._find_hackrf_transfer()
-        
-        # Frequency hopping
-        self.frequency_hop_enabled = config.FREQUENCY_HOP_ENABLED
-        self.frequency_index = 0
-        self.last_hop_time = 0
-        self.hop_interval = config.FREQUENCY_HOP_INTERVAL
-        
-        # Signal metrics
-        self.signal_history = []
-        self.max_history_size = 100
-        self.frequency_stats = {freq: {'samples': 0, 'avg_strength': 0, 'detections': 0} 
-                               for freq in config.FREQUENCIES}
-        
-        # Auto-tuning parameters - DISABLED during frequency hopping
-        self.auto_tune_enabled = False
-        self.last_tune_time = 0
-        self.tune_interval = 60
+        self.callback: Optional[Callable[[np.ndarray, float, float], None]] = None
 
-    # Add to HackRFInterface class after __init__
+        # RF settings
+        self.frequency: float = 314.9e6
+        self.sample_rate: float = 2_457_600
+        self.lna_gain: int = 32
+        self.vga_gain: int = 40
 
-    def set_learning_engine(self, learning_engine):
-        """Set reference to learning engine for adaptive hopping"""
-        self.learning_engine = learning_engine
-        self.adaptive_hopping = True
+        # --- Optional decode→DB pipeline (used when start() is called with no callback) ---
+        self._pipeline_db: Any = None
+        self._pipeline_decoder: Any = None
+        self._pipeline_on_signal: Optional[Callable[[dict], None]] = None
+        self._pipeline_q: "queue.Queue[tuple[np.ndarray, float, float, float]]" = queue.Queue(maxsize=400)
+        self._pipeline_stop = threading.Event()
+        self._pipeline_thread: Optional[threading.Thread] = None
 
-    def _get_adaptive_hop_schedule(self):
-        """Calculate optimal frequency hopping schedule based on learning"""
-        if not hasattr(self, 'learning_engine') or not self.learning_engine:
-            # No learning engine, use default schedule
-            return [(freq, self.hop_interval) for freq in config.FREQUENCIES]
-    
-        # Get statistics for each frequency
-        schedule = []
-    
-        for freq in config.FREQUENCIES:
-            stats = self.frequency_stats.get(freq, {'samples': 0, 'detections': 0})
-        
-            # Calculate detection rate
-            if stats['samples'] > 100:
-                detection_rate = stats['detections'] / stats['samples']
+        if not HACKRF_AVAILABLE:
+            logger.warning("HackRF library not available - simulation mode suggested")
+            return
+
+        # Try to open device
+        try:
+            self.device = HackRFDevice()
+            if self.device.open():
+                logger.info("✅ HackRF device opened successfully")
+                self._configure_device()
             else:
-                detection_rate = 0.1  # Default for new frequencies
-        
-            # Get learned profile confidence
-            optimal_params = self.learning_engine.get_optimal_scan_parameters(freq)
-            profile_confidence = 0.5  # Default
-        
-            # Check if we have a learned profile
-            for key, profile in self.learning_engine.signal_profiles.items():
-                if abs(profile.frequency - freq) < 0.5:
-                    profile_confidence = profile.confidence
-                    break
-            
-            # Calculate dwell time based on detection rate and confidence
-            # Higher detection rate = more time
-            # Higher confidence = less time needed (we know what to look for)
-            base_time = self.hop_interval
-        
-            if detection_rate > 0.05:  # Active frequency
-                # Spend more time on productive frequencies
-                multiplier = 1.0 + (detection_rate * 2.0)
-                # But reduce if we're confident (know what we're looking for)
-                multiplier = multiplier * (1.0 - (profile_confidence * 0.3))
-                dwell_time = base_time * multiplier
-            elif stats['samples'] > 500 and detection_rate < 0.001:
-                # Dead frequency - skip or minimize time
-                dwell_time = base_time * 0.2  # Only 20% of normal time
-            else:
-                dwell_time = base_time
-        
-            # Clamp to reasonable range
-            dwell_time = max(5.0, min(60.0, dwell_time))
-        
-            schedule.append((freq, dwell_time))
-    
-        return schedule
+                logger.error("❌ Failed to open HackRF device")
+                self.device = None
+        except Exception as e:
+            logger.error(f"❌ Error initializing HackRF: {e}")
+            self.device = None
 
-    
-    def _find_hackrf_transfer(self):
-        """Find hackrf_transfer executable"""
-        path = shutil.which('hackrf_transfer')
-        if path:
-            print(f"✅ Found hackrf_transfer in PATH: {path}")
-            return 'hackrf_transfer'
-        
-        print("⚠️  hackrf_transfer not found, will try 'hackrf_transfer' command")
-        return 'hackrf_transfer'
-    
-    def start(self, frequency: float, callback: Callable):
-        """Start HackRF reception"""
-        with self.restart_lock:
-            if self.is_running:
-                self._stop_process_only()  # Only stop process, not threads
-            
-            self.current_frequency = frequency
-            self.callback = callback
-            self.is_running = True
-            self.is_hopping = self.frequency_hop_enabled  # Set hopping flag
-            self.last_hop_time = time.time()
-            
-            # Start on first frequency if hopping enabled
-            if self.frequency_hop_enabled:
-                self.frequency_index = config.FREQUENCIES.index(frequency) if frequency in config.FREQUENCIES else 0
-                self.current_frequency = config.FREQUENCIES[self.frequency_index]
-            
-            # Ensure gain is valid (must be multiple of 2)
-            self.current_gain = (self.current_gain // 2) * 2
-            
-            # Build command
-            cmd = [
-                self.hackrf_transfer_path,
-                '-r', '-',
-                '-f', str(int(self.current_frequency * 1e6)),
-                '-s', str(config.SAMPLE_RATE),
-                '-g', str(self.current_gain),
-                '-l', '32',
-                '-a', '1'
-            ]
-            
-            print(f"🚀 Starting HackRF on {self.current_frequency} MHz with gain {self.current_gain} dB")
-            if self.frequency_hop_enabled:
-                print(f"🔄 Frequency hopping enabled: {config.FREQUENCIES} (interval: {self.hop_interval}s)")
-            print(f"Command: {' '.join(cmd)}")
-            
-            try:
-                self.process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    bufsize=0
-                )
-                
-                # Check if process started successfully
-                time.sleep(0.5)
-                if self.process.poll() is not None:
-                    stderr = self.process.stderr.read().decode()
-                    print(f"❌ HackRF failed to start: {stderr}")
-                    return False
-                
-                # Start reading thread
-                self.read_thread = threading.Thread(target=self._read_samples, daemon=True)
-                self.read_thread.start()
-                
-                # Start frequency hopping thread (only once)
-                if self.frequency_hop_enabled and not hasattr(self, 'hop_thread_started'):
-                    self.hop_thread = threading.Thread(target=self._frequency_hopper, daemon=True)
-                    self.hop_thread.start()
-                    self.hop_thread_started = True
-                
-                # Don't start auto-tune if frequency hopping is enabled
-                if self.auto_tune_enabled and not self.frequency_hop_enabled:
-                    self.tune_thread = threading.Thread(target=self._auto_tune, daemon=True)
-                    self.tune_thread.start()
-                
-                print("✅ HackRF started successfully")
-                return True
-                
-            except FileNotFoundError:
-                print(f"❌ hackrf_transfer not found at: {self.hackrf_transfer_path}")
-                return False
-                
-            except Exception as e:
-                print(f"❌ Failed to start HackRF: {e}")
-                return False
-    
-    def _stop_process_only(self):
-        """Stop only the HackRF process, keep threads running"""
-        if self.process:
-            try:
-                self.process.terminate()
-                self.process.wait(timeout=2)
-            except:
-                try:
-                    self.process.kill()
-                    self.process.wait(timeout=1)
-                except:
-                    pass
-            self.process = None
-        # Give the device time to release
-        time.sleep(0.5)
-    
-    def stop(self):
-        """Stop HackRF reception completely"""
-        self.is_running = False
-        self.is_hopping = False
-        with self.restart_lock:
-            self._stop_process_only()
-        print("⏹️  HackRF stopped")
-    
-    def _frequency_hopper(self):
-        """Automatically hop between frequencies with adaptive timing"""
-        print(f"🔄 Frequency hopper started (adaptive mode: {hasattr(self, 'adaptive_hopping')})")
-    
-        while self.is_hopping:
-            time.sleep(1.0)  # Check every second
-        
-            if not self.is_hopping:
-                break
-        
-            current_time = time.time()
-        
-            # Get current frequency's dwell time
-            if hasattr(self, 'adaptive_hopping') and self.adaptive_hopping:
-                schedule = self._get_adaptive_hop_schedule()
-                current_dwell = next((dwell for freq, dwell in schedule 
-                                    if abs(freq - self.current_frequency) < 0.01), 
-                                   self.hop_interval)
-            else:
-                current_dwell = self.hop_interval
-        
-            # Check if it's time to hop
-            if current_time - self.last_hop_time >= current_dwell:
-                # Try to acquire lock with timeout
-                if self.restart_lock.acquire(timeout=2.0):
-                    try:
-                        # Get next frequency from schedule
-                        if hasattr(self, 'adaptive_hopping') and self.adaptive_hopping:
-                            schedule = self._get_adaptive_hop_schedule()
-                            # Find current index
-                            current_idx = next((i for i, (freq, _) in enumerate(schedule) 
-                                              if abs(freq - self.current_frequency) < 0.01), 0)
-                            next_idx = (current_idx + 1) % len(schedule)
-                            new_frequency, next_dwell = schedule[next_idx]
-                        
-                            print(f"🔄 Adaptive hop to {new_frequency} MHz (dwell: {next_dwell:.1f}s)")
-                        else:
-                            # Standard hopping
-                            self.frequency_index = (self.frequency_index + 1) % len(config.FREQUENCIES)
-                            new_frequency = config.FREQUENCIES[self.frequency_index]
-                            print(f"🔄 Hopping to {new_frequency} MHz (from {self.current_frequency} MHz)")
-                    
-                        # Stop current reception
-                        self._stop_process_only()
-                    
-                        # Wait for settling
-                        time.sleep(config.FREQUENCY_HOP_DWELL_TIME)
-                    
-                        if not self.is_hopping:
-                            print("⏹️  Hopping cancelled (disabled)")
-                            break
-                        
-                        # Update frequency
-                        self.current_frequency = new_frequency
-                        self.last_hop_time = current_time
-                    
-                        # Get optimal gain from learning engine if available
-                        if hasattr(self, 'learning_engine') and self.learning_engine:
-                            optimal_params = self.learning_engine.get_optimal_scan_parameters(new_frequency)
-                            self.current_gain = optimal_params['gain']
-                        else:
-                            # Ensure gain is valid
-                            self.current_gain = (self.current_gain // 2) * 2
-                        
-                        # Build command
-                        cmd = [
-                            self.hackrf_transfer_path,
-                            '-r', '-',
-                            '-f', str(int(self.current_frequency * 1e6)),
-                            '-s', str(config.SAMPLE_RATE),
-                            '-g', str(self.current_gain),
-                            '-l', '32',
-                            '-a', '1'
-                        ]
-                    
-                        print(f"▶️  Starting on {self.current_frequency} MHz (gain: {self.current_gain} dB)...")
-                    
-                        # Start new process
-                        self.process = subprocess.Popen(
-                            cmd,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            bufsize=0
-                        )
-                    
-                        # Check if started successfully
-                        time.sleep(0.5)
-                        if self.process.poll() is not None:
-                            stderr = self.process.stderr.read().decode()
-                            print(f"❌ Failed to restart on {new_frequency} MHz: {stderr}")
-                            self.is_running = False
-                            self.is_hopping = False
-                            break
-                    
-                        # Restart reading thread
-                        self.read_thread = threading.Thread(target=self._read_samples, daemon=True)
-                        self.read_thread.start()
-                    
-                        print(f"✅ Now scanning {new_frequency} MHz")
-                    
-                    except Exception as e:
-                        print(f"❌ Error during frequency hop: {e}")
-                        import traceback
-                        traceback.print_exc()
-                    finally:
-                        self.restart_lock.release()
-                else:
-                    # Lock timeout
-                    print("⏭️  Skipping hop (device busy, lock timeout)")
-                    self.last_hop_time = current_time  # Reset timer to avoid rapid retries
-    
-        print("🛑 Frequency hopper stopped")
+    # ---------------------------
+    # Device control
+    # ---------------------------
 
-    
-    def _read_samples(self):
-        """Read IQ samples from HackRF"""
-        buffer_size = 262144
-    
-        while self.is_running and self.process:
-            try:
-                data = self.process.stdout.read(buffer_size)
-                if not data:
-                    break
-            
-                # Convert bytes to IQ samples
-                iq_data = np.frombuffer(data, dtype=np.int8)
-            
-                # Ensure we have pairs of I/Q samples (even length)
-                if len(iq_data) % 2 != 0:
-                    iq_data = iq_data[:-1]  # Drop the last byte if odd
-            
-                if len(iq_data) < 2:  # Need at least one I/Q pair
-                    continue
-            
-                i_samples = iq_data[0::2].astype(np.float32) / 128.0
-                q_samples = iq_data[1::2].astype(np.float32) / 128.0
-            
-                # Double-check they're the same length
-                min_len = min(len(i_samples), len(q_samples))
-                i_samples = i_samples[:min_len]
-                q_samples = q_samples[:min_len]
-            
-                complex_samples = i_samples + 1j * q_samples
-            
-                # Calculate signal metrics
-                power = np.mean(np.abs(complex_samples) ** 2)
-                signal_strength_dbm = 10 * np.log10(power + 1e-10) - 60
-            
-                # Store metrics
-                self.signal_history.append(signal_strength_dbm)
-                if len(self.signal_history) > self.max_history_size:
-                    self.signal_history.pop(0)
-            
-                # Update frequency stats
-                freq_key = self.current_frequency
-                if freq_key in self.frequency_stats:
-                    stats = self.frequency_stats[freq_key]
-                    stats['samples'] += 1
-                    # Running average
-                    stats['avg_strength'] = (stats['avg_strength'] * (stats['samples'] - 1) + signal_strength_dbm) / stats['samples']
-            
-                # Pass to callback
-                if self.callback:
-                    self.callback(complex_samples, signal_strength_dbm, self.current_frequency)
-            
-            except Exception as e:
-                if self.is_running:
-                    print(f"Error reading samples: {e}")
-                break
+    def _configure_device(self) -> None:
+        """Configure device with current settings."""
+        if not self.device:
+            return
+        self.device.set_freq(int(self.frequency))
+        self.device.set_sample_rate(self.sample_rate)
+        self.device.set_lna_gain(self.lna_gain)
+        self.device.set_vga_gain(self.vga_gain)
+        try:
+            self.device.set_amp_enable(True)
+        except Exception:
+            # Some wrappers may not support this; ignore.
+            pass
 
-    
-    def _auto_tune(self):
-        """Automatically adjust gain for optimal reception - DISABLED during frequency hopping"""
-        while self.is_running and not self.frequency_hop_enabled:
-            time.sleep(self.tune_interval)
-            
-            if len(self.signal_history) < 10:
-                continue
-            
-            current_time = time.time()
-            if current_time - self.last_tune_time < self.tune_interval:
-                continue
-            
-            avg_signal = np.mean(self.signal_history[-20:])
-            
-            # Only adjust if we're not frequency hopping
-            if not self.frequency_hop_enabled and self.restart_lock.acquire(blocking=False):
-                try:
-                    # Adjust gain based on signal strength
-                    if avg_signal < config.MIN_SIGNAL_STRENGTH - 10:
-                        new_gain = min(self.current_gain + config.GAIN_STEP, config.GAIN_MAX)
-                        new_gain = (new_gain // 2) * 2  # Ensure multiple of 2
-                        if new_gain != self.current_gain:
-                            self.current_gain = new_gain
-                            print(f"🔧 Auto-tune: Increased gain to {new_gain} dB (signal: {avg_signal:.1f} dBm)")
-                    
-                    elif avg_signal > -30:
-                        new_gain = max(self.current_gain - config.GAIN_STEP, config.GAIN_MIN)
-                        new_gain = (new_gain // 2) * 2  # Ensure multiple of 2
-                        if new_gain != self.current_gain:
-                            self.current_gain = new_gain
-                            print(f"🔧 Auto-tune: Decreased gain to {new_gain} dB (signal: {avg_signal:.1f} dBm)")
-                    
-                    self.last_tune_time = current_time
-                finally:
-                    self.restart_lock.release()
-    
-    def set_frequency_hopping(self, enabled: bool):
-        """Enable or disable frequency hopping"""
-        self.frequency_hop_enabled = enabled
-        self.is_hopping = enabled
-        if enabled:
-            self.auto_tune_enabled = False  # Disable auto-tune when hopping
-            print("🔄 Frequency hopping enabled")
-            # Restart hopping thread if needed
-            if not hasattr(self, 'hop_thread') or not self.hop_thread.is_alive():
-                self.hop_thread = threading.Thread(target=self._frequency_hopper, daemon=True)
-                self.hop_thread.start()
-        else:
-            print("⏸️  Frequency hopping disabled")
-    
-    def set_hop_interval(self, interval: float):
-        """Set frequency hop interval in seconds"""
-        self.hop_interval = max(10.0, interval)  # Minimum 10 seconds
-        print(f"⏱️  Hop interval set to {self.hop_interval}s")
-    
-    def get_frequency_stats(self):
-        """Get statistics for each frequency"""
-        return self.frequency_stats
-    
-    def increment_detection(self, frequency: float):
-        """Increment detection count for a frequency"""
-        if frequency in self.frequency_stats:
-            self.frequency_stats[frequency]['detections'] += 1
-    
+    def change_frequency(self, freq_hz: float) -> None:
+        """Change center frequency (Hz)."""
+        self.frequency = float(freq_hz)
+        if self.device:
+            self.device.set_freq(int(self.frequency))
+        logger.info(f"Changed frequency to {self.frequency/1e6:.3f} MHz")
+
+    # Convenience for older app code (MHz)
+    def set_frequency(self, freq_mhz: float) -> None:
+        self.change_frequency(float(freq_mhz) * 1e6)
+
+    def set_frequency_hopping(self, enabled: bool) -> bool:
+        """Frequency hopping not implemented in this wrapper."""
+        return False
+
+    def set_hop_interval(self, interval: float) -> bool:
+        """Frequency hopping not implemented in this wrapper."""
+        return False
+
+    def increment_detection(self, frequency: float) -> None:
+        """Optional per-frequency stats hook (not implemented)."""
+        return
+
     def get_status(self) -> dict:
-        """Get current receiver status"""
+        """Get current status."""
         return {
-            'running': self.is_running,
-            'frequency': self.current_frequency,
-            'gain': self.current_gain,
-            'avg_signal_strength': np.mean(self.signal_history[-10:]) if self.signal_history else None,
-            'sample_rate': config.SAMPLE_RATE,
-            'frequency_hopping': self.frequency_hop_enabled,
-            'hop_interval': self.hop_interval,
-            'frequency_stats': self.frequency_stats
+            "frequency": self.frequency / 1e6,
+            "is_streaming": self.is_running,
+            "sample_rate": self.sample_rate,
+            "lna_gain": self.lna_gain,
+            "vga_gain": self.vga_gain,
+            "frequency_hopping": False,
+            "hop_interval": 30.0,
+            "frequency_stats": {},
         }
 
+    def get_statistics(self) -> dict:
+        """Return lightweight stats (placeholder)."""
+        return {
+            "is_streaming": self.is_running,
+            "samples_received": 0,
+            "errors": 0,
+            "buffer_size": 0,
+            "sample_rate": self.sample_rate,
+        }
 
+    # ---------------------------
+    # Optional decode→DB pipeline
+    # ---------------------------
+
+    def attach_pipeline(self, db: Any, decoder: Any, on_signal: Optional[Callable[[dict], None]] = None) -> bool:
+        """
+        Attach a TPMS decode→DB pipeline.
+
+        If start() is called with callback=None, RX will enqueue IQ chunks and a worker thread will:
+        - decoder.process_samples(iq_complex, freq_hz)
+        - map each decoded signal to dict
+        - insert into db (insert_signals_batch preferred, else insert_signal)
+        """
+        self._pipeline_db = db
+        self._pipeline_decoder = decoder
+        self._pipeline_on_signal = on_signal
+        return True
+
+    def _pipeline_worker(self) -> None:
+        while not self._pipeline_stop.is_set():
+            try:
+                iq_complex, rssi, freq_hz, ts = self._pipeline_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            try:
+                dec = self._pipeline_decoder
+                db = self._pipeline_db
+                if dec is None or db is None:
+                    continue
+
+                signals = dec.process_samples(iq_complex, freq_hz)
+                if not signals:
+                    continue
+
+                now_ts = ts or time.time()
+                rows = []
+                for s in signals:
+                    # Best-effort attribute mapping
+                    try:
+                        s.signal_strength = rssi
+                    except Exception:
+                        pass
+
+                    rows.append(
+                        {
+                            "tpms_id": getattr(s, "tpms_id", None),
+                            "timestamp": getattr(s, "timestamp", None) or now_ts,
+                            "frequency": getattr(s, "frequency", None) or freq_hz,
+                            "signal_strength": getattr(s, "signal_strength", None) or rssi,
+                            "snr": getattr(s, "snr", None),
+                            "pressure_psi": getattr(s, "pressure_psi", None),
+                            "temperature_c": getattr(s, "temperature_c", None),
+                            "battery_low": getattr(s, "battery_low", None),
+                            "protocol": getattr(s, "protocol", None),
+                            "raw_data": getattr(s, "raw_data", None),
+                        }
+                    )
+
+                # Insert (batch if available)
+                if hasattr(db, "insert_signals_batch"):
+                    db.insert_signals_batch(rows)
+                else:
+                    for r in rows:
+                        db.insert_signal(r)
+
+                if self._pipeline_on_signal:
+                    for r in rows:
+                        try:
+                            self._pipeline_on_signal(r)
+                        except Exception:
+                            pass
+
+            except Exception as e:
+                logger.exception(f"Pipeline worker error: {e}")
+
+    def _start_pipeline(self) -> None:
+        if self._pipeline_thread and self._pipeline_thread.is_alive():
+            return
+        self._pipeline_stop.clear()
+        self._pipeline_thread = threading.Thread(target=self._pipeline_worker, daemon=True)
+        self._pipeline_thread.start()
+
+    def _stop_pipeline(self) -> None:
+        self._pipeline_stop.set()
+
+    # ---------------------------
+    # RX start/stop
+    # ---------------------------
+
+    def start(self, callback: Optional[Callable[[np.ndarray, float, float], None]] = None) -> bool:
+        """
+        Start receiving.
+
+        If callback is provided: callback(iq_complex, rssi_dbm, freq_hz) is called.
+        If callback is None: uses attached decode→DB pipeline (requires attach_pipeline()).
+        """
+        logger.info("start() called")
+
+        if self.is_running:
+            logger.info("RX already running")
+            return True
+
+        if not self.device:
+            logger.error("❌ Device not opened (is HackRF connected / permissions OK?)")
+            return False
+
+        # If user didn't provide callback, use built-in pipeline
+        if callback is None:
+            if self._pipeline_db is None or self._pipeline_decoder is None:
+                logger.error(
+                    "start() called with no callback, but no pipeline attached. "
+                    "Call attach_pipeline(db, decoder) first, or pass a callback."
+                )
+                return False
+
+            self._start_pipeline()
+
+            def _enqueue(iq_complex: np.ndarray, rssi_dbm: float, freq_hz: float) -> None:
+                try:
+                    self._pipeline_q.put_nowait((iq_complex, rssi_dbm, freq_hz, time.time()))
+                except queue.Full:
+                    # Drop if we can't keep up
+                    pass
+
+            self.callback = _enqueue
+        else:
+            self.callback = callback
+
+        def rx_callback(iq_data: np.ndarray) -> None:
+            """Internal callback wrapper called by HackRFDevice."""
+            try:
+                # iq_data from wrapper is int8 interleaved I,Q: [I0,Q0,I1,Q1,...]
+                if not isinstance(iq_data, np.ndarray):
+                    iq_data = np.asarray(iq_data, dtype=np.int8)
+
+                # Safety: ensure even length
+                if iq_data.size < 2:
+                    return
+                if iq_data.size % 2 == 1:
+                    iq_data = iq_data[:-1]
+
+                i = iq_data[::2].astype(np.float32)
+                q = iq_data[1::2].astype(np.float32)
+                iq_complex = (i + 1j * q).astype(np.complex64) / 128.0
+
+                power = float(np.mean(np.abs(iq_complex) ** 2))
+                rssi_dbm = 10.0 * np.log10(power + 1e-10) - 50.0  # rough calibration
+
+                cb = self.callback
+                if cb:
+                    cb(iq_complex, rssi_dbm, float(self.frequency))
+            except Exception as e:
+                logger.exception(f"RX callback error: {e}")
+
+        ok = bool(self.device.start_rx(rx_callback))
+        if ok:
+            self.is_running = True
+            logger.info("✅ RX started successfully")
+            return True
+
+        logger.error("❌ Failed to start RX")
+        return False
+
+    def stop(self) -> None:
+        """Stop receiving + stop pipeline worker."""
+        if self.device and self.is_running:
+            try:
+                self.device.stop_rx()
+            except Exception:
+                pass
+            self.is_running = False
+            logger.info("RX stopped")
+
+        self._stop_pipeline()
+
+    def __del__(self):
+        """Best-effort cleanup."""
+        try:
+            self.stop()
+        except Exception:
+            pass
+        try:
+            if self.device:
+                self.device.close()
+        except Exception:
+            pass
+
+
+class SimulatedHackRF(HackRFInterface):
+    """
+    Simulated HackRF that reuses HackRFInterface's pipeline logic.
+    Useful when running without real hardware.
+    """
+
+    def __init__(self):
+        # Don't call HackRFInterface.__init__ (it tries to open real hardware).
+        self.device = None
+        self.is_running = False
+        self.callback = None
+        self.frequency = 315_000_000.0
+        self.sample_rate = 2_457_600.0
+        self.lna_gain = 0
+        self.vga_gain = 0
+
+        self._pipeline_db = None
+        self._pipeline_decoder = None
+        self._pipeline_on_signal = None
+        self._pipeline_q = queue.Queue(maxsize=400)
+        self._pipeline_stop = threading.Event()
+        self._pipeline_thread = None
+
+        self._sim_thread: Optional[threading.Thread] = None
+
+        logger.info("SimulatedHackRF initialized")
+
+    def start(self, callback: Optional[Callable[[np.ndarray, float, float], None]] = None) -> bool:
+        if self.is_running:
+            return True
+
+        # Mirror HackRFInterface.start behavior
+        if callback is None:
+            if self._pipeline_db is None or self._pipeline_decoder is None:
+                logger.error(
+                    "SimulatedHackRF.start() called with no callback, but no pipeline attached. "
+                    "Call attach_pipeline(db, decoder) first, or pass a callback."
+                )
+                return False
+
+            self._start_pipeline()
+
+            def _enqueue(iq_complex: np.ndarray, rssi_dbm: float, freq_hz: float) -> None:
+                try:
+                    self._pipeline_q.put_nowait((iq_complex, rssi_dbm, freq_hz, time.time()))
+                except queue.Full:
+                    pass
+
+            self.callback = _enqueue
+        else:
+            self.callback = callback
+
+        self.is_running = True
+        self._sim_thread = threading.Thread(target=self._simulate, daemon=True)
+        self._sim_thread.start()
+        logger.info("✅ Simulation started")
+        return True
+
+    def stop(self) -> None:
+        self.is_running = False
+        self._stop_pipeline()
+        if self._sim_thread:
+            self._sim_thread.join(timeout=1.0)
+        logger.info("Simulation stopped")
+
+    def _simulate(self) -> None:
+        """Generate simulated IQ buffers periodically."""
+        try:
+            from config import config  # your project's config object
+            n = int(getattr(config, "SAMPLES_PER_SCAN", 4096))
+            sr = float(getattr(config, "SAMPLE_RATE", self.sample_rate))
+        except Exception:
+            n = 4096
+            sr = self.sample_rate
+
+        while self.is_running:
+            # Generate noise
+            iq = (np.random.randn(n) + 1j * np.random.randn(n)).astype(np.complex64) * 0.1
+
+            # Occasionally add a simple FSK-ish tone burst
+            if np.random.random() < 0.08:
+                t = np.arange(n, dtype=np.float32) / sr
+                carrier = 50_000.0
+                freq_dev = 20_000.0
+                bits = np.random.randint(0, 2, size=64)
+                bit_sig = np.repeat(bits, max(1, n // bits.size))[:n].astype(np.float32)
+                inst_freq = carrier + (bit_sig - 0.5) * 2.0 * freq_dev
+                phase = 2.0 * np.pi * np.cumsum(inst_freq) / sr
+                iq += (0.5 * np.exp(1j * phase)).astype(np.complex64)
+
+            power = float(np.mean(np.abs(iq) ** 2))
+            rssi_dbm = 10.0 * np.log10(power + 1e-10) - 30.0
+            cb = self.callback
+            if cb:
+                cb(iq, rssi_dbm, float(self.frequency))
+
+            time.sleep(0.25)
+
+
+def create_hackrf_interface(use_simulation: bool = False) -> HackRFInterface:
+    """Factory function."""
+    if use_simulation or not HACKRF_AVAILABLE:
+        return SimulatedHackRF()
+    return HackRFInterface()
+
+
+# -------------------------------------------------------------------
+# Backward-compatibility shims (some apps expect HackRFScanner/Scanner)
+# -------------------------------------------------------------------
+
+class HackRFScanner(HackRFInterface):
+    """Compatibility alias for older app code expecting HackRFScanner/Scanner."""
+    pass
+
+
+# Some code checks for Scanner
+Scanner = HackRFScanner

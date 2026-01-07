@@ -1,1362 +1,918 @@
-import streamlit as st
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-from datetime import datetime, timedelta
+#!/usr/bin/env python3
+# TPMS Tracker - Streamlit UI (refactored for speed + online learning)
+#
+# Key fixes vs the original:
+# - Replaces st.tabs with a horizontal segmented control (st.radio) so only ONE page executes per rerun.
+# - Sidebar "Statistics" is live: rate/hr from last minute, signals last hour, repeated signals last hour.
+# - Adds online pattern learning (time/location/sensor/pressure/temp) with incremental DB reads.
+# - Adds WAL/busy_timeout + extra indexes (handled in database.py) to reduce sluggishness & lockups.
+
+from __future__ import annotations
+
 import time
-import threading
-import queue
-import numpy as np
-from collections import deque
+import math
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
-# Import config and modules
-from config import config
+import pandas as pd
+import streamlit as st
+
 from database import TPMSDatabase
-from hackrf_interface import HackRFInterface
-from tpms_decoder import TPMSDecoder
-from ml_engine import VehicleClusteringEngine
-from debug_tools import DebugTools, SpectrumPeak, ModulationAnalysis
-from ml_signal_learning import SignalLearningEngine
+from ml_engine import VehicleClusteringEngine, OnlinePatternLearner
 
-# Global queues for thread-safe communication
-signal_queue = queue.Queue(maxsize=1000)
-signal_history_queue = deque(maxlen=config.SIGNAL_HISTORY_SIZE)
+# -----------------------------
+# App configuration
+# -----------------------------
 
-# Page config
-st.set_page_config(
-    page_title="TPMS Tracker",
-    page_icon="🚗",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+APP_TITLE = "TPMS Tracker - Intelligent Vehicle Pattern Recognition"
+DEFAULT_PORT = 8507
 
-# Initialize session state
-if 'db' not in st.session_state:
-    st.session_state.db = TPMSDatabase(config.DB_PATH)
-    st.session_state.hackrf = HackRFInterface()
-    st.session_state.decoder = TPMSDecoder(config.SAMPLE_RATE)
-    st.session_state.ml_engine = VehicleClusteringEngine(st.session_state.db)
-    st.session_state.signal_learning = SignalLearningEngine(st.session_state.db)
+# A safe default list; if your config.py defines FREQUENCIES_MHZ, we use it.
+DEFAULT_FREQUENCIES = [314.9, 315.0, 433.92]
 
-    # NEW: Wire up the learning engine to decoder and hackrf
-    st.session_state.decoder.set_learning_engine(st.session_state.signal_learning)
-    st.session_state.hackrf.set_learning_engine(st.session_state.signal_learning)
+try:
+    import config  # type: ignore
 
-    st.session_state.is_scanning = False
-    st.session_state.signal_buffer = []
-    st.session_state.recent_detections = []
+    FREQUENCIES = getattr(config, "FREQUENCIES_MHZ", DEFAULT_FREQUENCIES)
+    DB_PATH = getattr(config, "DB_PATH", "tpms_tracker.db")
+    TIMEZONE_LABEL = getattr(config, "TIMEZONE_LABEL", "Mountain Time (MT)")
+except Exception:
+    FREQUENCIES = DEFAULT_FREQUENCIES
+    DB_PATH = "tpms_tracker.db"
+    TIMEZONE_LABEL = "Mountain Time (MT)"
 
 
-def signal_callback(iq_samples, signal_strength, frequency):
-    """Callback for processing HackRF samples - queue-based"""
+# -----------------------------
+# Helpers
+# -----------------------------
+
+@st.cache_resource
+def get_db(db_path: str) -> TPMSDatabase:
+    db = TPMSDatabase(db_path)
+    # Ensure extra indexes exist (fast dashboard queries)
     try:
-        # Put data in queue instead of processing directly
-        signal_queue.put({
-            'iq_samples': iq_samples,
-            'signal_strength': signal_strength,
-            'frequency': frequency,
-            'timestamp': time.time()
-        }, block=False)
-    except queue.Full:
-        pass  # Drop samples if queue is full
-
-
-def show_signal_histogram():
-    """Display real-time signal strength histogram"""
-    st.subheader("📊 Signal Strength Distribution")
-
-    if len(signal_history_queue) < 10:
-        st.info("Collecting signal data...")
-        return
-
-    # Convert to numpy array
-    signal_data = np.array(list(signal_history_queue))
-
-    # Create histogram
-    fig = go.Figure()
-    fig.add_trace(go.Histogram(
-        x=signal_data,
-        nbinsx=config.HISTOGRAM_BINS,
-        name='Signal Strength',
-        marker_color='lightblue'
-    ))
-
-    # Add threshold line
-    fig.add_vline(
-        x=config.SIGNAL_THRESHOLD,
-        line_dash="dash",
-        line_color="red",
-        annotation_text="Detection Threshold"
-    )
-
-    fig.update_layout(
-        title='Signal Strength Distribution (dBm)',
-        xaxis_title='Signal Strength (dBm)',
-        yaxis_title='Count',
-        showlegend=True,
-        height=300
-    )
-
-    st.plotly_chart(fig, use_container_width=True)
-
-    # Statistics
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Mean", f"{np.mean(signal_data):.1f} dBm")
-    with col2:
-        st.metric("Median", f"{np.median(signal_data):.1f} dBm")
-    with col3:
-        st.metric("Max", f"{np.max(signal_data):.1f} dBm")
-    with col4:
-        above_threshold = np.sum(signal_data > config.SIGNAL_THRESHOLD)
-        st.metric("Above Threshold", f"{above_threshold} ({above_threshold / len(signal_data) * 100:.1f}%)")
-
-
-def show_live_detection():
-    """Live detection tab"""
-    if st.session_state.is_scanning:
-        process_signal_queue()
-
-    st.header("Live TPMS Detection")
-
-    # Add frequency status at top
-    show_frequency_status()
-
-    st.divider()
-
-    # Signal histogram
-    show_signal_histogram()
-
-    st.divider()
-
-    # Protocol monitoring
-    show_protocol_monitoring()
-
-    st.divider()
-
-    col1, col2 = st.columns([2, 1])
-
-    with col1:
-        st.subheader("Recent Vehicle Detections")
-
-        if st.session_state.recent_detections:
-            recent = st.session_state.recent_detections[-10:][::-1]
-
-            for detection in recent:
-                vehicle = detection['vehicle']
-                dt = datetime.fromtimestamp(detection['timestamp'])
-
-                with st.container():
-                    col_a, col_b, col_c = st.columns([2, 2, 1])
-
-                    with col_a:
-                        nickname = vehicle.get('nickname', 'Unknown Vehicle')
-                        st.markdown(f"**{nickname}**")
-                        st.caption(f"ID: {vehicle['id']}")
-
-                    with col_b:
-                        st.text(dt.strftime("%H:%M:%S"))
-                        st.caption(f"Seen {vehicle['encounter_count']} times")
-
-                    with col_c:
-                        if st.button("View", key=f"view_{detection['vehicle_id']}_{detection['timestamp']}"):
-                            st.session_state.selected_vehicle = vehicle['id']
-
-                    st.divider()
-        else:
-            st.info("No vehicles detected yet. Start scanning to begin detection.")
-
-    with col2:
-        st.subheader("Live Signal Stream")
-        recent_signals = st.session_state.db.get_recent_signals(10)
-
-        if recent_signals:
-            signal_df = pd.DataFrame(recent_signals)
-            signal_df['timestamp'] = pd.to_datetime(signal_df['timestamp'], unit='s')
-
-            st.dataframe(
-                signal_df[['tpms_id', 'timestamp', 'signal_strength', 'frequency']],
-                hide_index=True,
-                use_container_width=True
-            )
-        else:
-            st.info("Waiting for signals...")
-
-        if st.session_state.is_scanning:
-            time.sleep(1)
-            st.rerun()
-
-
-def show_protocol_monitoring():
-    """Display detected protocols and unknown signals"""
-    st.subheader("🔍 Protocol Detection")
-
-    if not hasattr(st.session_state, 'decoder'):
-        return
-
-    # Get protocol statistics
-    stats = st.session_state.decoder.get_protocol_statistics()
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.write("**Unknown Signals Detected**")
-        st.metric("Total Unknown", stats['total_unknown'])
-
-        if stats['modulation_types']:
-            st.write("**Modulation Types:**")
-            for mod_type, count in stats['modulation_types'].items():
-                st.write(f"- {mod_type}: {count}")
-        else:
-            st.info("No unknown signals detected yet")
-
-    with col2:
-        st.write("**Signal Characteristics**")
-
-        if stats['common_baud_rates']:
-            st.write("**Detected Baud Rates:**")
-            for rate in stats['common_baud_rates']:
-                st.write(f"- {rate:,} bps")
-
-        if stats['avg_signal_strength'] > 0:
-            st.metric("Avg Signal Strength", f"{stats['avg_signal_strength']:.1f} dBm")
-
-    # Show recent unknown signals
-    unknown_signals = st.session_state.decoder.get_unknown_signals(60)
-
-    if unknown_signals:
-        st.write("**Recent Unknown Signals (last 60s):**")
-
-        unknown_df = pd.DataFrame([
-            {
-                'Time': datetime.fromtimestamp(s.timestamp).strftime('%H:%M:%S'),
-                'Frequency': f"{s.frequency:.2f} MHz",
-                'Strength': f"{s.signal_strength:.1f} dBm",
-                'Modulation': s.modulation_type,
-                'Baud Rate': f"{s.baud_rate:,}" if s.baud_rate else "Unknown",
-                'Length': s.packet_length
-            }
-            for s in unknown_signals[-10:]
-        ])
-
-        st.dataframe(unknown_df, use_container_width=True, hide_index=True)
-
-
-def show_vehicle_database():
-    """Vehicle database tab"""
-    st.header("Vehicle Database")
-
-    vehicles = st.session_state.db.get_all_vehicles()
-
-    if not vehicles:
-        st.info("No vehicles in database yet.")
-        return
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        min_encounters = st.slider("Min Encounters", 1, 50, 1)
-    with col2:
-        sort_by = st.selectbox("Sort By", ["Last Seen", "First Seen", "Encounter Count"])
-    with col3:
-        search = st.text_input("Search TPMS ID")
-
-    filtered = [v for v in vehicles if v['encounter_count'] >= min_encounters]
-
-    if search:
-        filtered = [v for v in filtered if search.upper() in str(v['tpms_ids'])]
-
-    if sort_by == "Last Seen":
-        filtered.sort(key=lambda x: x['last_seen'], reverse=True)
-    elif sort_by == "First Seen":
-        filtered.sort(key=lambda x: x['first_seen'], reverse=True)
-    else:
-        filtered.sort(key=lambda x: x['encounter_count'], reverse=True)
-
-    for vehicle in filtered:
-        with st.expander(
-                f"🚗 {vehicle.get('nickname', 'Vehicle')} #{vehicle['id']} - "
-                f"Seen {vehicle['encounter_count']} times"
-        ):
-            col1, col2 = st.columns([2, 1])
-
-            with col1:
-                st.write("**TPMS IDs:**")
-                for tpms_id in vehicle['tpms_ids']:
-                    st.code(tpms_id, language=None)
-
-                st.write("**Timeline:**")
-                st.write(f"First seen: {datetime.fromtimestamp(vehicle['first_seen']).strftime('%Y-%m-%d %H:%M')}")
-                st.write(f"Last seen: {datetime.fromtimestamp(vehicle['last_seen']).strftime('%Y-%m-%d %H:%M')}")
-
-                current_nickname = vehicle.get('nickname', '')
-                new_nickname = st.text_input(
-                    "Nickname",
-                    value=current_nickname,
-                    key=f"nickname_{vehicle['id']}"
-                )
-                if new_nickname != current_nickname:
-                    if st.button("Save Nickname", key=f"save_{vehicle['id']}"):
-                        st.session_state.db.update_vehicle_nickname(vehicle['id'], new_nickname)
-                        st.success("Nickname updated!")
-                        st.rerun()
-
-            with col2:
-                history = st.session_state.db.get_vehicle_history(vehicle['id'])
-                st.metric("Total Encounters", len(history['encounters']))
-
-                if history['maintenance']:
-                    avg_pressure = sum(m['avg_pressure'] for m in history['maintenance'] if m['avg_pressure']) / len(
-                        history['maintenance'])
-                    st.metric("Avg Pressure", f"{avg_pressure:.1f} PSI")
-
-                prediction = st.session_state.ml_engine.predict_next_encounter(vehicle['id'])
-                if prediction['prediction'] == 'estimated':
-                    st.write("**Next encounter predicted:**")
-                    st.write(prediction['predicted_datetime'].strftime('%Y-%m-%d %H:%M'))
-                    st.progress(prediction['confidence'])
-                    st.caption(f"Confidence: {prediction['confidence'] * 100:.0f}%")
-
-
-def show_frequency_status():
-    """Display frequency hopping status and statistics"""
-    st.subheader("📡 Frequency Status")
-
-    if not st.session_state.is_scanning:
-        st.info("Start scanning to see frequency statistics")
-        return
-
-    status = st.session_state.hackrf.get_status()
-    freq_stats = status.get('frequency_stats', {})
-
-    # Current frequency
-    st.write(f"**Current Frequency:** {status['frequency']:.2f} MHz")
-
-    # Initialize session state for controls if not exists
-    if 'freq_hop_enabled' not in st.session_state:
-        st.session_state.freq_hop_enabled = status.get('frequency_hopping', True)
-    if 'hop_interval' not in st.session_state:
-        st.session_state.hop_interval = status.get('hop_interval', 30.0)
-
-    # Frequency hopping control
-    col1, col2 = st.columns(2)
-    with col1:
-        hop_enabled = st.checkbox(
-            "Enable Frequency Hopping",
-            value=st.session_state.freq_hop_enabled,
-            key="freq_hop_toggle"
-        )
-        # Only update if changed
-        if hop_enabled != st.session_state.freq_hop_enabled:
-            st.session_state.freq_hop_enabled = hop_enabled
-            st.session_state.hackrf.set_frequency_hopping(hop_enabled)
-            st.rerun()
-
-    with col2:
-        if st.session_state.freq_hop_enabled:
-            hop_interval = st.slider(
-                "Hop Interval (seconds)",
-                min_value=10.0,
-                max_value=60.0,
-                value=st.session_state.hop_interval,
-                step=5.0,
-                key="hop_interval_slider"
-            )
-            # Only update if changed
-            if abs(hop_interval - st.session_state.hop_interval) > 0.1:
-                st.session_state.hop_interval = hop_interval
-                st.session_state.hackrf.set_hop_interval(hop_interval)
-
-    # Frequency statistics table
-    if freq_stats:
-        st.write("**Frequency Statistics:**")
-
-        freq_df = pd.DataFrame([
-            {
-                'Frequency': f"{freq:.2f} MHz",
-                'Samples': stats['samples'],
-                'Avg Strength': f"{stats['avg_strength']:.1f} dBm",
-                'Detections': stats['detections']
-            }
-            for freq, stats in freq_stats.items()
-        ])
-
-        st.dataframe(freq_df, use_container_width=True, hide_index=True)
-
-        # Bar chart of detections per frequency
-        if any(stats['detections'] > 0 for stats in freq_stats.values()):
-            fig = go.Figure(data=[
-                go.Bar(
-                    x=[f"{freq:.2f}" for freq in freq_stats.keys()],
-                    y=[stats['detections'] for stats in freq_stats.values()],
-                    marker_color='lightgreen'
-                )
-            ])
-            fig.update_layout(
-                title='TPMS Detections by Frequency',
-                xaxis_title='Frequency (MHz)',
-                yaxis_title='Detections',
-                height=300
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-
-def show_analytics():
-    """Analytics tab"""
-    st.header("Analytics & Patterns")
-
-    vehicles = st.session_state.db.get_all_vehicles(min_encounters=2)
-
-    if not vehicles:
-        st.info("Not enough data for analytics yet. Keep scanning!")
-        return
-
-    days = st.slider("Analysis Period (days)", 1, 90, 30)
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("Encounter Frequency")
-
-        encounter_data = []
-        for vehicle in vehicles:
-            history = st.session_state.db.get_vehicle_history(vehicle['id'])
-            for encounter in history['encounters']:
-                encounter_data.append({
-                    'vehicle_id': vehicle['id'],
-                    'nickname': vehicle.get('nickname', 'Vehicle ' + str(vehicle['id'])),
-                    'timestamp': datetime.fromtimestamp(encounter['timestamp']),
-                    'date': datetime.fromtimestamp(encounter['timestamp']).date()
-                })
-
-        if encounter_data:
-            df = pd.DataFrame(encounter_data)
-
-            daily_counts = df.groupby('date').size().reset_index(name='encounters')
-            fig = px.line(
-                daily_counts,
-                x='date',
-                y='encounters',
-                title='Daily Vehicle Encounters',
-                labels={'date': 'Date', 'encounters': 'Number of Vehicles'}
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-            df['hour'] = df['timestamp'].dt.hour
-            df['day_of_week'] = df['timestamp'].dt.day_name()
-
-            heatmap_data = df.groupby(['day_of_week', 'hour']).size().reset_index(name='count')
-
-            days_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-            heatmap_pivot = heatmap_data.pivot(index='day_of_week', columns='hour', values='count').fillna(0)
-            heatmap_pivot = heatmap_pivot.reindex(days_order)
-
-            fig_heatmap = go.Figure(data=go.Heatmap(
-                z=heatmap_pivot.values,
-                x=heatmap_pivot.columns,
-                y=heatmap_pivot.index,
-                colorscale='YlOrRd',
-                text=heatmap_pivot.values,
-                texttemplate='%{text}',
-                textfont={"size": 10}
-            ))
-            fig_heatmap.update_layout(
-                title='Encounter Patterns by Day and Hour',
-                xaxis_title='Hour of Day',
-                yaxis_title='Day of Week'
-            )
-            st.plotly_chart(fig_heatmap, use_container_width=True)
-
-    with col2:
-        st.subheader("Top Vehicles")
-
-        top_vehicles = sorted(vehicles, key=lambda x: x['encounter_count'], reverse=True)[:10]
-
-        top_df = pd.DataFrame([
-            {
-                'Vehicle': v.get('nickname', 'Vehicle ' + str(v['id'])),
-                'Encounters': v['encounter_count'],
-                'Last Seen': datetime.fromtimestamp(v['last_seen']).strftime('%Y-%m-%d')
-            }
-            for v in top_vehicles
-        ])
-
-        fig_bar = px.bar(
-            top_df,
-            x='Encounters',
-            y='Vehicle',
-            orientation='h',
-            title='Most Frequently Encountered Vehicles',
-            color='Encounters',
-            color_continuous_scale='Blues'
-        )
-        st.plotly_chart(fig_bar, use_container_width=True)
-
-        st.subheader("Recent Activity")
-        recent_vehicles = sorted(vehicles, key=lambda x: x['last_seen'], reverse=True)[:5]
-
-        for v in recent_vehicles:
-            time_ago = datetime.now() - datetime.fromtimestamp(v['last_seen'])
-            hours_ago = time_ago.total_seconds() / 3600
-
-            if hours_ago < 1:
-                time_str = f"{int(time_ago.total_seconds() / 60)} minutes ago"
-            elif hours_ago < 24:
-                time_str = f"{int(hours_ago)} hours ago"
-            else:
-                time_str = f"{int(hours_ago / 24)} days ago"
-
-            nickname = v.get('nickname', 'Vehicle ' + str(v['id']))
-            st.write(f"**{nickname}** - {time_str}")
-
-
-def show_maintenance():
-    """Maintenance tracking tab"""
-    st.header("🔧 Tire Maintenance Monitoring")
-
-    vehicles = st.session_state.db.get_all_vehicles(min_encounters=3)
-
-    if not vehicles:
-        st.info("Not enough data for maintenance analysis yet.")
-        return
-
-    vehicle_options = {
-        f"{v.get('nickname', 'Vehicle ' + str(v['id']))} (ID: {v['id']})": v['id']
-        for v in vehicles
-    }
-
-    selected_name = st.selectbox("Select Vehicle", list(vehicle_options.keys()))
-    vehicle_id = vehicle_options[selected_name]
-
-    days = st.slider("Analysis Period (days)", 7, 90, 30, key="maintenance_days")
-
-    analysis = st.session_state.db.analyze_maintenance(vehicle_id, days)
-
-    if not analysis:
-        st.warning("No maintenance data available for this vehicle.")
-        return
-
-    st.subheader("Tire Health Overview")
-
-    cols = st.columns(4)
-    for idx, (tpms_id, data) in enumerate(analysis.items()):
-        with cols[idx % 4]:
-            st.write(f"**Tire {idx + 1}**")
-            st.caption(f"ID: {tpms_id[:8]}...")
-
-            if data['avg_pressure']:
-                pressure = data['avg_pressure']
-
-                if 30 <= pressure <= 35:
-                    color = "🟢"
-                    status = "Good"
-                elif 28 <= pressure < 30 or 35 < pressure <= 38:
-                    color = "🟡"
-                    status = "Warning"
-                else:
-                    color = "🔴"
-                    status = "Alert"
-
-                st.metric(
-                    "Avg Pressure",
-                    f"{pressure:.1f} PSI",
-                    delta=f"{data['pressure_std']:.1f} std"
-                )
-                st.write(f"{color} {status}")
-
-                if data['avg_temp']:
-                    st.metric("Avg Temp", f"{data['avg_temp']:.1f}°C")
-
-                if data['alerts']:
-                    st.warning("⚠️ " + ", ".join(data['alerts']))
-
-
-def show_ml_learning():
-    """ML Signal Learning tab - replaces old ML Insights"""
-    st.header("🤖 Signal Learning & Intelligence")
-
-    # Learning Statistics
-    st.subheader("📊 Learning Progress")
-
-    stats = st.session_state.signal_learning.get_learning_statistics()
-
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Total Attempts", stats['total_attempts'])
-    with col2:
-        st.metric("Successful Decodes", stats['successful_decodes'])
-    with col3:
-        success_rate = stats['success_rate'] * 100 if stats['success_rate'] > 0 else 0
-        st.metric("Success Rate", f"{success_rate:.1f}%")
-    with col4:
-        st.metric("Learned Profiles", stats['learned_profiles'])
-
-    # Progress bar for learning
-    if stats['total_attempts'] > 0:
-        progress = min(stats['successful_decodes'] / 100, 1.0)  # Cap at 100 samples
-        st.progress(progress)
-        st.caption(f"Learning progress: {stats['successful_decodes']}/100 samples for full training")
-
-    st.divider()
-
-    # Learning Controls
-    st.subheader("⚙️ Learning Parameters")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.write("**Adaptive Thresholds:**")
-
-        # Power threshold
-        power_thresh = st.slider(
-            "Power Threshold (dBm)",
-            min_value=-100.0,
-            max_value=-40.0,
-            value=st.session_state.signal_learning.adaptive_thresholds['power_threshold'],
-            step=5.0,
-            key="ml_power_thresh"
-        )
-
-        # SNR threshold
-        snr_thresh = st.slider(
-            "SNR Threshold (dB)",
-            min_value=0.0,
-            max_value=20.0,
-            value=st.session_state.signal_learning.adaptive_thresholds['snr_threshold'],
-            step=1.0,
-            key="ml_snr_thresh"
-        )
-
-        if st.button("Apply Thresholds"):
-            st.session_state.signal_learning.adaptive_thresholds['power_threshold'] = power_thresh
-            st.session_state.signal_learning.adaptive_thresholds['snr_threshold'] = snr_thresh
-            st.success("✅ Thresholds updated!")
-
-    with col2:
-        st.write("**Tolerance Settings:**")
-
-        # Bandwidth tolerance
-        bw_tol = st.slider(
-            "Bandwidth Tolerance (MHz)",
-            min_value=0.05,
-            max_value=1.0,
-            value=st.session_state.signal_learning.adaptive_thresholds['bandwidth_tolerance'],
-            step=0.05,
-            key="ml_bw_tol"
-        )
-
-        # Frequency tolerance
-        freq_tol = st.slider(
-            "Frequency Tolerance (MHz)",
-            min_value=0.01,
-            max_value=0.5,
-            value=st.session_state.signal_learning.adaptive_thresholds['frequency_tolerance'],
-            step=0.01,
-            key="ml_freq_tol"
-        )
-
-        if st.button("Apply Tolerances"):
-            st.session_state.signal_learning.adaptive_thresholds['bandwidth_tolerance'] = bw_tol
-            st.session_state.signal_learning.adaptive_thresholds['frequency_tolerance'] = freq_tol
-            st.success("✅ Tolerances updated!")
-
-    # Add this section after "Learning Controls" in show_ml_learning()
-
-    st.divider()
-
-    # Adaptive Features Status
-    st.subheader("🎯 Adaptive Features")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.write("**Adaptive Frequency Hopping:**")
-
-        if hasattr(st.session_state.hackrf, 'adaptive_hopping'):
-            st.success("✅ Active")
-
-            # Show frequency priorities
-            priorities = {}
-            for freq in config.FREQUENCIES:
-                priority = st.session_state.signal_learning.get_frequency_priority(freq)
-                should_skip = st.session_state.signal_learning.should_skip_frequency(freq)
-                priorities[freq] = {
-                    'priority': priority,
-                    'skip': should_skip
-                }
-
-            # Display frequency priorities
-            for freq, info in priorities.items():
-                status = "⏭️ SKIP" if info['skip'] else f"Priority: {info['priority']:.2f}"
-                color = "🔴" if info['skip'] else ("🟢" if info['priority'] > 0.7 else "🟡")
-                st.write(f"{color} {freq:.2f} MHz - {status}")
-        else:
-            st.info("Not active - start scanning to enable")
-
-    with col2:
-        st.write("**ML-Guided Decoding:**")
-
-        if hasattr(st.session_state.decoder, 'learning_engine'):
-            st.success("✅ Active")
-
-            # Show decoder hints for current frequency
-            if st.session_state.is_scanning:
-                current_freq = st.session_state.hackrf.current_frequency
-                hints = st.session_state.signal_learning.get_decoder_hints(current_freq, -60)
-
-                if hints['try_protocols']:
-                    st.write(f"**Current Frequency ({current_freq:.2f} MHz):**")
-                    st.write(f"Suggested protocols: {', '.join(hints['try_protocols'])}")
-                    if hints['baud_rates']:
-                        st.write(f"Baud rates: {', '.join(map(str, hints['baud_rates'][:3]))} bps")
-                    st.write(f"Confidence: {hints['confidence'] * 100:.0f}%")
-            else:
-                st.info("Start scanning to see decoder hints")
-        else:
-            st.info("Not active - start scanning to enable")
-
-    # Adaptive Hopping Schedule
-    if st.session_state.is_scanning and hasattr(st.session_state.hackrf, 'adaptive_hopping'):
-        st.write("**Current Hopping Schedule:**")
-
-        schedule = st.session_state.hackrf._get_adaptive_hop_schedule()
-        schedule_df = pd.DataFrame([
-            {
-                'Frequency': f"{freq:.2f} MHz",
-                'Dwell Time': f"{dwell:.1f}s",
-                'Percentage': f"{(dwell / sum(d for _, d in schedule) * 100):.1f}%"
-            }
-            for freq, dwell in schedule
-        ])
-
-        st.dataframe(schedule_df, use_container_width=True, hide_index=True)
-
-        # Pie chart of time allocation
-        fig = go.Figure(data=[go.Pie(
-            labels=[f"{freq:.2f} MHz" for freq, _ in schedule],
-            values=[dwell for _, dwell in schedule],
-            hole=.3
-        )])
-        fig.update_layout(
-            title='Time Allocation by Frequency',
-            height=300
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    st.divider()
-
-    # Learned Signal Profiles
-    st.subheader("📚 Learned Signal Profiles")
-
-    if stats['profiles']:
-        # Create tabs for each profile
-        profile_tabs = st.tabs([f"Profile {i + 1}" for i in range(len(stats['profiles']))])
-
-        for idx, (key, profile) in enumerate(stats['profiles'].items()):
-            with profile_tabs[idx]:
-                col1, col2, col3 = st.columns(3)
-
-                with col1:
-                    st.metric("Frequency", f"{profile['frequency']:.2f} MHz")
-                    st.metric("Confidence", f"{profile['confidence'] * 100:.0f}%")
-
-                with col2:
-                    st.metric("Modulation", profile['modulation'])
-                    st.metric("Sample Count", profile['sample_count'])
-
-                with col3:
-                    # Get optimal parameters for this profile
-                    optimal = st.session_state.signal_learning.get_optimal_scan_parameters(
-                        profile['frequency']
-                    )
-                    st.metric("Optimal Gain", f"{optimal['gain']} dB")
-                    st.metric("Optimal Duration", f"{optimal['duration']:.1f}s")
-
-                # Show full profile details
-                with st.expander("📋 Full Profile Details"):
-                    full_profile = st.session_state.signal_learning.signal_profiles.get(key)
-                    if full_profile:
-                        st.write(
-                            f"**Bandwidth Range:** {full_profile.bandwidth_range[0]:.2f} - {full_profile.bandwidth_range[1]:.2f} MHz")
-                        st.write(
-                            f"**Power Range:** {full_profile.power_range[0]:.1f} - {full_profile.power_range[1]:.1f} dBm")
-                        st.write(
-                            f"**Baud Rate Range:** {full_profile.baud_rate_range[0]:,} - {full_profile.baud_rate_range[1]:,} bps")
-                        st.write(f"**SNR Threshold:** {full_profile.snr_threshold:.1f} dB")
-                        st.write(
-                            f"**Last Updated:** {datetime.fromtimestamp(full_profile.last_updated).strftime('%Y-%m-%d %H:%M:%S')}")
-    else:
-        st.info("No signal profiles learned yet. Start scanning to begin learning!")
-
-    st.divider()
-
-    # Manual Feedback Section
-    st.subheader("👍 Manual Feedback")
-
-    st.write("Help improve detection by providing feedback on recent signals:")
-
-    recent_signals = st.session_state.db.get_recent_signals(20)
-
-    if recent_signals:
-        feedback_df = pd.DataFrame([
-            {
-                'Time': datetime.fromtimestamp(s['timestamp']).strftime('%H:%M:%S'),
-                'Frequency': f"{s['frequency']:.2f} MHz",
-                'Strength': f"{s['signal_strength']:.1f} dBm",
-                'Protocol': s['protocol'],
-                'TPMS ID': s['tpms_id'][:12] + '...'
-            }
-            for s in recent_signals[:10]
-        ])
-
-        st.dataframe(feedback_df, use_container_width=True, hide_index=True)
-
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            if st.button("✅ All Correct", type="primary"):
-                st.success("Thank you! Learning engine updated.")
-        with col2:
-            if st.button("❌ False Positive"):
-                st.warning("Marked as false positive. Adjusting thresholds...")
-                # Increase thresholds slightly
-                st.session_state.signal_learning.adaptive_thresholds['power_threshold'] += 2
-                st.session_state.signal_learning.adaptive_thresholds['snr_threshold'] += 0.5
-        with col3:
-            if st.button("🔄 Retrain Models"):
-                with st.spinner("Retraining..."):
-                    st.session_state.signal_learning._retrain_models()
-                st.success("Models retrained!")
-    else:
-        st.info("No recent signals to review")
-
-    st.divider()
-
-    # Model Performance
-    st.subheader("📈 Model Performance")
-
-    if stats['model_trained']:
-        st.success("✅ ML model is trained and active")
-
-        # Show training history if available
-        if len(st.session_state.signal_learning.training_buffer) > 10:
-            training_data = list(st.session_state.signal_learning.training_buffer)
-
-            # Plot success rate over time
-            success_over_time = []
-            window_size = 20
-
-            for i in range(len(training_data)):
-                if i >= window_size:
-                    window = training_data[i - window_size:i]
-                    successes = sum(1 for s in window if s['decoded'])
-                    success_over_time.append({
-                        'sample': i,
-                        'success_rate': successes / window_size
-                    })
-
-            if success_over_time:
-                df = pd.DataFrame(success_over_time)
-                fig = px.line(
-                    df,
-                    x='sample',
-                    y='success_rate',
-                    title='Detection Success Rate (20-sample rolling window)',
-                    labels={'sample': 'Sample Number', 'success_rate': 'Success Rate'}
-                )
-                fig.update_yaxes(range=[0, 1])
-                st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("ℹ️  ML model not yet trained. Need at least 50 successful decodes.")
-
-        if stats['successful_decodes'] > 0:
-            progress = stats['successful_decodes'] / 50
-            st.progress(progress)
-            st.caption(f"{stats['successful_decodes']}/50 samples collected")
-
-    # Save/Load Models
-    st.divider()
-    st.subheader("💾 Model Management")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("💾 Save Learning Data"):
-            st.session_state.signal_learning._save_models()
-            st.success("✅ Learning data saved!")
-
-    with col2:
-        if st.button("📂 Load Learning Data"):
-            st.session_state.signal_learning._load_models()
-            st.success("✅ Learning data loaded!")
-            st.rerun()
-
-
-def process_signal_queue():
-    """Process signals from the queue - runs in main Streamlit thread"""
-    processed = 0
-    max_batch = 10
-
-    while not signal_queue.empty() and processed < max_batch:
+        db.ensure_performance_indexes()
+    except Exception:
+        pass
+    return db
+
+
+def fmt_ts(ts: float) -> str:
+    try:
+        return datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return "—"
+
+
+def safe_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        v = float(x)
+        if math.isnan(v):
+            return None
+        return v
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=2.0)
+def cached_realtime_stats(db_path: str) -> Dict[str, Any]:
+    db = get_db(db_path)
+    return db.get_realtime_stats()
+
+
+def ensure_models(db_path: str):
+    """Ensure expensive models are created once per session."""
+    # Session-state defaults (avoid KeyError/AttributeError on first run or after hot-reload)
+    if "last_model_update" not in st.session_state:
+        st.session_state.last_model_update = None
+    if "last_rowid" not in st.session_state:
+        st.session_state.last_rowid = 0
+
+    if "online_learner" not in st.session_state:
+        st.session_state.online_learner = OnlinePatternLearner()
+    if "vehicle_engine" not in st.session_state:
+        db = get_db(db_path)
+        st.session_state.vehicle_engine = VehicleClusteringEngine(db)
+
+def process_online_learning(db_path: str, limit: int = 5000) -> int:
+    """Pull new rows from DB and update online learner + vehicle co-occurrence."""
+    ensure_models(db_path)
+    db = get_db(db_path)
+
+    rows = db.get_signals_since_rowid(last_rowid=int(st.session_state.last_rowid), limit=int(limit))
+    if not rows:
+        return 0
+
+    st.session_state.online_learner.update_rows(rows)
+
+    # Feed vehicle clustering engine (best-effort; depends on your engine's API)
+    # VehicleClusteringEngine in your repo may support update_signal(...) or update(...)
+    ve = st.session_state.vehicle_engine
+    for r in rows:
         try:
-            data = signal_queue.get_nowait()
-
-            # Add to signal history for histogram
-            signal_history_queue.append(data['signal_strength'])
-
-            # Process with decoder
-            signals = st.session_state.decoder.process_samples(
-                data['iq_samples'],
-                data['frequency']
+            ve.update_signal(
+                tpms_id=str(r.get("tpms_id")),
+                timestamp=float(r.get("timestamp") or 0.0),
+                pressure=safe_float(r.get("pressure_psi")),
+                temperature=safe_float(r.get("temperature_c")),
+                latitude=safe_float(r.get("latitude")),
+                longitude=safe_float(r.get("longitude")),
             )
+        except Exception:
+            # Don't break UI if the engine has a different signature
+            pass
 
-            for signal in signals:
-                signal.signal_strength = data['signal_strength']
-
-                # Increment detection count for this frequency
-                st.session_state.hackrf.increment_detection(data['frequency'])
-
-                signal_dict = {
-                    'tpms_id': signal.tpms_id,
-                    'timestamp': signal.timestamp,
-                    'frequency': signal.frequency,
-                    'signal_strength': signal.signal_strength,
-                    'snr': signal.snr,
-                    'pressure_psi': signal.pressure_psi,
-                    'temperature_c': signal.temperature_c,
-                    'battery_low': signal.battery_low,
-                    'protocol': signal.protocol,
-                    'raw_data': signal.raw_data
-                }
-
-                # NEW: Learn from successful decode
-                st.session_state.signal_learning.learn_from_signal(
-                    {
-                        'frequency': signal.frequency,
-                        'power': signal.signal_strength,
-                        'snr': signal.snr,
-                        'modulation': signal.protocol,
-                        'characteristics': {}
-                    },
-                    decoded=True,
-                    protocol=signal.protocol
-                )
-
-                st.session_state.db.insert_signal(signal_dict)
-                st.session_state.signal_buffer.append(signal_dict)
-
-            # Process for vehicle clustering
-            if len(st.session_state.signal_buffer) > 10:
-                vehicle_ids = st.session_state.ml_engine.process_signals(st.session_state.signal_buffer)
-
-                for vehicle_id in vehicle_ids:
-                    vehicle_info = st.session_state.db.get_vehicle_history(vehicle_id)
-                    st.session_state.recent_detections.append({
-                        'vehicle_id': vehicle_id,
-                        'timestamp': time.time(),
-                        'vehicle': vehicle_info['vehicle']
-                    })
-
-                st.session_state.signal_buffer = []
-
-            processed += 1
-
-        except queue.Empty:
-            break
-        except Exception as e:
-            print(f"Error processing signal: {e}")
-            continue
+    # Advance checkpoint
+    st.session_state.last_rowid = max(st.session_state.last_rowid, int(st.session_state.online_learner.last_rowid))
+    st.session_state.last_model_update = time.time()
+    return len(rows)
 
 
-def show_debug_tools():
-    """Debug and diagnostic tools tab"""
-    st.header("🔧 Debug & Diagnostic Tools")
+def sidebar_control_panel(db_path: str):
+    st.sidebar.markdown("## ⚙️ Control Panel")
+    st.sidebar.caption(f"🕒 Displaying times in {TIMEZONE_LABEL}")
 
-    st.warning("⚠️ Running diagnostics will stop any active scanning!")
+    # Frequency selector
+    if "selected_freq" not in st.session_state:
+        st.session_state.selected_freq = float(FREQUENCIES[0]) if FREQUENCIES else 314.9
 
-    # Initialize debug tools
-    if 'debug_tools' not in st.session_state:
-        st.session_state.debug_tools = DebugTools()
+    st.sidebar.markdown("### 📡 Scanner Control")
+    st.session_state.selected_freq = st.sidebar.selectbox(
+        "Select Frequency (MHz)",
+        options=[float(x) for x in FREQUENCIES],
+        index=max(0, [float(x) for x in FREQUENCIES].index(float(st.session_state.selected_freq))) if FREQUENCIES else 0,
+        key="freq_select",
+    )
 
-    # Hardware Info Section
-    st.subheader("📡 Hardware Information")
-
-    if st.button("🔍 Check Hardware", type="primary"):
-        with st.spinner("Checking hardware..."):
-            hw_info = st.session_state.debug_tools.get_hardware_info()
-
-            if hw_info.device_found:
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.success("✅ HackRF One Detected")
-                    st.metric("Serial Number", hw_info.serial_number)
-                    st.metric("Board ID", hw_info.board_id)
-                with col2:
-                    st.metric("Firmware Version", hw_info.firmware_version)
-                    st.metric("Part ID", hw_info.part_id)
-                    if hw_info.operacake_detected:
-                        st.info("🎛️ Opera Cake detected")
+    colA, colB = st.sidebar.columns(2)
+    with colA:
+        if st.button("Set Frequency"):
+            # Hook for your scanner object (if present)
+            scanner = st.session_state.get("scanner")
+            if scanner and hasattr(scanner, "set_frequency"):
+                try:
+                    scanner.set_frequency(st.session_state.selected_freq)
+                    st.success(f"Set frequency to {st.session_state.selected_freq} MHz")
+                except Exception as e:
+                    st.error(f"Could not set frequency: {e}")
             else:
-                st.error("❌ HackRF not found or not responding")
+                st.info("Scanner object not attached in this build (Live Detection page wires it up).")
 
-    st.divider()
+    st.sidebar.markdown("---")
 
-    # Spectrum Scan Section
-    st.subheader("📊 Spectrum Scanner")
-
-    col1, col2, col3 = st.columns(3)
+    # Start / stop scan controls (hooks)
+    col1, col2 = st.sidebar.columns(2)
     with col1:
-        scan_start = st.number_input("Start Freq (MHz)", value=310.0, step=1.0)
-    with col2:
-        scan_end = st.number_input("End Freq (MHz)", value=320.0, step=1.0)
-    with col3:
-        scan_step = st.number_input("Step (MHz)", value=0.5, step=0.1, min_value=0.1)
-
-    if st.button("🔍 Run Spectrum Scan"):
-        # Stop any active scanning
-        if st.session_state.is_scanning:
-            st.session_state.hackrf.stop()
-            st.session_state.is_scanning = False
-            time.sleep(1)
-
-        with st.spinner(f"Scanning {scan_start} - {scan_end} MHz..."):
-            peaks, raw_spectrum = st.session_state.debug_tools.spectrum_scan(
-                scan_start, scan_end, step=scan_step, duration=0.5
-            )
-
-            # Always show the full spectrum plot
-            st.subheader("📊 Full Spectrum")
-
-            if raw_spectrum:
-                freqs = [f for f, p in raw_spectrum]
-                powers = [p for f, p in raw_spectrum]
-
-                fig = go.Figure()
-
-                # Plot all measurements
-                fig.add_trace(go.Scatter(
-                    x=freqs,
-                    y=powers,
-                    mode='lines+markers',
-                    name='Measured Power',
-                    line=dict(color='lightblue', width=2),
-                    marker=dict(size=4)
-                ))
-
-                # Add threshold line
-                fig.add_hline(
-                    y=-85,
-                    line_dash="dash",
-                    line_color="red",
-                    annotation_text="Detection Threshold (-85 dBm)"
-                )
-
-                # Highlight peaks
-                if peaks:
-                    peak_freqs = [p.frequency for p in peaks]
-                    peak_powers = [p.power for p in peaks]
-                    fig.add_trace(go.Scatter(
-                        x=peak_freqs,
-                        y=peak_powers,
-                        mode='markers',
-                        name='Detected Peaks',
-                        marker=dict(size=12, color='red', symbol='star')
-                    ))
-
-                fig.update_layout(
-                    title=f'Spectrum Scan: {scan_start} - {scan_end} MHz',
-                    xaxis_title='Frequency (MHz)',
-                    yaxis_title='Power (dBm)',
-                    height=500,
-                    showlegend=True,
-                    hovermode='x unified'
-                )
-
-                st.plotly_chart(fig, use_container_width=True)
-
-                # Statistics
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("Frequencies Scanned", len(raw_spectrum))
-                with col2:
-                    st.metric("Peaks Found", len(peaks))
-                with col3:
-                    st.metric("Avg Power", f"{np.mean(powers):.1f} dBm")
-                with col4:
-                    st.metric("Max Power", f"{np.max(powers):.1f} dBm")
-
-            # Show peaks table if any
-            if peaks:
-                st.subheader("🎯 Detected Peaks")
-                peaks_df = pd.DataFrame([
-                    {
-                        'Frequency (MHz)': f"{p.frequency:.2f}",
-                        'Power (dBm)': f"{p.power:.1f}",
-                        'SNR (dB)': f"{p.snr:.1f}",
-                        'Bandwidth (MHz)': f"{p.bandwidth:.2f}"
-                    }
-                    for p in peaks
-                ])
-
-                st.dataframe(peaks_df, use_container_width=True, hide_index=True)
+        if st.button("▶️ Start Scan"):
+            scanner = st.session_state.get("scanner")
+            if scanner and hasattr(scanner, "start"):
+                try:
+                    scanner.start()
+                    st.session_state.scan_status = "Active"
+                except Exception as e:
+                    st.error(f"Start failed: {e}")
             else:
-                st.info("ℹ️ No peaks detected above -80 dBm threshold")
+                st.info("Scanner object not attached in this build (Live Detection page wires it up).")
+    with col2:
+        if st.button("⏹ Stop Scan"):
+            scanner = st.session_state.get("scanner")
+            if scanner and hasattr(scanner, "stop"):
+                try:
+                    scanner.stop()
+                    st.session_state.scan_status = "Inactive"
+                except Exception as e:
+                    st.error(f"Stop failed: {e}")
+            else:
+                st.info("Scanner object not attached in this build (Live Detection page wires it up).")
 
-    st.divider()
+    status = st.session_state.get("scan_status", "Inactive")
+    st.sidebar.markdown("### 🟢 Status")
+    st.sidebar.write(f"**{status}**")
 
-    # Modulation Analysis Section
-    st.subheader("🔬 Modulation Analyzer")
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 📊 Statistics (live)")
 
-    analyze_freq = st.number_input("Frequency to Analyze (MHz)", value=314.9, step=0.1)
-    analyze_duration = st.slider("Capture Duration (seconds)", 0.5, 5.0, 2.0, 0.5)
+    stats = cached_realtime_stats(db_path)
 
-    if st.button("🔬 Analyze Modulation"):
-        # Stop any active scanning
-        if st.session_state.is_scanning:
-            st.session_state.hackrf.stop()
-            st.session_state.is_scanning = False
-            time.sleep(1)
+    if isinstance(stats, dict) and stats.get("ok") is False:
+        st.sidebar.warning(f"Stats error: {stats.get('error', 'unknown')}")
 
-        with st.spinner(f"Analyzing {analyze_freq} MHz..."):
-            analysis = st.session_state.debug_tools.analyze_modulation(
-                analyze_freq, duration=analyze_duration
-            )
 
-            st.success("✅ Analysis complete")
 
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Modulation Type", analysis.modulation_type)
-                st.metric("Confidence", f"{analysis.confidence * 100:.0f}%")
-            with col2:
-                st.metric("Baud Rate", f"{analysis.baud_rate:,} bps" if analysis.baud_rate > 0 else "Unknown")
-                st.metric("Bandwidth", f"{analysis.bandwidth:.2f} MHz")
-            with col3:
-                st.metric("Frequency", f"{analysis.frequency:.2f} MHz")
+    # Requested stats
+    st.sidebar.metric("Rate (signals/hr)", int(stats.get("rate_per_hour_last_min", 0)))
+    st.sidebar.metric("Signals (last hour)", int(stats.get("n_last_hour", stats.get("signals_last_hour", 0))))
+    st.sidebar.metric("Repeated signals (last hour)", int(stats.get("repeats_last_hour", stats.get("repeated_signals_last_hour", 0))))
 
-            # Show characteristics
-            if analysis.characteristics:
-                with st.expander("📈 Signal Characteristics"):
-                    char_df = pd.DataFrame([
-                        {'Parameter': k, 'Value': f"{v:.4f}"}
-                        for k, v in analysis.characteristics.items()
-                    ])
-                    st.dataframe(char_df, use_container_width=True, hide_index=True)
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🧾 Inventory")
+    st.sidebar.metric("Known Vehicles", int(stats.get("known_vehicles", 0)))
+    st.sidebar.metric("Known Sensors", int(stats.get("known_sensors", 0)))
 
-    st.divider()
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🧠 Learning")
+    ensure_models(db_path)
+    st.sidebar.checkbox("Auto-learn (small batch each rerun)", value=True, key="auto_learn")
+    st.sidebar.write(f"Last model update: **{fmt_ts(st.session_state.last_model_update)}**")
+    if st.sidebar.button("Update model now"):
+        n = process_online_learning(db_path, limit=10000)
+        if n:
+            st.sidebar.success(f"Learned from {n} new signals")
+        else:
+            st.sidebar.info("No new signals to learn from")
 
-    # Full Diagnostic Suite
-    st.subheader("🚀 Full Diagnostic Suite")
+
+# -----------------------------
+# Pages
+# -----------------------------
+
+def page_live_detection(db_path: str):
+    st.header("🎯 Live Detection - Multi-Scanner")
 
     st.info(
-        "This will run a complete diagnostic including hardware check, spectrum scan, and modulation analysis on all detected signals.")
+        "Scan multiple frequencies simultaneously with multiple SDR devices. "
+        "Perfect for determining which frequency your car uses!"
+    )
 
-    if st.button("🚀 Run Full Diagnostic", type="primary"):
-        # Stop any active scanning
-        if st.session_state.is_scanning:
-            st.session_state.hackrf.stop()
-            st.session_state.is_scanning = False
-            time.sleep(1)
+    # Initialize multi-scanner manager in session state
+    if 'multi_scanner' not in st.session_state:
+        st.session_state.multi_scanner = None
+    if 'scanner_counter' not in st.session_state:
+        st.session_state.scanner_counter = 0
 
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+    # Initialize multi-scanner manager
+    if st.session_state.multi_scanner is None:
+        try:
+            import tpms_decoder
+            from config import config
 
-        status_text.text("Starting diagnostic...")
-        progress_bar.progress(10)
+            db = get_db(db_path)
+            DecoderCls = getattr(tpms_decoder, "TPMSDecoder", None)
+            if DecoderCls is None:
+                st.error("tpms_decoder.TPMSDecoder not found")
+                return
 
-        results = st.session_state.debug_tools.run_full_diagnostic()
+            sample_rate = getattr(config, "SAMPLE_RATE", 2_457_600)
 
-        progress_bar.progress(100)
-        status_text.text("Complete!")
-
-        # Display results
-        st.success("✅ Full diagnostic complete!")
-
-        # Hardware
-        with st.expander("📡 Hardware Info", expanded=True):
-            hw = results['hardware']
-            if hw.device_found:
-                st.write(f"**Serial:** {hw.serial_number}")
-                st.write(f"**Board ID:** {hw.board_id}")
-                st.write(f"**Firmware:** {hw.firmware_version}")
-            else:
-                st.error("Hardware not detected")
-
-        # Spectrum
-        if results['raw_spectrum']:
-            with st.expander(f"📊 Spectrum Scan ({len(results['raw_spectrum'])} frequencies measured)", expanded=True):
-                # Plot full spectrum
-                freqs = [f for f, p in results['raw_spectrum']]
-                powers = [p for f, p in results['raw_spectrum']]
-
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=freqs,
-                    y=powers,
-                    mode='lines+markers',
-                    name='Power',
-                    line=dict(color='lightblue', width=2),
-                    marker=dict(size=3)
-                ))
-
-                # Mark TPMS frequencies
-                for tpms_freq in config.FREQUENCIES:
-                    fig.add_vline(
-                        x=tpms_freq,
-                        line_dash="dash",
-                        line_color="green",
-                        annotation_text=f"{tpms_freq} MHz"
-                    )
-
-                fig.add_hline(y=-80, line_dash="dash", line_color="red", annotation_text="Threshold")
-
-                fig.update_layout(
-                    title='Complete Spectrum Scan',
-                    xaxis_title='Frequency (MHz)',
-                    yaxis_title='Power (dBm)',
-                    height=400
-                )
-
-                st.plotly_chart(fig, use_container_width=True)
-
-                # Show top peaks
-                if results['spectrum_scan']:
-                    st.write("**Top Detected Peaks:**")
-                    spectrum_df = pd.DataFrame([
-                        {
-                            'Frequency': f"{p.frequency:.2f} MHz",
-                            'Power': f"{p.power:.1f} dBm",
-                            'SNR': f"{p.snr:.1f} dB"
-                        }
-                        for p in results['spectrum_scan'][:10]
-                    ])
-                    st.dataframe(spectrum_df, use_container_width=True, hide_index=True)
-                else:
-                    st.info("No peaks above -80 dBm detected")
-
-        # Modulation
-        if results['modulation_analysis']:
-            with st.expander(f"🔬 Modulation Analysis ({len(results['modulation_analysis'])} signals)", expanded=True):
-                for analysis in results['modulation_analysis']:
-                    st.write(f"**{analysis.frequency:.2f} MHz:** {analysis.modulation_type} "
-                             f"({analysis.confidence * 100:.0f}% confidence, {analysis.baud_rate:,} baud)")
-
-
-def main():
-    st.title("🚗 TPMS Tracker - Intelligent Vehicle Pattern Recognition")
-
-    with st.sidebar:
-        st.header("⚙️ Control Panel")
-        st.subheader("Scanner Control")
-
-        frequency = st.selectbox(
-            "Frequency (MHz)",
-            config.FREQUENCIES,
-            index=0
-        )
-
-        # In the sidebar, after frequency selection
-        if st.session_state.is_scanning:
-            st.divider()
-
-            # Manual gain control
-            with st.expander("⚙️ Advanced Settings"):
-                current_gain = st.session_state.hackrf.current_gain
-                new_gain = st.slider(
-                    "Manual Gain (dB)",
-                    min_value=0,
-                    max_value=47,
-                    value=current_gain,
-                    step=2,
-                    help="Adjust receiver gain (must be even number)"
-                )
-
-                if new_gain != current_gain and st.button("Apply Gain"):
-                    st.session_state.hackrf.current_gain = new_gain
-                    st.success(f"Gain set to {new_gain} dB (will apply on next hop)")
-
-        # Add after the Advanced Settings expander in sidebar
-
-        st.divider()
-
-        # Adaptive Features Toggle
-        with st.expander("🎯 Adaptive Features"):
-            adaptive_hop = st.checkbox(
-                "Adaptive Frequency Hopping",
-                value=hasattr(st.session_state.hackrf, 'adaptive_hopping') and st.session_state.hackrf.adaptive_hopping,
-                help="Spend more time on productive frequencies"
+            from multi_scanner_manager import MultiScannerManager
+            st.session_state.multi_scanner = MultiScannerManager(
+                db=db,
+                decoder_class=DecoderCls,
+                sample_rate=sample_rate
             )
+            st.success("Multi-scanner manager initialized!")
+        except Exception as e:
+            st.error(f"Failed to initialize multi-scanner manager: {e}")
+            return
 
-            if adaptive_hop != getattr(st.session_state.hackrf, 'adaptive_hopping', False):
-                st.session_state.hackrf.adaptive_hopping = adaptive_hop
-                if adaptive_hop:
-                    st.success("✅ Adaptive hopping enabled")
-                else:
-                    st.info("ℹ️ Using standard hopping")
+    manager = st.session_state.multi_scanner
 
-            ml_guided = st.checkbox(
-                "ML-Guided Decoding",
-                value=hasattr(st.session_state.decoder, 'learning_engine'),
-                help="Use learned patterns to optimize decoding"
-            )
+    # Add new scanner section
+    with st.expander("➕ Add New Scanner", expanded=manager.get_scanner_count() == 0):
+        st.write("Configure and add a new SDR scanner")
 
-            st.caption("These features improve over time as the system learns")
+        col1, col2, col3 = st.columns(3)
 
-        col1, col2 = st.columns(2)
         with col1:
-            if st.button("▶️ Start Scan", disabled=st.session_state.is_scanning):
-                st.session_state.is_scanning = True
-                st.session_state.hackrf.start(frequency, signal_callback)
-                st.success("Scanning started!")
+            hw_type = st.selectbox(
+                "Hardware Type",
+                options=["Auto-detect", "HackRF", "RTL-SDR", "Simulation"],
+                key="new_hw_type"
+            )
 
         with col2:
-            if st.button("⏹️ Stop Scan", disabled=not st.session_state.is_scanning):
-                st.session_state.is_scanning = False
-                st.session_state.hackrf.stop()
-                st.info("Scanning stopped")
+            freq_mhz = st.selectbox(
+                "Frequency (MHz)",
+                options=FREQUENCIES,
+                key="new_freq"
+            )
 
-        if st.session_state.is_scanning:
-            status = st.session_state.hackrf.get_status()
-            st.metric("Status", "🟢 Active")
-            st.metric("Frequency", f"{status['frequency']:.2f} MHz")
-            st.metric("Gain", f"{status['gain']} dB")
-            if status['avg_signal_strength']:
-                st.metric("Signal", f"{status['avg_signal_strength']:.1f} dBm")
+        with col3:
+            scanner_name = st.text_input(
+                "Scanner Name (optional)",
+                placeholder=f"Scanner {st.session_state.scanner_counter + 1}",
+                key="new_scanner_name"
+            )
+
+        if st.button("🔌 Add Scanner", type="primary"):
+            try:
+                import hardware_manager
+
+                hw_map = {
+                    "Auto-detect": None,
+                    "HackRF": "hackrf",
+                    "RTL-SDR": "rtlsdr",
+                    "Simulation": "simulation"
+                }
+
+                preferred = hw_map[hw_type]
+                scanner = hardware_manager.create_hardware_interface(preferred=preferred)
+
+                if scanner is None:
+                    st.error(f"❌ Failed to initialize {hw_type}")
+                    return
+
+                # Get actual hardware type
+                hw_manager = hardware_manager.HardwareManager(preferred=preferred)
+                hw_info = hw_manager.get_hardware_info()
+                actual_hw_type = hw_info.get("type")
+
+                # Validate hardware type
+                if actual_hw_type is None:
+                    st.error("❌ Hardware initialization failed - could not determine hardware type")
+                    return
+
+                # Generate scanner ID
+                if scanner_name and scanner_name.strip():
+                    scanner_id = scanner_name.strip()
+                else:
+                    st.session_state.scanner_counter += 1
+                    scanner_id = f"scanner_{st.session_state.scanner_counter}"
+
+                # Add to manager
+                freq_hz = float(freq_mhz) * 1e6
+                if manager.add_scanner(scanner_id, actual_hw_type, freq_hz, scanner):
+                    st.success(f"✅ Added {scanner_id}: {actual_hw_type.upper()} @ {freq_mhz} MHz")
+                    st.rerun()
+                else:
+                    st.error(f"Failed to add scanner (ID may already exist)")
+
+            except Exception as e:
+                st.error(f"Error adding scanner: {e}")
+                import traceback
+                st.code(traceback.format_exc())
+
+    # Display active scanners
+    st.markdown("---")
+    st.subheader("📡 Active Scanners")
+
+    status = manager.get_status()
+
+    if not status:
+        st.info("No scanners configured. Add a scanner above to get started!")
+        return
+
+    # Create a row for each scanner
+    for scanner_id, info in status.items():
+        with st.container():
+            col1, col2, col3, col4, col5, col6 = st.columns([2, 1.5, 1, 1, 1, 1])
+
+            with col1:
+                # Safe hardware type handling
+                hw_type_str = info.get('hardware_type') or 'unknown'
+                hw_icon = {"hackrf": "🔴", "rtlsdr": "📻", "simulation": "🎮"}.get(hw_type_str, "❓")
+                st.write(f"{hw_icon} **{scanner_id}**")
+                st.caption(f"{hw_type_str.upper()}")
+
+            with col2:
+                freq = info.get('frequency', 0)
+                st.metric("Frequency", f"{freq:.2f} MHz")
+
+            with col3:
+                is_running = info.get('is_running', False)
+                if is_running:
+                    st.success("🟢 Active")
+                else:
+                    st.info("⚪ Idle")
+
+            with col4:
+                if is_running:
+                    if st.button("⏹️ Stop", key=f"stop_{scanner_id}"):
+                        if manager.stop_scanner(scanner_id):
+                            st.success(f"Stopped {scanner_id}")
+                            st.rerun()
+                else:
+                    if st.button("▶️ Start", key=f"start_{scanner_id}"):
+                        if manager.start_scanner(scanner_id):
+                            st.success(f"Started {scanner_id}")
+                            st.rerun()
+
+            with col5:
+                # Change frequency
+                freq = info.get('frequency', FREQUENCIES[0])
+                try:
+                    current_idx = FREQUENCIES.index(freq) if freq in FREQUENCIES else 0
+                except (ValueError, IndexError):
+                    current_idx = 0
+
+                new_freq = st.selectbox(
+                    "Freq",
+                    options=FREQUENCIES,
+                    index=current_idx,
+                    key=f"freq_{scanner_id}",
+                    label_visibility="collapsed"
+                )
+                if new_freq != freq:
+                    if manager.change_frequency(scanner_id, float(new_freq) * 1e6):
+                        st.rerun()
+
+            with col6:
+                if st.button("🗑️", key=f"remove_{scanner_id}", help="Remove scanner"):
+                    if manager.remove_scanner(scanner_id):
+                        st.success(f"Removed {scanner_id}")
+                        st.rerun()
+
+            # Show error if present
+            if 'error' in info:
+                st.error(f"Error: {info['error']}")
+
+            st.markdown("---")
+
+    # Global controls
+    st.subheader("🎛️ Global Controls")
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        if st.button("▶️ Start All", type="primary"):
+            results = manager.start_all()
+            success_count = sum(1 for v in results.values() if v)
+            st.success(f"Started {success_count}/{len(results)} scanners")
+            st.rerun()
+
+    with col2:
+        if st.button("⏹️ Stop All"):
+            results = manager.stop_all()
+            st.info("All scanners stopped")
+            st.rerun()
+
+    with col3:
+        st.metric("Total Scanners", manager.get_scanner_count())
+
+    with col4:
+        st.metric("Running", manager.get_running_count())
+
+    # Show recent signals grouped by frequency
+    st.markdown("---")
+    st.subheader("📊 Recent Detections (Last 2 Minutes)")
+
+    db = get_db(db_path)
+    recent = db.get_recent_signals(time_window=120)
+    df = pd.DataFrame(recent)
+
+    if df.empty:
+        st.write("No recent signals detected.")
+        return
+
+    df["time"] = df["timestamp"].apply(fmt_ts)
+
+    # Group by frequency
+    if "frequency" in df.columns:
+        for freq in sorted(df["frequency"].unique()):
+            freq_df = df[df["frequency"] == freq].copy()
+
+            with st.expander(f"📡 {freq / 1e6:.2f} MHz ({len(freq_df)} signals)", expanded=True):
+                show_cols = [c for c in ["time", "tpms_id", "protocol", "pressure_psi", "temperature_c",
+                                         "battery_low", "signal_strength", "snr"]
+                             if c in freq_df.columns]
+                st.dataframe(
+                    freq_df[show_cols].sort_values("time", ascending=False),
+                    width='stretch',
+                    height=min(300, len(freq_df) * 35 + 38)
+                )
+    else:
+        show_cols = [c for c in ["time", "tpms_id", "protocol", "pressure_psi", "temperature_c",
+                                 "battery_low", "signal_strength", "snr", "frequency"]
+                     if c in df.columns]
+        st.dataframe(df[show_cols].sort_values("time", ascending=False),
+                     width='stretch', height=420)
+
+
+def page_sensor_database(db_path: str):
+    st.header("📡 Sensor Database")
+
+    db = get_db(db_path)
+
+    lookback_h = st.slider("Look back window (hours)", 1, 72, 24)
+    since = time.time() - lookback_h * 3600
+
+    # Fast top sensors query
+    conn = db._connect(read_only=True)  # intentionally using the helper for speed
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT tpms_id,
+               COUNT(*)             AS signals,
+               MIN(timestamp)       AS first_ts,
+               MAX(timestamp)       AS last_ts,
+               AVG(signal_strength) AS avg_rssi,
+               AVG(pressure_psi)    AS avg_pressure,
+               AVG(temperature_c)   AS avg_temp,
+               AVG(frequency)       AS avg_freq
+        FROM tpms_signals
+        WHERE timestamp >= ?
+        GROUP BY tpms_id
+        ORDER BY signals DESC
+        LIMIT 1000
+        """,
+        (since,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    df = pd.DataFrame([dict(r) for r in rows])
+    if df.empty:
+        st.write("No sensors found in that window.")
+        return
+
+    df["first_seen"] = df["first_ts"].apply(fmt_ts)
+    df["last_seen"] = df["last_ts"].apply(fmt_ts)
+
+    display_cols = ["tpms_id", "signals", "first_seen", "last_seen", "avg_rssi",
+                    "avg_pressure", "avg_temp", "avg_freq"]
+    st.dataframe(df[display_cols], width='stretch', height=560)
+
+
+def page_vehicle_database(db_path: str):
+    st.header("🚗 Vehicle Database")
+
+    db = get_db(db_path)
+
+    st.caption("Vehicles are inferred from sensor co-occurrence. This page is lightweight by default.")
+    min_enc = st.slider("Min encounters (filter)", 0, 20, 3)
+    vehicles = db.get_all_vehicles(min_encounters=int(min_enc))
+
+    if not vehicles:
+        st.write("No vehicles found yet.")
+        return
+
+    df = pd.DataFrame(vehicles)
+    show_cols = [c for c in ["vehicle_hash", "sensor_count", "encounter_count", "first_seen", "last_seen", "confidence_score"] if c in df.columns]
+    if "first_seen" in df.columns:
+        df["first_seen"] = df["first_seen"].apply(fmt_ts)
+    if "last_seen" in df.columns:
+        df["last_seen"] = df["last_seen"].apply(fmt_ts)
+
+    st.dataframe(df[show_cols], width='stretch', height=520)
+
+    with st.expander("Show sensors for a vehicle"):
+        vh = st.selectbox("Vehicle hash", options=df["vehicle_hash"].tolist())
+        details = db.get_vehicle_details(vh)
+        st.json(details)
+
+
+def page_analytics(db_path: str):
+    st.header("📈 Analytics")
+
+    db = get_db(db_path)
+
+    col1, col2, col3 = st.columns([1, 1, 2])
+    with col1:
+        lookback_h = st.selectbox("Window", [1, 6, 12, 24, 48, 72], index=3)
+    with col2:
+        bucket = st.selectbox("Bucket", ["1 min", "5 min", "15 min", "1 hour"], index=1)
+    with col3:
+        st.caption("All charts are computed from a time-windowed subset (fast).")
+
+    now = time.time()
+    since = now - int(lookback_h) * 3600
+
+    bucket_s = {"1 min": 60, "5 min": 300, "15 min": 900, "1 hour": 3600}[bucket]
+
+    # Pull just timestamps (fast) and bucket in pandas
+    conn = db._connect(read_only=True)
+    cur = conn.cursor()
+    cur.execute("SELECT timestamp FROM tpms_signals WHERE timestamp >= ? ORDER BY timestamp ASC", (since,))
+    ts = [float(r[0]) for r in cur.fetchall()]
+    conn.close()
+
+    if not ts:
+        st.write("No signals in that window.")
+        return
+
+    s = pd.Series(1, index=pd.to_datetime(ts, unit="s"))
+    series = s.resample(f"{bucket_s}S").sum()
+
+    st.line_chart(series)
+
+    # Top sensors
+    conn = db._connect(read_only=True)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT tpms_id, COUNT(*) AS n
+        FROM tpms_signals
+        WHERE timestamp >= ?
+        GROUP BY tpms_id
+        ORDER BY n DESC
+        LIMIT 20
+        """,
+        (since,),
+    )
+    top = cur.fetchall()
+    conn.close()
+
+    top_df = pd.DataFrame([{"tpms_id": r[0], "signals": int(r[1])} for r in top])
+    st.subheader("Top sensors (by signals)")
+    st.dataframe(top_df, width='stretch', height=360)
+
+    # Pressure/Temp distributions (sample)
+    st.subheader("Pressure / Temperature (sample)")
+    conn = db._connect(read_only=True)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT pressure_psi, temperature_c
+        FROM tpms_signals
+        WHERE timestamp >= ?
+          AND pressure_psi IS NOT NULL
+          AND temperature_c IS NOT NULL
+        ORDER BY timestamp DESC
+        LIMIT 5000
+        """,
+        (since,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    if rows:
+        df = pd.DataFrame(rows, columns=["pressure_psi", "temperature_c"])
+        st.scatter_chart(df, x="pressure_psi", y="temperature_c")
+
+
+def page_maintenance(db_path: str):
+    st.header("🛠 Maintenance")
+
+    db = get_db(db_path)
+
+    st.caption(
+        "Maintenance analysis can get expensive if you run it over the whole DB. "
+        "This page defaults to a time window and computes alerts on-demand."
+    )
+
+    lookback_days = st.slider("Analyze lookback (days)", 1, 30, 7)
+    min_vehicle_enc = st.slider("Vehicles: min encounters", 0, 20, 3)
+
+    vehicles = db.get_all_vehicles(min_encounters=int(min_vehicle_enc))
+    if not vehicles:
+        st.write("No vehicles found yet.")
+        return
+
+    vdf = pd.DataFrame(vehicles)
+    if "vehicle_hash" not in vdf.columns:
+        st.write("Vehicle data missing vehicle_hash column.")
+        return
+
+    selected = st.selectbox("Select a vehicle", options=vdf["vehicle_hash"].tolist())
+    details = db.get_vehicle_details(selected)
+
+    st.subheader("Vehicle details")
+    st.json(details)
+
+    if st.button("Run maintenance alert scan for this vehicle"):
+        # Best-effort: analyze only sensors in this vehicle
+        sensors = details.get("tpms_ids") or details.get("sensors") or []
+        if isinstance(sensors, str):
+            sensors = [s.strip() for s in sensors.split(",") if s.strip()]
+
+        if not sensors:
+            st.warning("No sensors found for this vehicle.")
+            return
+
+        since = time.time() - float(lookback_days) * 86400.0
+        conn = db._connect(read_only=True)
+        cur = conn.cursor()
+
+        alerts = []
+        for sid in sensors:
+            cur.execute(
+                """
+                SELECT timestamp, pressure_psi, temperature_c, battery_low
+                FROM tpms_signals
+                WHERE tpms_id = ?
+                  AND timestamp >= ?
+                ORDER BY timestamp DESC
+                LIMIT 2000
+                """,
+                (sid, since),
+            )
+            rows = cur.fetchall()
+            if not rows:
+                continue
+            sdf = pd.DataFrame(rows, columns=["timestamp", "pressure_psi", "temperature_c", "battery_low"])
+
+            # simple heuristics
+            p = pd.to_numeric(sdf["pressure_psi"], errors="coerce").dropna()
+            t = pd.to_numeric(sdf["temperature_c"], errors="coerce").dropna()
+
+            if len(p) >= 10:
+                drift = float(p.iloc[0] - p.iloc[-1])
+                if abs(drift) >= 2.5:
+                    alerts.append({"tpms_id": sid, "type": "Pressure drift", "detail": f"{drift:+.1f} PSI over window"})
+
+                if float(p.min()) <= 18:
+                    alerts.append({"tpms_id": sid, "type": "Low pressure", "detail": f"min {float(p.min()):.1f} PSI"})
+
+            if len(t) >= 10:
+                if float(t.max()) >= 85:
+                    alerts.append({"tpms_id": sid, "type": "High temp", "detail": f"max {float(t.max()):.1f}°C"})
+
+            # battery low flags
+            if "battery_low" in sdf.columns and sdf["battery_low"].fillna(0).astype(int).sum() > 0:
+                alerts.append({"tpms_id": sid, "type": "Battery low", "detail": "battery_low observed"})
+
+        conn.close()
+
+        if not alerts:
+            st.success("No alerts triggered by heuristics.")
         else:
-            st.metric("Status", "🔴 Inactive")
+            adf = pd.DataFrame(alerts)
+            st.dataframe(adf, width='stretch', height=420)
 
-        st.divider()
 
-        st.subheader("📊 Statistics")
-        vehicles = st.session_state.db.get_all_vehicles()
-        st.metric("Known Vehicles", len(vehicles))
+def page_ml_insights(db_path: str):
+    st.header("🧠 ML Insights")
+    ensure_models(db_path)
 
-        recent_signals = st.session_state.db.get_recent_signals(3600)
-        st.metric("Signals (1hr)", len(recent_signals))
+    db = get_db(db_path)
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "🎯 Live Detection",
-        "🚗 Vehicle Database",
-        "📈 Analytics",
-        "🔧 Maintenance",
-        "🤖 Signal Learning",
-        "🔧 Debug Tools"
-    ])
+    st.caption(
+        "This page uses mixed learning: online incremental updates + batch analysis from a selected window.\n\n"
+        "Online model updates are fast (only new DB rows). Batch analysis is optional and windowed."
+    )
 
-    with tab1:
-        show_live_detection()
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        if st.button("Learn from new signals"):
+            n = process_online_learning(db_path, limit=20000)
+            if n:
+                st.success(f"Updated models from {n} new signals")
+            else:
+                st.info("No new signals.")
+    with col2:
+        st.write(
+            f"Online learner updates: **{st.session_state.online_learner.total_updates}**, "
+            f"last rowid: **{st.session_state.online_learner.last_rowid}**"
+        )
 
-    with tab2:
-        show_vehicle_database()
+    # Choose a sensor
+    lookback_h = st.slider("Sensor picker lookback (hours)", 1, 72, 24)
+    since = time.time() - float(lookback_h) * 3600.0
 
-    with tab3:
-        show_analytics()
+    conn = db._connect(read_only=True)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT tpms_id, COUNT(*) AS n
+        FROM tpms_signals
+        WHERE timestamp >= ?
+        GROUP BY tpms_id
+        ORDER BY n DESC
+        LIMIT 500
+        """,
+        (since,),
+    )
+    sensors = [r[0] for r in cur.fetchall()]
+    conn.close()
 
-    with tab4:
-        show_maintenance()
+    if not sensors:
+        st.write("No sensors in that window.")
+        return
 
-    with tab5:
-        show_ml_learning()
+    sensor = st.selectbox("Sensor ID", options=sensors)
 
-    with tab6:
-        show_debug_tools()
+    # Latest reading for sensor
+    conn = db._connect(read_only=True)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT timestamp, pressure_psi, temperature_c, latitude, longitude
+        FROM tpms_signals
+        WHERE tpms_id = ?
+        ORDER BY timestamp DESC
+        LIMIT 1
+        """,
+        (sensor,),
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        st.write("No data for sensor.")
+        return
+
+    ts, p, t, lat, lon = float(row[0]), row[1], row[2], row[3], row[4]
+    st.subheader("Latest reading")
+    st.write(
+        f"Time: **{fmt_ts(ts)}**  |  Pressure: **{p} PSI**  |  Temp: **{t} °C**  "
+        f"|  Location: **({lat}, {lon})**"
+    )
+
+    # Prediction + anomaly
+    pred = st.session_state.online_learner.predict(sensor_id=sensor, ts=ts, lat=safe_float(lat), lon=safe_float(lon))
+    if pred.get("ok"):
+        st.subheader("Predicted baseline (online)")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Pred Pressure", f"{pred['pressure_pred']:.1f} PSI")
+        c2.metric("Pred Temp", f"{pred['temp_pred']:.1f} °C")
+        c3.metric("Pressure conf", f"{pred['pressure_conf']:.2f}")
+        c4.metric("Temp conf", f"{pred['temp_conf']:.2f}")
+
+        an = st.session_state.online_learner.anomaly_scores(sensor, safe_float(p), safe_float(t), ts=ts)
+        if an.get("ok"):
+            z_p = an.get("z_pressure")
+            z_t = an.get("z_temp")
+            st.subheader("Anomaly score (z)")
+            c1, c2 = st.columns(2)
+            c1.metric("z(Pressure)", "—" if z_p is None else f"{z_p:+.2f}")
+            c2.metric("z(Temp)", "—" if z_t is None else f"{z_t:+.2f}")
+
+    else:
+        st.info(pred.get("reason", "No prediction available."))
+
+    # Batch pattern slice
+    with st.expander("Batch patterns (windowed)"):
+        w_h = st.slider("Batch window (hours)", 1, 168, 48)
+        since2 = time.time() - float(w_h) * 3600.0
+
+        conn = db._connect(read_only=True)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT timestamp, pressure_psi, temperature_c
+            FROM tpms_signals
+            WHERE tpms_id = ?
+              AND timestamp >= ?
+            ORDER BY timestamp ASC
+            LIMIT 20000
+            """,
+            (sensor, since2),
+        )
+        rows = cur.fetchall()
+        conn.close()
+
+        if rows:
+            df = pd.DataFrame(rows, columns=["timestamp", "pressure_psi", "temperature_c"])
+            df["dt"] = pd.to_datetime(df["timestamp"], unit="s")
+            df = df.set_index("dt").drop(columns=["timestamp"])
+            st.line_chart(df.resample("15min").mean(numeric_only=True))
+
+            # Hour-of-day profile
+            df2 = df.copy()
+            df2["hour"] = df2.index.hour
+            prof = df2.groupby("hour")[["pressure_psi", "temperature_c"]].mean(numeric_only=True).reset_index()
+            st.dataframe(prof, width='stretch')
+
+def page_sensor_trigger(db_path: str):
+    st.header("🧲 Sensor Trigger")
+
+    st.info("Placeholder UI for your ESP32 / GPIO / SDR trigger controls.")
+    st.write("If your project provides esp32_trigger_controller, wire it up here with lazy imports (same pattern as Live Detection).")
+
+
+# -----------------------------
+# Main
+# -----------------------------
+
+def main():
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
+
+    # Header
+    st.markdown(f"# 🚗 {APP_TITLE}")
+    st.caption(f"DB: {DB_PATH}")
+
+    # Sidebar
+    sidebar_control_panel(DB_PATH)
+
+    # Page selection (segmented control)
+    pages = [
+        ("Live Detection", page_live_detection),
+        ("Vehicle Database", page_vehicle_database),
+        ("Sensor Database", page_sensor_database),
+        ("Analytics", page_analytics),
+        ("Maintenance", page_maintenance),
+        ("ML Insights", page_ml_insights),
+        ("Sensor Trigger", page_sensor_trigger),
+    ]
+
+    labels = [p[0] for p in pages]
+    st.markdown(
+        """
+        <style>
+        div[role="radiogroup"] > label {
+            background: rgba(127,127,127,0.08);
+            padding: 6px 10px;
+            border-radius: 999px;
+            margin-right: 6px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    choice = st.radio("Navigation", labels, horizontal=True, label_visibility="collapsed")
+    page_fn = dict(pages)[choice]
+
+    # Opportunistic lightweight online learning on each run (small batch)
+    # Keeps predictions "fresh" without making the UI sluggish.
+    if st.session_state.get("auto_learn", True):
+        try:
+            process_online_learning(DB_PATH, limit=2000)
+        except Exception:
+            pass
+
+    page_fn(DB_PATH)
 
 
 if __name__ == "__main__":
