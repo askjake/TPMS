@@ -60,8 +60,17 @@ class MultiScannerManager:
             # Create decoder instance for this scanner
             decoder = self.decoder_class(self.sample_rate)
 
-            # Attach pipeline
-            scanner.attach_pipeline(db=self.db, decoder=decoder)
+            # Attach pipeline with GPS callback
+            def on_signal_with_gps(signal_dict):
+                # Add GPS coordinates if available
+                if 'gps_manager' in st.session_state:
+                    gps = st.session_state.gps_manager
+                    location = gps.get_location()
+                    if location:
+                        signal_dict['latitude'] = location[0]
+                        signal_dict['longitude'] = location[1]
+
+            scanner.attach_pipeline(db=self.db, decoder=decoder, on_signal=on_signal_with_gps)
 
             # Set frequency
             scanner.change_frequency(frequency)

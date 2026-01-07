@@ -161,10 +161,10 @@ class TPMSDatabase:
         """Insert multiple signals in a batch for better performance"""
         if not signals:
             return 0
-        
+
         conn = self._connect()
         cursor = conn.cursor()
-        
+
         rows = []
         for signal_data in signals:
             rows.append((
@@ -181,15 +181,15 @@ class TPMSDatabase:
                 signal_data.get('protocol', 'unknown'),
                 signal_data.get('raw_data')
             ))
-        
+
         cursor.executemany('''
-            INSERT INTO tpms_signals
-            (tpms_id, timestamp, latitude, longitude, frequency,
-             signal_strength, snr, pressure_psi, temperature_c,
-             battery_low, protocol, raw_data)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', rows)
-        
+                           INSERT INTO tpms_signals
+                           (tpms_id, timestamp, latitude, longitude, frequency,
+                            signal_strength, snr, pressure_psi, temperature_c,
+                            battery_low, protocol, raw_data)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           ''', rows)
+
         count = cursor.rowcount
         conn.commit()
         conn.close()
@@ -431,7 +431,7 @@ class TPMSDatabase:
         if not result:
             conn.close()
             return {}
-        
+
         tpms_ids = json.loads(result[0])
         cutoff_time = datetime.now().timestamp() - (days * 86400)
 
@@ -565,20 +565,19 @@ class TPMSDatabase:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT
-                rowid,
-                tpms_id,
-                protocol,
-                timestamp,
-                frequency,
-                pressure_psi,
-                temperature_c,
-                battery_low,
-                signal_strength,
-                snr,
-                latitude,
-                longitude,
-                raw_data
+            SELECT rowid,
+                   tpms_id,
+                   protocol,
+                   timestamp,
+                   frequency,
+                   pressure_psi,
+                   temperature_c,
+                   battery_low,
+                   signal_strength,
+                   snr,
+                   latitude,
+                   longitude,
+                   raw_data
             FROM tpms_signals
             WHERE rowid > ?
             ORDER BY rowid ASC
@@ -586,13 +585,17 @@ class TPMSDatabase:
             """,
             (int(last_rowid), int(limit)),
         )
+
+        # Get column names
+        columns = [description[0] for description in cur.description]
         rows = cur.fetchall()
         conn.close()
 
         out: List[Dict[str, Any]] = []
         for r in rows:
-            # sqlite3.Row supports mapping-like access
-            out.append(dict(r))
+            # Build dict from column names and row values
+            row_dict = dict(zip(columns, r))
+            out.append(row_dict)
         return out
 
     def ensure_performance_indexes(self) -> None:
@@ -618,4 +621,3 @@ class TPMSDatabase:
             conn.commit()
         finally:
             conn.close()
-

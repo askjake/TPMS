@@ -2,13 +2,14 @@
 TPMS Signal Decoder with Protocol Detection
 Matching Maurader TPMSRX implementation
 """
+
 import numpy as np
 from scipy import signal as scipy_signal
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Tuple
 import time
 from config import config
-# At the top of tpms_decoder.py
+
 import logging
 import sys
 from pathlib import Path
@@ -17,29 +18,26 @@ from pathlib import Path
 log_dir = Path(__file__).parent / "logs"
 log_dir.mkdir(exist_ok=True)
 
-# Configure root logger to WARNING to suppress DEBUG from other libraries
 logging.basicConfig(
-    level=logging.WARNING,  # Changed from DEBUG
+    level=logging.WARNING,
     format='[%(asctime)s] %(name)s - %(levelname)s - %(message)s',
 )
 
-# Set our logger to INFO
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# Add file handler for our logger only
 file_handler = logging.FileHandler(log_dir / "tpms_decoder.log")
 file_handler.setLevel(logging.INFO)
 file_handler.setFormatter(logging.Formatter('[%(asctime)s] %(name)s - %(levelname)s - %(message)s'))
 logger.addHandler(file_handler)
 
-# Also log to console
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setLevel(logging.DEBUG)
 console_handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s - %(message)s'))
 logger.addHandler(console_handler)
 
 logger.info("TPMS Decoder initialized")
+
 
 @dataclass
 class TPMSSignal:
@@ -55,6 +53,7 @@ class TPMSSignal:
     raw_data: bytes
     confidence: float = 0.0
 
+
 @dataclass
 class UnknownSignal:
     timestamp: float
@@ -66,19 +65,22 @@ class UnknownSignal:
     pattern_signature: str
     raw_samples: np.ndarray
 
+
 class TPMSDecoder:
     def __init__(self, sample_rate: int):
         self.sample_rate = sample_rate
         self.unknown_signals = []
         self.protocol_patterns = {}
         self.learning_engine = None
+        self._failed_count = 0
+        self._success_count = 0
         self._init_protocol_patterns()
 
     def _init_protocol_patterns(self):
         """Initialize known TPMS protocol patterns matching Maurader"""
         self.protocol_patterns = {
             'Schrader_FSK': {
-                'preamble': [0x55, 0x55],  # Alternating pattern
+                'preamble': [0x55, 0x55],
                 'packet_length': 10,
                 'modulation': 'FSK',
                 'symbol_rate': 19200,
@@ -118,7 +120,7 @@ class TPMSDecoder:
 
         power = np.abs(iq_samples) ** 2
         avg_power = float(np.mean(power))
-        signal_strength = 10 * np.log10(avg_power + 1e-10)  # dBFS-ish, not calibrated dBm
+        signal_strength = 10 * np.log10(avg_power + 1e-10)
         snr = float(self._calculate_snr(iq_samples))
 
         if signal_strength < config.SIGNAL_THRESHOLD:
@@ -135,11 +137,16 @@ class TPMSDecoder:
             if decoded:
                 decoded_any = decoded
                 signals.append(decoded)
+                self._success_count += 1
 
-                # safer print (pressure can be None)
                 p = decoded.pressure_psi
                 p_str = f"{p:.1f} PSI" if p is not None else "PSI=?"
-                logger.info(f"✅ {protocol_name}: {decoded.tpms_id} | {p_str} | {signal_strength:.1f} dB")
+                t = decoded.temperature_c
+                t_str = f"{t:.1f}°C" if t is not None else "T=?"
+
+                # Log every 10th successful decode to reduce spam
+                if self._success_count % 10 == 0:
+                    logger.info(f"✅ {protocol_name}: {decoded.tpms_id} | {p_str} | {t_str} | {signal_strength:.1f} dB | Total: {self._success_count}")
 
                 if self.learning_engine:
                     self.learning_engine.learn_from_signal(
@@ -154,13 +161,12 @@ class TPMSDecoder:
                         decoded=True,
                         protocol=protocol_name
                     )
-                break  # stop after first successful decode
+                break
 
         if decoded_any is None:
-            # count failures once per call, not once per protocol
-            self._failed_count = getattr(self, "_failed_count", 0) + 1
+            self._failed_count += 1
             if self._failed_count % 100 == 0:
-                logger.info(f"⚠️  {self._failed_count} signals failed to decode")
+                logger.info(f"⚠️  {self._failed_count} signals failed to decode (vs {self._success_count} successful)")
 
             if config.PROTOCOL_DETECTION_ENABLED:
                 unknown = self._analyze_unknown_signal(iq_samples, frequency, signal_strength)
@@ -183,14 +189,14 @@ class TPMSDecoder:
         return signals
 
     def _try_decode_protocol(self, iq_samples: np.ndarray, protocol_name: str,
-                            pattern: dict, frequency: float, signal_strength: float,
-                            snr: float) -> Optional[TPMSSignal]:
+                             pattern: dict, frequency: float, signal_strength: float,
+                             snr: float) -> Optional[TPMSSignal]:
         """Attempt to decode signal with specific protocol"""
         try:
             # Demodulate based on modulation type
             if pattern['modulation'] == 'FSK':
                 bits = self._demodulate_fsk(iq_samples, pattern['symbol_rate'],
-                                           pattern.get('deviation', pattern['symbol_rate'] * 2))
+                                            pattern.get('deviation', pattern['symbol_rate'] * 2))
             elif pattern['modulation'] == 'OOK':
                 bits = self._demodulate_ook(iq_samples, pattern['symbol_rate'])
             else:
@@ -220,10 +226,16 @@ class TPMSDecoder:
             # Convert to bytes
             packet_bytes = self._bits_to_bytes(packet_bits)
 
-            # Validate and decode packet
-            if not self._validate_packet(packet_bytes, protocol_name):
+            # 🔧 DEBUG LOGGING MOVED HERE - after packet_bytes is defined
+            if self._success_count % 100 == 0:  # Log every 100th packet
+                debug_info = self.debug_packet_decode(packet_bytes, protocol_name)
+                logger.info(f"📦 Packet debug: {debug_info}")
+
+            # Validate packet structure (RELAXED validation)
+            if not self._validate_packet_structure(packet_bytes, protocol_name):
                 return None
 
+            # Decode packet (this can return partial data)
             decoded = self._decode_packet(packet_bytes, protocol_name)
 
             if decoded:
@@ -242,15 +254,141 @@ class TPMSDecoder:
                 )
 
         except Exception as e:
-            print(f"⚠️  Error decoding {protocol_name}: {e}")
+            logger.debug(f"Error decoding {protocol_name}: {e}")
             return None
+
+    def _validate_packet_structure(self, packet: bytes, protocol: str) -> bool:
+        """Validate basic packet structure (RELAXED - don't reject based on data values)"""
+        if len(packet) < 4:
+            return False
+
+        # Check for obviously invalid ID patterns
+        # Allow 0x00 in some positions, but not all zeros
+        if all(b == 0x00 for b in packet[:4]):
+            return False
+        if all(b == 0xFF for b in packet[:4]):
+            return False
+
+        # That's it! Don't validate pressure/temp ranges here
+        # Let the decoder extract whatever values exist
+        return True
+
+    def _decode_schrader_pressure_psi(self, pressure_raw: int) -> Optional[float]:
+        """Decode Schrader pressure with permissive range"""
+        if pressure_raw == 0 or pressure_raw == 255:
+            return None
+        # Allow full range - validation happens at display/analysis time
+        return float(pressure_raw) * 0.25
+
+    def _decode_packet(self, packet: bytes, protocol: str) -> Optional[Dict]:
+        """Decode packet based on protocol - extract whatever data is available"""
+        if len(packet) < 4:
+            return None
+
+        try:
+            # Extract ID (first 4 bytes for most protocols)
+            tpms_id = ''.join(f'{b:02X}' for b in packet[:4])
+
+            pressure = None
+            temperature = None
+            battery_low = False
+            confidence = 0.7
+
+            # Schrader protocol decoding
+            if 'Schrader' in protocol:
+                if len(packet) >= 5:
+                    pressure_raw = packet[4]
+                    pressure = self._decode_schrader_pressure_psi(pressure_raw)
+                    # Sanity check: typical tire pressure 15-60 PSI
+                    if pressure is not None and 10.0 <= pressure <= 80.0:
+                        confidence += 0.1
+                    else:
+                        pressure = None  # Reject invalid pressure
+
+                if len(packet) >= 6:
+                    temp_raw = packet[5]
+                    # Temperature offset: typically -40°C to +215°C range (raw 0-255)
+                    # But realistic tire temps: -20°C to +80°C (raw 20-120)
+                    if 20 < temp_raw < 120:  # Realistic range
+                        temperature = temp_raw - 40
+                        confidence += 0.1
+                    else:
+                        temperature = None  # Reject invalid temp
+
+                if len(packet) >= 7:
+                    flags = packet[6]
+                    battery_low = bool(flags & 0x80)
+
+            # Toyota protocol decoding
+            elif 'Toyota' in protocol:
+                if len(packet) >= 7:
+                    pressure_raw = packet[6]
+                    if 0 < pressure_raw < 255:
+                        pressure = pressure_raw * 0.25
+                        # Sanity check
+                        if not (10.0 <= pressure <= 80.0):
+                            pressure = None
+                        else:
+                            confidence += 0.1
+
+                if len(packet) >= 8:
+                    temp_raw = packet[7]
+                    if 20 < temp_raw < 120:  # Realistic range
+                        temperature = temp_raw - 40
+                        confidence += 0.1
+                    else:
+                        temperature = None
+
+                if len(packet) >= 9:
+                    flags = packet[8]
+                    battery_low = bool(flags & 0x40)
+
+            # Don't return packets with no valid data
+            if pressure is None and temperature is None:
+                return None
+
+            return {
+                'id': tpms_id,
+                'pressure': pressure,
+                'temperature': temperature,
+                'battery_low': battery_low,
+                'confidence': min(confidence, 1.0)
+            }
+
+        except Exception as e:
+            logger.debug(f"Packet decode error: {e}")
+            return None
+
+    def debug_packet_decode(self, packet: bytes, protocol: str) -> Dict:
+        """Debug helper to see raw packet bytes and decoded values"""
+        result = {
+            'raw_hex': ' '.join(f'{b:02X}' for b in packet),
+            'raw_bytes': list(packet),
+            'length': len(packet),
+            'protocol': protocol
+        }
+
+        if 'Schrader' in protocol and len(packet) >= 7:
+            result['id_hex'] = ''.join(f'{b:02X}' for b in packet[:4])
+            result['pressure_raw'] = packet[4]
+            result['pressure_psi'] = packet[4] * 0.25
+
+            # Try multiple temperature interpretations
+            result['temp_byte5_raw'] = packet[5]
+            result['temp_byte5_minus40'] = packet[5] - 40
+            result['temp_byte5_minus50'] = packet[5] - 50
+
+            if len(packet) >= 8:
+                result['temp_byte6_raw'] = packet[6]
+                result['temp_byte6_minus40'] = packet[6] - 40
+
+            result['flags'] = f'{packet[6]:08b}' if len(packet) > 6 else 'N/A'
+
+        return result
 
     def _demodulate_fsk(self, iq_samples: np.ndarray, symbol_rate: int,
                        deviation: int) -> Optional[np.ndarray]:
-        """
-        FSK demodulation matching Maurader implementation
-        Uses instantaneous frequency detection
-        """
+        """FSK demodulation matching Maurader implementation"""
         if len(iq_samples) < 100:
             return None
 
@@ -281,17 +419,14 @@ class TPMSDecoder:
             if end <= len(inst_freq):
                 resampled[i] = np.mean(inst_freq[start:end])
 
-        # Threshold detection (positive freq = 1, negative = 0)
+        # Threshold detection
         threshold = np.median(resampled)
         bits = (resampled > threshold).astype(int)
 
         return bits
 
     def _demodulate_ook(self, iq_samples: np.ndarray, symbol_rate: int) -> Optional[np.ndarray]:
-        """
-        OOK (On-Off Keying) demodulation matching Maurader
-        Uses envelope detection
-        """
+        """OOK (On-Off Keying) demodulation matching Maurader"""
         if len(iq_samples) < 100:
             return None
 
@@ -320,7 +455,7 @@ class TPMSDecoder:
             if end <= len(amplitude):
                 resampled[i] = np.mean(amplitude[start:end])
 
-        # Adaptive threshold (Otsu's method approximation)
+        # Adaptive threshold
         hist, bin_edges = np.histogram(resampled, bins=50)
         threshold = self._otsu_threshold(resampled, hist, bin_edges)
 
@@ -360,90 +495,6 @@ class TPMSDecoder:
 
         return threshold
 
-    def _validate_packet(self, packet: bytes, protocol: str) -> bool:
-         """Validate packet structure and checksum"""
-         if len(packet) < 4:
-             return False
-
-         # Basic validation: check if packet has reasonable values
-         # Most TPMS IDs are non-zero and non-0xFF
-         if packet[0] == 0x00 and packet[1] == 0x00:
-             return False
-         if packet[0] == 0xFF and packet[1] == 0xFF:
-             return False
-
-         # Check for pressure sanity (byte 4 in Schrader)
-         if 'Schrader' in protocol and len(packet) >= 6:
-             p = self._decode_schrader_pressure_psi(packet[4])
-             if p is None:
-                 return False
-             if not (5.0 <= p <= 80.0):  # pick your expected physical range
-                 return False
-
-         return True
-
-    def _decode_schrader_pressure_psi(self, pressure_raw: int) -> Optional[float]:
-        if not (0 < pressure_raw < 255):
-            return None
-        return float(pressure_raw) * 0.25
-
-    def _decode_packet(self, packet: bytes, protocol: str) -> Optional[Dict]:
-        """Decode packet based on protocol"""
-        if len(packet) < 4:
-            return None
-
-        try:
-            # Extract ID (first 4 bytes for most protocols)
-            tpms_id = ''.join(f'{b:02X}' for b in packet[:4])
-
-            pressure = None
-            temperature = None
-            battery_low = False
-
-            # Schrader protocol decoding
-            if 'Schrader' in protocol:
-                if len(packet) >= 8:
-                    # Pressure: byte 4-5, typically in kPa * 4
-                    pressure_raw = packet[4]
-                    pressure = self._decode_schrader_pressure_psi(pressure_raw)
-
-                    # Temperature: byte 6, offset by 40°C
-                    temp_raw = packet[5]
-                    if temp_raw > 0 and temp_raw < 255:
-                        temperature = temp_raw - 40
-
-                    # Status flags: byte 7
-                    if len(packet) > 6:
-                        flags = packet[6]
-                        battery_low = bool(flags & 0x80)
-
-            # Toyota protocol decoding
-            elif 'Toyota' in protocol:
-                if len(packet) >= 10:
-                    # Toyota uses different byte positions
-                    pressure_raw = packet[6]
-                    if pressure_raw > 0 and pressure_raw < 255:
-                        pressure = pressure_raw * 0.25  # Different scaling
-
-                    temp_raw = packet[7]
-                    if temp_raw > 0 and temp_raw < 255:
-                        temperature = temp_raw - 40
-
-                    flags = packet[8]
-                    battery_low = bool(flags & 0x40)
-
-            return {
-                'id': tpms_id,
-                'pressure': pressure,
-                'temperature': temperature,
-                'battery_low': battery_low,
-                'confidence': 0.85
-            }
-
-        except Exception as e:
-            print(f"⚠️  Packet decode error: {e}")
-            return None
-
     def _bytes_to_bits(self, bytes_data: List[int]) -> np.ndarray:
         """Convert bytes to bit array (MSB first)"""
         bits = []
@@ -454,7 +505,6 @@ class TPMSDecoder:
 
     def _bits_to_bytes(self, bits: np.ndarray) -> bytes:
         """Convert bit array to bytes (MSB first)"""
-        # Pad to multiple of 8
         remainder = len(bits) % 8
         if remainder != 0:
             bits = np.pad(bits, (0, 8 - remainder), 'constant')
@@ -484,7 +534,6 @@ class TPMSDecoder:
         """Calculate Signal-to-Noise Ratio"""
         power = np.abs(iq_samples) ** 2
 
-        # Use top 10% as signal, bottom 50% as noise
         sorted_power = np.sort(power)
         signal_power = np.mean(sorted_power[-len(sorted_power)//10:])
         noise_power = np.mean(sorted_power[:len(sorted_power)//2])
@@ -516,7 +565,7 @@ class TPMSDecoder:
             )
 
         except Exception as e:
-            print(f"⚠️  Error analyzing unknown signal: {e}")
+            logger.debug(f"Error analyzing unknown signal: {e}")
             return None
 
     def _detect_modulation(self, iq_samples: np.ndarray) -> str:
@@ -539,28 +588,22 @@ class TPMSDecoder:
         """Estimate symbol/baud rate using autocorrelation"""
         try:
             amplitude = np.abs(iq_samples)
-
-            # Normalize
             amplitude = amplitude - np.mean(amplitude)
 
-            # Autocorrelation
             autocorr = np.correlate(amplitude, amplitude, mode='full')
             autocorr = autocorr[len(autocorr)//2:]
 
-            # Find first significant peak after zero lag
             threshold = 0.5 * np.max(autocorr[10:])
             peaks, _ = scipy_signal.find_peaks(autocorr[10:], height=threshold, distance=5)
 
             if len(peaks) > 0:
-                # First peak indicates symbol period
                 symbol_period = peaks[0] + 10
                 baud_rate = int(self.sample_rate / symbol_period)
 
-                # Round to common rates
                 common_rates = [8192, 8400, 9600, 10000, 19200, 38400]
                 closest = min(common_rates, key=lambda x: abs(x - baud_rate))
 
-                if abs(closest - baud_rate) < baud_rate * 0.1:  # Within 10%
+                if abs(closest - baud_rate) < baud_rate * 0.1:
                     return closest
 
                 return baud_rate
@@ -597,6 +640,9 @@ class TPMSDecoder:
 
         return {
             'total_unknown': len(recent_unknown),
+            'total_successful': self._success_count,
+            'total_failed': self._failed_count,
+            'success_rate': self._success_count / (self._success_count + self._failed_count) if (self._success_count + self._failed_count) > 0 else 0,
             'modulation_types': modulation_counts,
             'common_baud_rates': list(set(baud_rates)) if baud_rates else [],
             'avg_signal_strength': np.mean([s.signal_strength for s in recent_unknown]) if recent_unknown else 0

@@ -164,7 +164,7 @@ def best_effort_signal_bounds(
                         mx = t if (mx is None or t > mx) else mx
                 except Exception:
                     pass
-                if sid is not None and len(sensors) < 200_000:
+                if sid is not None and len(sensors) < 500_000:
                     sensors.add(str(sid))
 
         n_f = float(n_rows) if n_rows else None
@@ -288,7 +288,7 @@ def load_table(db_path: str, table: str, limit: Optional[int] = None) -> pd.Data
 @st.cache_data(show_spinner=False)
 def load_signals_clean(
     db_path: str,
-    limit: int = 200_000,
+    limit: int = 500_000,
     order: str = "ASC",
     start_ts: Optional[float] = None,
     end_ts: Optional[float] = None,
@@ -701,7 +701,7 @@ def section_signals_dashboard(tables: List[str], db_path: str):
             with st.expander("quick_check details"):
                 st.write(qc)
 
-        limit = int(st.number_input("Max rows to load", min_value=1_000, max_value=2_000_000, value=200_000, step=25_000))
+        limit = int(st.number_input("Max rows to load", min_value=1_000, max_value=5_000_000, value=200_000, step=25_000))
         order_ui = st.radio("Order", ["Newest first", "Oldest first"], index=0 if db_ok else 1)
         order = "DESC" if order_ui == "Newest first" else "ASC"
 
@@ -1050,7 +1050,7 @@ def section_mate_graph(con: sqlite3.Connection, db_path: str):
 
         st.header("Mate graph scope")
         sensor_filter = st.text_input("Optional sensor id contains", value="")
-        max_events = st.number_input("Max events to replay", min_value=10_000, value=200_000, step=10_000)
+        max_events = st.number_input("Max events to replay", min_value=10_000, value=500_000, step=10_000)
 
     params = MateGraphParams(
         base_mate_window_s=float(base),

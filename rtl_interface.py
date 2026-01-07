@@ -423,3 +423,4 @@ def create_rtlsdr_interface(use_simulation=False):
 RTLSDRScanner = RTLSDRInterface
 Scanner = RTLSDRInterface
 
+

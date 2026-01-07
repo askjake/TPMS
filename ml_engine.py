@@ -39,14 +39,14 @@ class VehicleClusteringEngine:
         self,
         db,
         # --- temporal mate logic ---
-        base_mate_window_s: float = 1.0,        # strict "mate" window
-        relaxed_mate_window_s: float = 3.0,     # used once pair is suspected
-        observation_window_s: float = 1.0,      # which sensors count as "currently together"
-        min_same_sensor_gap_s: float = 0.25,    # debounce repeats from same sensor
+        base_mate_window_s: float = 60.0,        # strict "mate" window
+        relaxed_mate_window_s: float = 120.0,     # used once pair is suspected
+        observation_window_s: float = 10.0,      # which sensors count as "currently together"
+        min_same_sensor_gap_s: float = 0.005,    # debounce repeats from same sensor
 
         # --- scoring / thresholds ---
-        suspect_score: float = 2.0,             # when we start relaxing the window for that pair
-        link_score: float = 4.0,                # edge threshold for building vehicle components
+        suspect_score: float = 120.0,             # when we start relaxing the window for that pair
+        link_score: float = 2.0,                # edge threshold for building vehicle components
         stable_pair_ratio: float = 0.60,        # % of pairs that must be strong to create a *new* vehicle
 
         # --- forgetting ---
@@ -54,10 +54,10 @@ class VehicleClusteringEngine:
 
         # --- safety gates ---
         max_vehicle_size: int = 8,
-        min_vehicle_size: int = 3,
+        min_vehicle_size: int = 2,
 
         # --- DB cache ---
-        refresh_vehicle_cache_s: float = 30.0,
+        refresh_vehicle_cache_s: float = 300.0,
     ):
         self.db = db
 
@@ -564,14 +564,14 @@ def create_learning_engine() -> AdaptiveLearningEngine:
 def create_clustering_engine(db) -> VehicleClusteringEngine:
     return VehicleClusteringEngine(
         db=db,
-        base_mate_window_s=1.0,
-        relaxed_mate_window_s=3.0,
-        observation_window_s=1.0,
+        base_mate_window_s=60.0,        # ✅ Changed from 1.0
+        relaxed_mate_window_s=120.0,    # ✅ Changed from 3.0
+        observation_window_s=60.0,      # ✅ Changed from 1.0
         suspect_score=2.0,
         link_score=4.0,
-        decay_halflife_s=180.0,
-        max_vehicle_size=6,   # I’d start tighter than 8
-        min_vehicle_size=3,
+        decay_halflife_s=300.0,         # ✅ Increased from 180
+        max_vehicle_size=6,
+        min_vehicle_size=3,             # ✅ Requires 3+ sensors (allows incomplete sets)
     )
 
 
@@ -790,4 +790,3 @@ class OnlinePatternLearner:
             pass
 
         return {"ok": True, "z_pressure": z_p, "z_temp": z_t, "n": base["p"].n}
-

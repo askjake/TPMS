@@ -503,3 +503,4 @@ class HackRFScanner(HackRFInterface):
 HackRFScanner = HackRFInterface
 Scanner = HackRFScanner
 
+
