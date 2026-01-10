@@ -9,6 +9,7 @@ from pathlib import Path
 @dataclass
 class Config:
     # Add to Config class
+    PROTOCOL_DETECTION_ENABLED = True
     HISTOGRAM_BINS: int = 50  # Number of bins for signal histogram
     DEFAULT_FREQUENCY: int = 315_000_000  # Default frequency
     BANDWIDTH: int = 1_750_000  # 1.75 MHz bandwidth
@@ -31,7 +32,7 @@ class Config:
     ])
     
     # Signal Detection Thresholds
-    SIGNAL_THRESHOLD: float = -60.0  # dBm - lowered for better sensitivity
+    SIGNAL_THRESHOLD: float = -50.0  # dBm - lowered for better sensitivity
     MIN_SNR: float = 6.0  # dB - minimum SNR for valid decode
     
     # Symbol Rates (matching Maurader exactly)

@@ -96,23 +96,24 @@ class RTLSDRInterface:
 
             try:
                 dec = self._pipeline_decoder
-                db = self._pipeline_db
-                if dec is None or db is None:
+                if dec is None:
                     continue
 
+                # Decode signals
                 signals = dec.process_samples(iq_complex, freq_hz)
                 if not signals:
                     continue
 
-                rows = []
+                # Convert to dicts
                 now_ts = ts or time.time()
                 for s in signals:
+                    # Best-effort mapping
                     try:
                         s.signal_strength = rssi
                     except Exception:
                         pass
 
-                    rows.append({
+                    signal_dict = {
                         "tpms_id": getattr(s, "tpms_id", None),
                         "timestamp": getattr(s, "timestamp", None) or now_ts,
                         "frequency": getattr(s, "frequency", None) or freq_hz,
@@ -123,22 +124,25 @@ class RTLSDRInterface:
                         "battery_low": getattr(s, "battery_low", None),
                         "protocol": getattr(s, "protocol", None),
                         "raw_data": getattr(s, "raw_data", None),
-                    })
+                        # 🔥 IMPORTANT: Don't set lat/lon here - let callback handle it
+                        "latitude": None,
+                        "longitude": None,
+                    }
 
-                # Insert batch
-                if hasattr(db, "insert_signals_batch"):
-                    db.insert_signals_batch(rows)
-                else:
-                    for r in rows:
-                        db.insert_signal(r)
-
-                # Optional hook
-                if self._pipeline_on_signal:
-                    for r in rows:
+                    # 🔥 ONLY call the callback - it will handle GPS + DB insertion
+                    if self._pipeline_on_signal:
                         try:
-                            self._pipeline_on_signal(r)
-                        except Exception:
-                            pass
+                            self._pipeline_on_signal(signal_dict)
+                        except Exception as e:
+                            logger.error(f"Callback error: {e}")
+                    else:
+                        # ⚠️ Fallback: Only insert directly if NO callback provided
+                        # This shouldn't happen in normal operation
+                        if self._pipeline_db:
+                            try:
+                                self._pipeline_db.insert_signal(signal_dict)
+                            except Exception as e:
+                                logger.error(f"Direct DB insert error: {e}")
 
             except Exception as e:
                 logger.error(f"Pipeline worker error: {e}")
