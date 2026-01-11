@@ -1669,11 +1669,264 @@ def page_ml_insights(db_path: str):
 
 def page_sensor_trigger(db_path: str):
     st.header("🧲 Sensor Trigger")
-
-    st.info("Placeholder UI for your ESP32 / GPIO / SDR trigger controls.")
-    st.write(
-        "If your project provides esp32_trigger_controller, wire it up here with lazy imports (same pattern as Live Detection).")
-
+    
+    # ESP32 connection settings
+    st.subheader("ESP32 Connection")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        esp32_ip = st.text_input(
+            "ESP32 IP Address",
+            value="192.168.4.1",
+            help="Default IP when ESP32 is in AP mode"
+        )
+    with col2:
+        esp32_port = st.text_input("Port", value="80")
+    
+    esp32_url = f"http://{esp32_ip}:{esp32_port}"
+    
+    # Connection status
+    if st.button("🔌 Test Connection"):
+        with st.spinner("Connecting to ESP32..."):
+            try:
+                response = requests.get(f"{esp32_url}/status", timeout=3)
+                if response.status_code == 200:
+                    status_data = response.json()
+                    st.success("✅ Connected to ESP32!")
+                    st.json(status_data)
+                else:
+                    st.error(f"❌ Connection failed: HTTP {response.status_code}")
+            except requests.exceptions.RequestException as e:
+                st.error(f"❌ Cannot connect to ESP32: {str(e)}")
+                st.info("Make sure you're connected to the 'TPMS_Trigger' WiFi network")
+    
+    st.divider()
+    
+    # Trigger patterns
+    st.subheader("Trigger Patterns")
+    
+    patterns = {
+        "Schrader": {
+            "index": 0,
+            "description": "3 pulses, 100ms width, 50ms interval",
+            "icon": "🔵"
+        },
+        "Toyota": {
+            "index": 1,
+            "description": "2 pulses, 150ms width, 100ms interval",
+            "icon": "🔴"
+        },
+        "Continental": {
+            "index": 2,
+            "description": "4 pulses, 80ms width, 30ms interval",
+            "icon": "🟢"
+        },
+        "Generic": {
+            "index": 3,
+            "description": "1 pulse, 100ms width",
+            "icon": "⚪"
+        }
+    }
+    
+    # Pattern selection
+    selected_pattern = st.selectbox(
+        "Select Trigger Pattern",
+        options=list(patterns.keys()),
+        format_func=lambda x: f"{patterns[x]['icon']} {x} - {patterns[x]['description']}"
+    )
+    
+    pattern_index = patterns[selected_pattern]["index"]
+    
+    st.divider()
+    
+    # Single trigger
+    st.subheader("Single Trigger")
+    
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        st.info(f"Send a single {selected_pattern} trigger pattern to activate nearby TPMS sensors")
+    with col2:
+        if st.button("📡 Send Trigger", type="primary", use_container_width=True):
+            with st.spinner("Sending trigger..."):
+                try:
+                    response = requests.post(
+                        f"{esp32_url}/trigger",
+                        data={"pattern": pattern_index},
+                        timeout=5
+                    )
+                    if response.status_code == 200:
+                        result = response.json()
+                        st.success(f"✅ {result.get('message', 'Trigger sent successfully!')}")
+                        st.balloons()
+                    else:
+                        st.error(f"❌ Failed: HTTP {response.status_code}")
+                except requests.exceptions.RequestException as e:
+                    st.error(f"❌ Request failed: {str(e)}")
+    
+    st.divider()
+    
+    # Continuous triggering
+    st.subheader("Continuous Triggering")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        trigger_interval = st.slider(
+            "Trigger Interval (seconds)",
+            min_value=0.5,
+            max_value=5.0,
+            value=1.0,
+            step=0.5,
+            help="Time between trigger sequences"
+        )
+    
+    # Initialize session state for continuous triggering
+    if 'is_continuous_triggering' not in st.session_state:
+        st.session_state.is_continuous_triggering = False
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button(
+            "▶️ Start Continuous",
+            disabled=st.session_state.is_continuous_triggering,
+            use_container_width=True
+        ):
+            try:
+                response = requests.post(
+                    f"{esp32_url}/start_continuous",
+                    data={
+                        "pattern": pattern_index,
+                        "interval": trigger_interval
+                    },
+                    timeout=5
+                )
+                if response.status_code == 200:
+                    result = response.json()
+                    st.session_state.is_continuous_triggering = True
+                    st.success(f"✅ Continuous triggering started!")
+                    st.rerun()
+                else:
+                    st.error(f"❌ Failed: HTTP {response.status_code}")
+            except requests.exceptions.RequestException as e:
+                st.error(f"❌ Request failed: {str(e)}")
+    
+    with col2:
+        if st.button(
+            "⏹️ Stop Continuous",
+            disabled=not st.session_state.is_continuous_triggering,
+            use_container_width=True
+        ):
+            try:
+                response = requests.post(f"{esp32_url}/stop_continuous", timeout=5)
+                if response.status_code == 200:
+                    st.session_state.is_continuous_triggering = False
+                    st.success("✅ Continuous triggering stopped")
+                    st.rerun()
+                else:
+                    st.error(f"❌ Failed: HTTP {response.status_code}")
+            except requests.exceptions.RequestException as e:
+                st.error(f"❌ Request failed: {str(e)}")
+    
+    # Status indicator
+    if st.session_state.is_continuous_triggering:
+        st.warning(f"🔄 Continuous triggering active ({selected_pattern}, {trigger_interval}s interval)")
+    
+    st.divider()
+    
+    # Live status monitoring
+    st.subheader("ESP32 Status")
+    
+    status_placeholder = st.empty()
+    
+    if st.button("🔄 Refresh Status"):
+        try:
+            response = requests.get(f"{esp32_url}/status", timeout=3)
+            if response.status_code == 200:
+                status_data = response.json()
+                
+                with status_placeholder.container():
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        st.metric(
+                            "Status",
+                            "Triggering" if status_data.get('is_triggering') else "Idle",
+                            delta="Active" if status_data.get('is_triggering') else None
+                        )
+                    
+                    with col2:
+                        st.metric(
+                            "Pattern",
+                            status_data.get('pattern', 'Unknown').capitalize()
+                        )
+                    
+                    with col3:
+                        st.metric(
+                            "Interval",
+                            f"{status_data.get('interval', 0)}s"
+                        )
+                    
+                    st.info(f"LF Frequency: {status_data.get('lf_frequency', 125000) / 1000:.1f} kHz")
+            else:
+                status_placeholder.error(f"❌ Failed to get status: HTTP {response.status_code}")
+        except requests.exceptions.RequestException as e:
+            status_placeholder.error(f"❌ Cannot connect: {str(e)}")
+    
+    st.divider()
+    
+    # Usage instructions
+    with st.expander("ℹ️ How to Use", expanded=False):
+        st.markdown("""
+        ### Setup
+        1. Power on your ESP32 with the LF antenna circuit
+        2. Connect to the **TPMS_Trigger** WiFi network (password: `tpms12345`)
+        3. Click "Test Connection" to verify communication
+        
+        ### Single Trigger Mode
+        - Select the appropriate trigger pattern for your TPMS sensors
+        - Click "Send Trigger" to activate nearby sensors
+        - Sensors should respond within 1-2 seconds
+        
+        ### Continuous Trigger Mode
+        - Useful for sensor programming or diagnostics
+        - Set the interval between triggers (0.5-5 seconds)
+        - Click "Start Continuous" to begin
+        - Click "Stop Continuous" when finished
+        
+        ### Trigger Patterns
+        - **Schrader**: Most common aftermarket TPMS sensors
+        - **Toyota**: OEM Toyota/Lexus sensors
+        - **Continental**: European OEM sensors
+        - **Generic**: Works with most sensors (try this first)
+        
+        ### Troubleshooting
+        - **No connection**: Ensure you're connected to TPMS_Trigger WiFi
+        - **Sensors not responding**: Try different patterns or move antenna closer (10-20cm)
+        - **Weak signal**: Check antenna connections and 12V power supply
+        """)
+    
+    # Advanced settings
+    with st.expander("⚙️ Advanced Settings", expanded=False):
+        st.warning("⚠️ Advanced users only - incorrect settings may damage hardware")
+        
+        st.markdown("""
+        ### Hardware Configuration
+        - **LF Frequency**: 125 kHz (fixed in firmware)
+        - **Output Power**: Controlled by 12V supply and MOSFET driver
+        - **Effective Range**: 10-30 cm depending on antenna quality
+        
+        ### Custom Patterns
+        To add custom trigger patterns, modify the ESP32 firmware:
+        ```cpp
+        TriggerPattern patterns[] = {
+          {pulse_count, pulse_width_ms, pulse_interval_ms}
+        };
+        ```
+        
+        ### Safety Notes
+        - Keep antenna away from electronic devices during operation
+        - Do not exceed 12V 1.5A power supply rating
+        - Disconnect power before modifying circuit
+        """)
 
 def page_gps_setup(db_path: str):
     st.header("🛰️ GPS Setup")
