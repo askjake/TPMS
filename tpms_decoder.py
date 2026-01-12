@@ -6,6 +6,7 @@ Enhanced with adaptive learning, error correction, and self-evolution
 import numpy as np
 from scipy import signal as scipy_signal
 from scipy.signal import hilbert
+from scipy.stats import kurtosis as stats_kurtosis
 from sklearn.cluster import DBSCAN
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Tuple
@@ -713,51 +714,72 @@ class TPMSDecoder:
     def _blind_feature_extraction(self, iq_samples: np.ndarray, frequency: float,
                                   signal_strength: float) -> Optional[UnknownSignal]:
         """
-        Extracts physics parameters without knowing the protocol.
-        Uses Hilbert Transform for Instantaneous Frequency analysis.
+        Extract physics parameters without knowing the protocol.
+
+        NOTE: IQ samples are already complex (analytic). Do NOT run a Hilbert transform here
+        (hilbert() requires real input and will raise).
         """
         try:
-            # Analytic signal via Hilbert
-            analytic = hilbert(iq_samples)
+            analytic = iq_samples  # complex baseband is already analytic
+
+            # Instantaneous frequency (Hz) from unwrapped phase
             inst_phase = np.unwrap(np.angle(analytic))
-            inst_freq = np.diff(inst_phase) / (2.0 * np.pi) * self.sample_rate
+            inst_freq = np.diff(inst_phase) * (self.sample_rate / (2.0 * np.pi))
+            if inst_freq.size < 10:
+                return None
 
-            # 1. Estimate Deviation (FSK spread)
+            # 1) Estimate deviation from IF histogram
             hist, bin_edges = np.histogram(inst_freq, bins=50)
-            peaks, _ = scipy_signal.find_peaks(hist, prominence=max(hist) * 0.2)
+            peaks, _ = scipy_signal.find_peaks(hist, prominence=max(hist) * 0.2) if hist.size else ([], None)
             if len(peaks) >= 2:
-                freqs = bin_edges[peaks]
-                deviation = (max(freqs) - min(freqs)) / 2
+                peak_freqs = bin_edges[peaks]
+                deviation = float((max(peak_freqs) - min(peak_freqs)) / 2.0)
             else:
-                deviation = 0
+                deviation = 0.0
 
-            # 2. Estimate Baud Rate (Pulse Width Analysis)
-            if deviation > 5000:  # FSK
-                bits = (inst_freq > 0).astype(int)
-            else:  # OOK (Amplitude based)
-                env = np.abs(analytic)
-                threshold = np.mean(env)
-                bits = (env > threshold).astype(int)
+            # 2) Rough baud estimate via run-lengths on a crude bitstream
+            if deviation > 5000:  # heuristic: likely FSK
+                thr = np.median(inst_freq)
+                bits = (inst_freq > thr).astype(int)
+            else:  # likely OOK/ASK
+                env = np.abs(analytic[1:])  # align with inst_freq length
+                thr = np.median(env)
+                bits = (env > thr).astype(int)
 
-            # Count run lengths
             changes = np.diff(bits)
             change_indices = np.where(changes != 0)[0]
             if len(change_indices) > 5:
                 run_lengths = np.diff(change_indices)
-                median_run = np.median(run_lengths)
-                baud_rate = int(self.sample_rate / median_run)
+                median_run = float(np.median(run_lengths)) if run_lengths.size else 0.0
+                if median_run > 0:
+                    baud_rate = int(self.sample_rate / median_run)
+
+                    # Snap to common TPMS rates so we don’t get nonsense like ~sample_rate
+                    common = [8000, 8192, 8400, 9600, 10000, 19200, 20000, 38400]
+                    closest = min(common, key=lambda x: abs(x - baud_rate))
+                    if abs(closest - baud_rate) / closest < 0.15:
+                        baud_rate = closest
+                    else:
+                        baud_rate = None
+                else:
+                    baud_rate = None
             else:
                 baud_rate = None
 
-            # 3. Modulation Classification via Kurtosis
-            amp_kurtosis = scipy_signal.kurtosis(np.abs(iq_samples))
+            # 3) Modulation classification via amplitude kurtosis
+            amp_kurtosis = float(stats_kurtosis(np.abs(analytic), fisher=True, bias=False))
+            if not np.isfinite(amp_kurtosis):
+                amp_kurtosis = 0.0
             mod_type = 'OOK' if amp_kurtosis > 1.0 else 'FSK'
 
-            # 4. Create pattern signature
+            # 4) Create pattern signature
             pattern_sig = self._create_pattern_signature(iq_samples)
 
-            # 5. Estimate packet length
-            packet_length = len(iq_samples) // (self.sample_rate // (baud_rate or 10000))
+            # 5) Estimate packet length (in symbols, rough)
+            sym_rate = baud_rate or 10000
+            samples_per_symbol = int(self.sample_rate / max(sym_rate, 1))
+            samples_per_symbol = max(1, samples_per_symbol)
+            packet_length = max(1, int(len(iq_samples) / samples_per_symbol))
 
             return UnknownSignal(
                 timestamp=time.time(),
@@ -770,11 +792,14 @@ class TPMSDecoder:
                 raw_samples=iq_samples,
                 deviation=deviation,
                 kurtosis=amp_kurtosis,
-                center_freq_offset=0
+                center_freq_offset=0.0
             )
 
         except Exception as e:
-            logger.debug(f"Error in blind feature extraction: {e}")
+            # Make this visible (it used to disappear at DEBUG)
+            self._blind_errors = getattr(self, "_blind_errors", 0) + 1
+            if self._blind_errors <= 5 or self._blind_errors % 100 == 0:
+                logger.warning(f"Blind feature extraction error (count={self._blind_errors}): {e}", exc_info=True)
             return None
 
     def _extract_bits_from_samples(self, iq_samples: np.ndarray, symbol_rate: int) -> Optional[np.ndarray]:
@@ -1592,7 +1617,7 @@ def create_decoder_with_learning(sample_rate: int, db_path: str) -> 'TPMSDecoder
     from database import TPMSDatabase
 
     db = TPMSDatabase(db_path)
-    decoder = TPMSDecoder(sample_rate, db._connect())
+    decoder = TPMSDecoder(sample_rate, db)
 
     logger.info(f"Created intelligent decoder with learning (sample_rate={sample_rate})")
     logger.info(f"Loaded {len(decoder.protocol_patterns)} protocols")
