@@ -1,0 +1,56 @@
+# /etc/systemd/system/hackrf-tpms-sync@.service
+#
+# One-shot service that runs when the Portapack SD card is connected.
+# Triggered by: /etc/udev/rules.d/80-hackrf-portapack-sd.rules
+#
+# Instance name (%i) = kernel device name, e.g. sdb1
+#
+# How it works:
+#   1. udev detects the partition and sets SYSTEMD_WANTS for this service
+#   2. systemd starts this one-shot unit
+#   3. ExecStartPre waits for udisks2 to auto-mount the partition
+#      (udisks2 typically mounts within 3s of block device appearing)
+#   4. ExecStart runs hackrf_sd_sync.py which:
+#        - finds the mount point from /proc/mounts (volume 0403-0201)
+#        - downloads sensors.db -> local backup
+#        - decodes 36-byte SensorRecord structs
+#        - merges into local SQLite + binary db
+#        - exports JSON/CSV
+#        - cleans SD card
+
+[Unit]
+Description=HackRF Portapack SD Card TPMS Sync (%i)
+After=local-fs.target udisks2.service
+Wants=udisks2.service
+
+[Service]
+Type=oneshot
+# Give udisks2/systemd automount up to 10s to mount the filesystem
+ExecStartPre=/bin/bash -c "\
+    for i in $(seq 1 20); do \
+        grep -q '0403-0201' /proc/mounts && exit 0; \
+        sleep 0.5; \
+    done; \
+    echo 'ERROR: 0403-0201 never appeared in /proc/mounts after 10s'; \
+    exit 1"
+
+ExecStart=/usr/bin/python3 /home/montjac/TPMS/hackrf_sd_sync.py
+
+# Run as the desktop user so local files end up with correct ownership
+User=montjac
+Group=montjac
+
+# Pass through the display env (useful if you want desktop notifications later)
+Environment=HOME=/home/montjac
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+
+# Log to journal (journalctl -u hackrf-tpms-sync@sdb1)
+StandardOutput=journal
+StandardError=journal
+
+# Restart policy: don't retry on failure (transient device)
+Restart=no
+TimeoutStartSec=60
+
+[Install]
+WantedBy=default.target

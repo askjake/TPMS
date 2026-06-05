@@ -1,0 +1,19 @@
+# /etc/udev/rules.d/80-hackrf-portapack-sd.rules
+#
+# Automatically trigger TPMS sync when the HackRF Portapack SD card is mounted.
+#
+# Device fingerprint (verified via udevadm):
+#   ATTRS{idVendor}=="0781"   (SanDisk/Portapack MSD)
+#   ATTRS{idProduct}=="a7a8"  (Portapack mass-storage)
+#   ATTRS{model}=="Portapack MSD"
+#
+# The rule fires when the block PARTITION is added (i.e. the filesystem
+# partition appears).  systemd-udevd then starts the one-shot service
+# hackrf-tpms-sync@.service, passing the device node as the instance name.
+#
+# To reload:  sudo udevadm control --reload-rules && sudo udevadm trigger
+# To test  :  sudo udevadm test /sys/block/sdb/sdb1
+
+ACTION=="add", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", \
+    ATTRS{idVendor}=="0781", ATTRS{idProduct}=="a7a8", \
+    TAG+="systemd", ENV{SYSTEMD_WANTS}="hackrf-tpms-sync@%k.service"
