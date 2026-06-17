@@ -1,0 +1,19 @@
+[Unit]
+Description=TPMS Dashboard Sync Watcher
+Documentation=https://github.com/askjake/TPMS
+After=network.target
+
+[Service]
+Type=simple
+User=montjac
+WorkingDirectory=/home/montjac/TPMS
+Environment="PATH=/home/montjac/TPMS/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/home/montjac/TPMS/venv/bin/python3 tpms_dashboard_sync.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tpms-dashboard-sync
+
+[Install]
+WantedBy=multi-user.target

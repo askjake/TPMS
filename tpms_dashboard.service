@@ -1,0 +1,24 @@
+[Unit]
+Description=TPMS Streamlit Dashboard
+Documentation=https://github.com/askjake/TPMS
+After=network.target
+
+[Service]
+Type=simple
+User=montjac
+WorkingDirectory=/home/montjac/TPMS
+Environment="PATH=/home/montjac/TPMS/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/home/montjac/TPMS/venv/bin/streamlit run tpms_dashboard.py \
+    --server.address 0.0.0.0 \
+    --server.port 8501 \
+    --server.headless true \
+    --server.fileWatcherType none \
+    --browser.gatherUsageStats false
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tpms-dashboard
+
+[Install]
+WantedBy=multi-user.target

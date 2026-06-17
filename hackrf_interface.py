@@ -35,8 +35,8 @@ class HackRFInterface:
         self.sample_rate = 2_457_600
 
         # 🔥 OPTIMIZED GAINS for better sensitivity
-        self.lna_gain = 40  # Max LNA gain (was 32)
-        self.vga_gain = 62  # Max VGA gain (was 40)
+        self.lna_gain = 38  # Max LNA gain (was 32)
+        self.vga_gain = 50  # Max VGA gain (was 40)
 
         # --- Optional decode→DB pipeline ---
         self._pipeline_db = None
@@ -583,5 +583,6 @@ class HackRFScanner(HackRFInterface):
 # Some code checks for Scanner
 HackRFScanner = HackRFInterface
 Scanner = HackRFScanner
+
 
 

@@ -712,7 +712,7 @@ def page_sensor_database(db_path: str):
             st.error(f"Error checking unknown signals: {e}")
 
     st.markdown("---")
-
+    
     # Get decoder statistics
     try:
         decoder_stats = db.get_reprocessing_statistics()
@@ -2285,3 +2285,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
