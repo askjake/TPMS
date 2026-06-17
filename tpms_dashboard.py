@@ -274,6 +274,136 @@ with tab_overview:
 with tab_history:
     st.subheader("Sensor Readings Across Sessions Over Time")
 
+    # ── Repeated-sensor capture-time histogram ────────────────────────────────
+    st.markdown("#### 📡 Capture-Time Distribution — Repeated Sensors")
+    st.caption(
+        "Shows **when** sensors that appeared in more than one export session "
+        "were first captured, binned by hour-of-day and coloured by sensor. "
+        "Use the threshold slider to define what counts as 'repeated'."
+    )
+
+    rep_min = st.slider(
+        "Min sessions for a sensor to count as 'repeated'",
+        min_value=2, max_value=max(2, int(df["export_file"].nunique())),
+        value=2, step=1, key="rep_thresh",
+    )
+
+    _session_counts = df.groupby("sensor_id")["export_file"].nunique()
+    _repeated_ids   = _session_counts[_session_counts >= rep_min].index
+
+    df_rep = df[df["sensor_id"].isin(_repeated_ids)].copy()
+
+    if df_rep.empty:
+        st.info(f"No sensors appear in ≥ {rep_min} sessions with current filters.")
+    else:
+        # Derive capture hour and day-of-week from the actual first_seen timestamp
+        # (the moment the SDR caught the broadcast), not just the export file time.
+        df_rep["capture_hour"]    = df_rep["first_seen"].dt.hour
+        df_rep["capture_date"]    = df_rep["first_seen"].dt.date.astype(str)
+        df_rep["capture_dow"]     = df_rep["first_seen"].dt.day_name()
+        df_rep["capture_hhmm"]    = df_rep["first_seen"].dt.strftime("%H:%M")
+        df_rep["sessions_seen"]   = df_rep["sensor_id"].map(_session_counts)
+
+        rh1, rh2 = st.columns(2)
+
+        with rh1:
+            # ── Primary histogram: hour-of-day, stacked by session ────────────
+            fig_cap_hr = px.histogram(
+                df_rep,
+                x="capture_hour",
+                color="session_label",
+                nbins=24,
+                title=f"Capture Hour-of-Day  ({len(_repeated_ids)} repeated sensors)",
+                labels={"capture_hour": "Hour of Day (0–23)", "count": "Capture Events",
+                        "session_label": "Session"},
+                barmode="stack",
+                category_orders={"capture_hour": list(range(24))},
+            )
+            fig_cap_hr.update_layout(
+                xaxis=dict(tickmode="linear", tick0=0, dtick=1),
+                bargap=0.05,
+            )
+            st.plotly_chart(fig_cap_hr, use_container_width=True)
+
+        with rh2:
+            # ── Capture count per day, coloured by session ────────────────────
+            fig_cap_day = px.histogram(
+                df_rep,
+                x="capture_date",
+                color="session_label",
+                title="Capture Events by Date",
+                labels={"capture_date": "Date", "count": "Capture Events",
+                        "session_label": "Session"},
+                barmode="stack",
+            )
+            fig_cap_day.update_layout(xaxis_tickangle=-30, bargap=0.1)
+            st.plotly_chart(fig_cap_day, use_container_width=True)
+
+        # ── Strip chart: each dot = one capture event for a repeated sensor ──
+        st.markdown("##### Individual Capture Events (strip chart)")
+        st.caption(
+            "Each mark is one capture event for a repeated sensor. "
+            "X = exact `first_seen` timestamp · Y = sensor ID · "
+            "Colour = how many sessions that sensor appeared in."
+        )
+
+        # Sort sensors by number of sessions seen (most recurring at top)
+        sensor_order = (
+            df_rep.groupby("sensor_id")["sessions_seen"]
+                  .first()
+                  .sort_values(ascending=False)
+                  .index.tolist()
+        )
+
+        fig_strip = px.strip(
+            df_rep,
+            x="first_seen",
+            y="sensor_id",
+            color="sessions_seen",
+            color_continuous_scale="Viridis",
+            hover_data=["protocol", pressure_col, temp_col,
+                        "capture_hhmm", "session_label"],
+            title="Repeated Sensor Capture Events Over Time",
+            labels={
+                "first_seen":      "Capture Time (first_seen)",
+                "sensor_id":       "Sensor ID",
+                "sessions_seen":   "# Sessions",
+                "session_label":   "Session",
+            },
+            category_orders={"sensor_id": sensor_order},
+        )
+        fig_strip.update_traces(marker=dict(size=8, opacity=0.75))
+        fig_strip.update_layout(
+            height=max(350, len(_repeated_ids) * 22 + 100),
+            coloraxis_colorbar=dict(title="Sessions"),
+        )
+        st.plotly_chart(fig_strip, use_container_width=True)
+
+        # ── Summary table ────────────────────────────────────────────────────
+        with st.expander("📋 Repeated-sensor summary table"):
+            df_rep_summary = (
+                df_rep.groupby("sensor_id", as_index=False)
+                      .agg(
+                          protocol=("protocol", "first"),
+                          sessions=("export_file", "nunique"),
+                          first_capture=("first_seen", "min"),
+                          last_capture=("first_seen", "max"),
+                          avg_pressure=(pressure_col, "mean"),
+                          avg_temp=(temp_col, "mean"),
+                          total_packets=("packet_count", "sum"),
+                      )
+                      .sort_values("sessions", ascending=False)
+            )
+            df_rep_summary["span_hours"] = (
+                (df_rep_summary["last_capture"] - df_rep_summary["first_capture"])
+                .dt.total_seconds() / 3600
+            ).round(1)
+            st.dataframe(df_rep_summary, use_container_width=True)
+
+    st.markdown("---")
+    # ── END repeated-sensor histogram block ───────────────────────────────────
+
+
     # Only sensors seen in ≥ 2 sessions are interesting for history
     session_counts = df.groupby("sensor_id")["export_file"].nunique()
     recurring = session_counts[session_counts >= 2].index.tolist()
