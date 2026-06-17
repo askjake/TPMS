@@ -11,6 +11,20 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+import os
+import sys
+
+# Ensure we can access USB devices
+if os.geteuid() != 0:  # Not running as root
+    # Check if we're in the plugdev group
+    import grp
+    try:
+        plugdev_gid = grp.getgrnam('plugdev').gr_gid
+        if plugdev_gid not in os.getgroups():
+            logger.warning("User not in plugdev group - HackRF may not be accessible")
+    except KeyError:
+        logger.warning("plugdev group not found")
+
 # Find libhackrf
 _libhackrf_path = ctypes.util.find_library('hackrf')
 if not _libhackrf_path:
@@ -41,6 +55,17 @@ HACKRF_ERROR_INVALID_PARAM = -2
 HACKRF_ERROR_NOT_FOUND = -5
 HACKRF_ERROR_LIBUSB = -1000
 
+# Human-readable error names (subset)
+ERROR_CODE_NAMES = {
+    0: 'HACKRF_SUCCESS',
+    -2: 'HACKRF_ERROR_INVALID_PARAM',
+    -5: 'HACKRF_ERROR_NOT_FOUND',
+    -1000: 'HACKRF_ERROR_LIBUSB',
+}
+
+# Track open devices globally
+_open_devices = []
+
 # Transfer structure (matches hackrf.h)
 class hackrf_transfer(ctypes.Structure):
     _fields_ = [
@@ -63,6 +88,8 @@ class HackRFDevice:
     """Python wrapper for HackRF device"""
     
     def __init__(self):
+        self.last_error_code = None
+        self.last_error_name = None
         self.device = None
         self.callback = None
         self.is_streaming = False
@@ -70,32 +97,35 @@ class HackRFDevice:
         
         if _libhackrf is None:
             raise RuntimeError("libhackrf not available")
-    
+
     def open(self) -> bool:
         """Open HackRF device"""
+        global _open_devices
+
         try:
-            # Initialize library
+            # Initialize library (safe to call multiple times)
             result = _libhackrf.hackrf_init()
             if result != HACKRF_SUCCESS:
                 logger.error(f"hackrf_init failed: {result}")
                 return False
-            
+
             # Open device
             device_ptr = ctypes.c_void_p()
             result = _libhackrf.hackrf_open(ctypes.byref(device_ptr))
-            
+
             if result != HACKRF_SUCCESS:
                 logger.error(f"hackrf_open failed: {result}")
                 return False
-            
+
             self.device = device_ptr
+            _open_devices.append(self)
             logger.info("✅ HackRF device opened successfully")
             return True
-            
+
         except Exception as e:
             logger.error(f"Failed to open HackRF: {e}")
             return False
-    
+
     def close(self):
         """Close HackRF device"""
         if self.device:
@@ -285,4 +315,6 @@ def get_version() -> Optional[str]:
         return version.value.decode('utf-8')
     except:
         return "unknown"
+
+
 

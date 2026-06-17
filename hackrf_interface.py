@@ -18,9 +18,14 @@ except Exception as e:
 
 logger = logging.getLogger(__name__)
 
+_hackrf_singleton = None
+_hackrf_lock = threading.Lock()
+
 
 class HackRFInterface:
     def __init__(self):
+        global _hackrf_singleton
+
         logger.info("HackRFInterface.__init__ called")
 
         self.device = None
@@ -28,12 +33,15 @@ class HackRFInterface:
         self.callback = None
         self.frequency = 314.9e6
         self.sample_rate = 2_457_600
-        self.lna_gain = 32
-        self.vga_gain = 40
-        # --- Optional decode→DB pipeline (used when start() is called with no callback) ---
+
+        # 🔥 OPTIMIZED GAINS for better sensitivity
+        self.lna_gain = 40  # Max LNA gain (was 32)
+        self.vga_gain = 62  # Max VGA gain (was 40)
+
+        # --- Optional decode→DB pipeline ---
         self._pipeline_db = None
         self._pipeline_decoder = None
-        self._pipeline_on_signal = None  # optional callable(signal_dict)
+        self._pipeline_on_signal = None
         self._pipeline_q: "queue.Queue[tuple]" = queue.Queue(maxsize=200)
         self._pipeline_stop = threading.Event()
         self._pipeline_thread: Optional[threading.Thread] = None
@@ -42,21 +50,27 @@ class HackRFInterface:
             logger.warning("HackRF library not available - simulation mode")
             return
 
-        # Try to open device
-        try:
-            self.device = HackRFDevice()
-            if self.device.open():
-                logger.info("✅ HackRF device opened successfully")
+        # Use singleton device
+        with _hackrf_lock:
+            if _hackrf_singleton is None:
+                try:
+                    _hackrf_singleton = HackRFDevice()
+                    if _hackrf_singleton.open():
+                        logger.info("✅ HackRF device opened successfully (singleton)")
+                    else:
+                        logger.error("❌ Failed to open HackRF device")
+                        _hackrf_singleton = None
+                except Exception as e:
+                    logger.error(f"❌ Error initializing HackRF: {e}")
+                    _hackrf_singleton = None
+
+            self.device = _hackrf_singleton
+
+            if self.device:
                 self._configure_device()
-            else:
-                logger.error("❌ Failed to open HackRF device")
-                self.device = None
-        except Exception as e:
-            logger.error(f"❌ Error initializing HackRF: {e}")
-            self.device = None
 
     def _configure_device(self):
-        """Configure device with default settings"""
+        """Configure device with optimized settings"""
         if not self.device:
             return
 
@@ -65,6 +79,76 @@ class HackRFInterface:
         self.device.set_lna_gain(self.lna_gain)
         self.device.set_vga_gain(self.vga_gain)
         self.device.set_amp_enable(True)
+
+        logger.info(f"HackRF configured: LNA={self.lna_gain}dB, VGA={self.vga_gain}dB, AMP=ON")
+
+    # ... (attach_pipeline and _pipeline_worker stay the same) ...
+
+    def start(self, callback: Optional[Callable] = None):
+        """Start receiving with corrected RSSI calculation"""
+        logger.info("start() called")
+
+        if not self.device:
+            logger.error("❌ Device not opened")
+            return False
+
+        # If user didn't provide callback, use built-in pipeline
+        if callback is None:
+            if self._pipeline_db is None or self._pipeline_decoder is None:
+                raise ValueError(
+                    "start() called with no callback, but no pipeline attached. "
+                    "Call attach_pipeline(db, decoder) first, or pass a callback."
+                )
+
+            self._start_pipeline()
+
+            def _enqueue(iq_complex, rssi, freq_hz):
+                try:
+                    self._pipeline_q.put_nowait((iq_complex, rssi, freq_hz, time.time()))
+                except queue.Full:
+                    pass
+
+            self.callback = _enqueue
+        else:
+            self.callback = callback
+
+        def rx_callback(iq_data):
+            try:
+                # Convert int8 to complex float (correct normalization)
+                iq_complex = (iq_data[::2] + 1j * iq_data[1::2]).astype(np.complex64) / 128.0
+
+                # 🔥 CORRECTED RSSI CALCULATION
+                # Calculate power (mean of squared magnitude)
+                power = float(np.mean(np.abs(iq_complex) ** 2))
+
+                # Convert to dBFS (decibels relative to full scale)
+                power_dbfs = 10 * np.log10(power + 1e-12)
+
+                # Apply HackRF-specific calibration
+                # HackRF One has ~0 dBFS at full scale with proper gains
+                # Account for total gain: LNA + VGA + amp (~14 dB)
+                total_gain_db = self.lna_gain + self.vga_gain + 14  # amp adds ~14dB
+
+                # Estimated RSSI (rough calibration, adjust based on testing)
+                # Formula: power_dbfs + noise_floor - total_gain
+                rssi = power_dbfs - total_gain_db + 10  # +10 is empirical offset
+
+                # Sanity check (typical TPMS signals are -40 to -80 dBm)
+                rssi = max(-120, min(-20, rssi))
+
+                if self.callback:
+                    self.callback(iq_complex, rssi, self.frequency)
+
+            except Exception as e:
+                logger.error(f"Callback error: {e}")
+
+        if self.device.start_rx(rx_callback):
+            self.is_running = True
+            logger.info("✅ RX started successfully")
+            return True
+
+        logger.error("❌ Failed to start RX")
+        return False
 
     def attach_pipeline(self, db, decoder, on_signal=None):
         """
@@ -79,6 +163,7 @@ class HackRFInterface:
         return True
 
     def _pipeline_worker(self):
+        """Worker thread for decode→DB pipeline"""
         while not self._pipeline_stop.is_set():
             try:
                 iq_complex, rssi, freq_hz, ts = self._pipeline_q.get(timeout=0.5)
@@ -87,24 +172,24 @@ class HackRFInterface:
 
             try:
                 dec = self._pipeline_decoder
-                db = self._pipeline_db
-                if dec is None or db is None:
+                if dec is None:
                     continue
 
+                # Decode signals
                 signals = dec.process_samples(iq_complex, freq_hz)
                 if not signals:
                     continue
 
-                rows = []
+                # Convert to dicts
                 now_ts = ts or time.time()
                 for s in signals:
-                    # best-effort mapping
+                    # Best-effort mapping
                     try:
                         s.signal_strength = rssi
                     except Exception:
                         pass
 
-                    rows.append({
+                    signal_dict = {
                         "tpms_id": getattr(s, "tpms_id", None),
                         "timestamp": getattr(s, "timestamp", None) or now_ts,
                         "frequency": getattr(s, "frequency", None) or freq_hz,
@@ -115,22 +200,25 @@ class HackRFInterface:
                         "battery_low": getattr(s, "battery_low", None),
                         "protocol": getattr(s, "protocol", None),
                         "raw_data": getattr(s, "raw_data", None),
-                    })
+                        # 🔥 IMPORTANT: Don't set lat/lon here - let callback handle it
+                        "latitude": None,
+                        "longitude": None,
+                    }
 
-                # Insert (batch if available)
-                if hasattr(db, "insert_signals_batch"):
-                    db.insert_signals_batch(rows)
-                else:
-                    for r in rows:
-                        db.insert_signal(r)
-
-                # Optional hook (UI/debug)
-                if self._pipeline_on_signal:
-                    for r in rows:
+                    # 🔥 ONLY call the callback - it will handle GPS + DB insertion
+                    if self._pipeline_on_signal:
                         try:
-                            self._pipeline_on_signal(r)
-                        except Exception:
-                            pass
+                            self._pipeline_on_signal(signal_dict)
+                        except Exception as e:
+                            logger.error(f"Callback error: {e}")
+                    else:
+                        # ⚠️ Fallback: Only insert directly if NO callback provided
+                        # This shouldn't happen in normal operation
+                        if self._pipeline_db:
+                            try:
+                                self._pipeline_db.insert_signal(signal_dict)
+                            except Exception as e:
+                                logger.error(f"Direct DB insert error: {e}")
 
             except Exception as e:
                 logger.error(f"Pipeline worker error: {e}")
@@ -268,13 +356,125 @@ class SimulatedHackRF:
         self.is_running = False
         self.callback = None
         self.frequency = 315_000_000
+        self.sample_rate = 2_457_600
         self.thread = None
 
-    def start(self, callback: Callable):
+        # Pipeline support
+        self._pipeline_db = None
+        self._pipeline_decoder = None
+        self._pipeline_on_signal = None
+        self._pipeline_q: "queue.Queue[tuple]" = queue.Queue(maxsize=200)
+        self._pipeline_stop = threading.Event()
+        self._pipeline_thread: Optional[threading.Thread] = None
+
+    def attach_pipeline(self, db, decoder, on_signal=None):
+        """Attach TPMS decode→DB pipeline"""
+        self._pipeline_db = db
+        self._pipeline_decoder = decoder
+        self._pipeline_on_signal = on_signal
+        logger.info("Pipeline attached to SimulatedHackRF")
+        return True
+
+    def _pipeline_worker(self):
+        """Worker thread for decode→DB pipeline"""
+        while not self._pipeline_stop.is_set():
+            try:
+                iq_complex, rssi, freq_hz, ts = self._pipeline_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            try:
+                dec = self._pipeline_decoder
+                if dec is None:
+                    continue
+
+                # Decode signals
+                signals = dec.process_samples(iq_complex, freq_hz)
+                if not signals:
+                    continue
+
+                # Convert to dicts
+                now_ts = ts or time.time()
+                for s in signals:
+                    # Best-effort mapping
+                    try:
+                        s.signal_strength = rssi
+                    except Exception:
+                        pass
+
+                    signal_dict = {
+                        "tpms_id": getattr(s, "tpms_id", None),
+                        "timestamp": getattr(s, "timestamp", None) or now_ts,
+                        "frequency": getattr(s, "frequency", None) or freq_hz,
+                        "signal_strength": getattr(s, "signal_strength", None) or rssi,
+                        "snr": getattr(s, "snr", None),
+                        "pressure_psi": getattr(s, "pressure_psi", None),
+                        "temperature_c": getattr(s, "temperature_c", None),
+                        "battery_low": getattr(s, "battery_low", None),
+                        "protocol": getattr(s, "protocol", None),
+                        "raw_data": getattr(s, "raw_data", None),
+                        # 🔥 IMPORTANT: Don't set lat/lon here - let callback handle it
+                        "latitude": None,
+                        "longitude": None,
+                    }
+
+                    # 🔥 ONLY call the callback - it will handle GPS + DB insertion
+                    if self._pipeline_on_signal:
+                        try:
+                            self._pipeline_on_signal(signal_dict)
+                        except Exception as e:
+                            logger.error(f"Callback error: {e}")
+                    else:
+                        # ⚠️ Fallback: Only insert directly if NO callback provided
+                        # This shouldn't happen in normal operation
+                        if self._pipeline_db:
+                            try:
+                                self._pipeline_db.insert_signal(signal_dict)
+                            except Exception as e:
+                                logger.error(f"Direct DB insert error: {e}")
+
+            except Exception as e:
+                logger.error(f"Pipeline worker error: {e}")
+
+    def _start_pipeline(self):
+        """Start pipeline worker thread"""
+        if self._pipeline_thread and self._pipeline_thread.is_alive():
+            return
+        self._pipeline_stop.clear()
+        self._pipeline_thread = threading.Thread(target=self._pipeline_worker, daemon=True)
+        self._pipeline_thread.start()
+        logger.info("Pipeline worker started")
+
+    def _stop_pipeline(self):
+        """Stop pipeline worker thread"""
+        self._pipeline_stop.set()
+        if self._pipeline_thread:
+            self._pipeline_thread.join(timeout=2.0)
+
+    def start(self, callback: Optional[Callable] = None):
         if self.is_running:
             return False
 
-        self.callback = callback
+        # Set up callback
+        if callback is None:
+            if self._pipeline_db is None or self._pipeline_decoder is None:
+                raise ValueError(
+                    "start() called with no callback, but no pipeline attached. "
+                    "Call attach_pipeline(db, decoder) first, or pass a callback."
+                )
+
+            self._start_pipeline()
+
+            def _enqueue(iq_complex, rssi, freq_hz):
+                try:
+                    self._pipeline_q.put_nowait((iq_complex, rssi, freq_hz, time.time()))
+                except queue.Full:
+                    pass
+
+            self.callback = _enqueue
+        else:
+            self.callback = callback
+
         self.is_running = True
         self.thread = threading.Thread(target=self._simulate, daemon=True)
         self.thread.start()
@@ -285,6 +485,10 @@ class SimulatedHackRF:
         self.is_running = False
         if self.thread:
             self.thread.join(timeout=1.0)
+
+        # Stop pipeline
+        self._stop_pipeline()
+
         logger.info("Simulation stopped")
 
     def _simulate(self):
@@ -323,6 +527,7 @@ class SimulatedHackRF:
 
     def change_frequency(self, freq):
         self.frequency = freq
+        logger.info(f"Simulated frequency change to {freq / 1e6:.1f} MHz")
         return True
 
     def set_frequency_hopping(self, enabled):
@@ -335,10 +540,25 @@ class SimulatedHackRF:
         pass
 
     def get_status(self):
-        return {'frequency': self.frequency / 1e6, 'is_streaming': self.is_running}
+        return {
+            'frequency': self.frequency / 1e6,
+            'is_streaming': self.is_running,
+            'sample_rate': self.sample_rate,
+            'lna_gain': 32,
+            'vga_gain': 40,
+            'frequency_hopping': False,
+            'hop_interval': 30.0,
+            'frequency_stats': {}
+        }
 
     def get_statistics(self):
-        return {'is_streaming': self.is_running, 'samples_received': 0}
+        return {
+            'is_streaming': self.is_running,
+            'samples_received': 0,
+            'errors': 0,
+            'buffer_size': 0,
+            'sample_rate': self.sample_rate
+        }
 
 
 def create_hackrf_interface(use_simulation=False):
@@ -363,4 +583,5 @@ class HackRFScanner(HackRFInterface):
 # Some code checks for Scanner
 HackRFScanner = HackRFInterface
 Scanner = HackRFScanner
+
 

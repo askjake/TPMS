@@ -3,7 +3,7 @@ import json
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple, Any
 import numpy as np
-import pandas as pd  # ADDED
+import pandas as pd
 
 
 class TPMSDatabase:
@@ -45,21 +45,26 @@ class TPMSDatabase:
         return conn
 
     def init_database(self):
-        """Initialize database schema"""
+        """Initialize database schema with all tables including discovery and reprocessing"""
         conn = self._connect()
         cursor = conn.cursor()
+
+        # Check if this is an existing database that needs migration
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='tpms_signals'")
+        existing_table = cursor.fetchone()
+
+        if existing_table:
+            # Migrate existing table - add new columns if they don't exist
+            self._migrate_existing_database(cursor)
 
         # Raw TPMS signals
         cursor.execute('''
                        CREATE TABLE IF NOT EXISTS tpms_signals
-
                        (
                            id              INTEGER PRIMARY KEY AUTOINCREMENT,
                            tpms_id         TEXT NOT NULL,
-
                            timestamp       REAL NOT NULL,
                            latitude        REAL,
-
                            longitude       REAL,
                            frequency       REAL,
                            signal_strength REAL,
@@ -68,7 +73,10 @@ class TPMSDatabase:
                            temperature_c   REAL,
                            battery_low     INTEGER,
                            protocol        TEXT,
-                           raw_data        BLOB
+                           raw_data        BLOB,
+                           confidence      REAL    DEFAULT 0.8,
+                           reprocessed     INTEGER DEFAULT 0,
+                           reprocess_count INTEGER DEFAULT 0
                        )
                        ''')
 
@@ -121,13 +129,133 @@ class TPMSDatabase:
                        )
                        ''')
 
-        # Create indices
+        # Discovered protocols table
+        cursor.execute('''
+                       CREATE TABLE IF NOT EXISTS discovered_protocols
+                       (
+                           id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                           name            TEXT UNIQUE NOT NULL,
+                           modulation      TEXT        NOT NULL,
+                           symbol_rate     INTEGER     NOT NULL,
+                           deviation       INTEGER,
+                           preamble        TEXT        NOT NULL, -- JSON array
+                           packet_length   INTEGER     NOT NULL,
+                           id_offset       INTEGER DEFAULT 0,
+                           pressure_offset INTEGER,
+                           pressure_scale  REAL    DEFAULT 0.25,
+                           temp_offset     INTEGER,
+                           temp_correction INTEGER DEFAULT -40,
+                           confidence      REAL        NOT NULL,
+                           sample_count    INTEGER DEFAULT 1,
+                           discovered_at   REAL        NOT NULL,
+                           last_seen       REAL,
+                           success_count   INTEGER DEFAULT 0,
+                           metadata        TEXT                  -- JSON for additional characteristics
+                       )
+                       ''')
+
+        # Unknown signals for reprocessing
+        cursor.execute('''
+                       CREATE TABLE IF NOT EXISTS unknown_signals
+                       (
+                           id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                           timestamp         REAL NOT NULL,
+                           frequency         REAL NOT NULL,
+                           signal_strength   REAL NOT NULL,
+                           snr               REAL,
+                           modulation_type   TEXT,
+                           baud_rate         INTEGER,
+                           packet_length     INTEGER,
+                           pattern_signature TEXT,
+                           raw_samples       BLOB,
+                           retry_count       INTEGER DEFAULT 0,
+                           last_retry        REAL,
+                           decoded           INTEGER DEFAULT 0,
+                           decoded_protocol  TEXT,
+                           decoded_at        REAL,
+                           notes             TEXT
+                       )
+                       ''')
+
+        # Reprocessing results tracking
+        cursor.execute('''
+                       CREATE TABLE IF NOT EXISTS reprocessing_results
+                       (
+                           id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                           unknown_signal_id INTEGER NOT NULL,
+                           strategy_used     TEXT    NOT NULL,
+                           retry_attempt     INTEGER NOT NULL,
+                           timestamp         REAL    NOT NULL,
+                           success           INTEGER NOT NULL,
+                           protocol_found    TEXT,
+                           tpms_id           TEXT,
+                           confidence        REAL,
+                           notes             TEXT,
+                           FOREIGN KEY (unknown_signal_id) REFERENCES unknown_signals (id)
+                       )
+                       ''')
+
+        # Protocol learning statistics
+        cursor.execute('''
+                       CREATE TABLE IF NOT EXISTS protocol_statistics
+                       (
+                           id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                           protocol_name       TEXT NOT NULL,
+                           timestamp           REAL NOT NULL,
+                           success_count       INTEGER DEFAULT 0,
+                           failure_count       INTEGER DEFAULT 0,
+                           avg_signal_strength REAL,
+                           avg_snr             REAL,
+                           common_frequencies  TEXT, -- JSON array
+                           notes               TEXT
+                       )
+                       ''')
+
+        # Create indices for performance
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_tpms_id ON tpms_signals(tpms_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON tpms_signals(timestamp)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_vehicle_hash ON vehicles(vehicle_hash)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_protocol ON tpms_signals(protocol)')
+
+        # Only create these indices if the columns exist
+        try:
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_reprocessed ON tpms_signals(reprocessed)')
+        except sqlite3.OperationalError:
+            pass  # Column doesn't exist yet, will be created in migration
+
+        # Indices for discovery tables
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_discovered_protocols_name ON discovered_protocols(name)')
+        cursor.execute(
+            'CREATE INDEX IF NOT EXISTS idx_discovered_protocols_confidence ON discovered_protocols(confidence)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_unknown_signals_decoded ON unknown_signals(decoded)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_unknown_signals_retry_count ON unknown_signals(retry_count)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_unknown_signals_timestamp ON unknown_signals(timestamp)')
 
         conn.commit()
         conn.close()
+
+    def _migrate_existing_database(self, cursor):
+        """Migrate existing database to add new columns"""
+        # Get existing columns
+        cursor.execute("PRAGMA table_info(tpms_signals)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+
+        # Add missing columns
+        columns_to_add = {
+            'confidence': 'REAL DEFAULT 0.8',
+            'reprocessed': 'INTEGER DEFAULT 0',
+            'reprocess_count': 'INTEGER DEFAULT 0'
+        }
+
+        for column_name, column_def in columns_to_add.items():
+            if column_name not in existing_columns:
+                try:
+                    cursor.execute(f'ALTER TABLE tpms_signals ADD COLUMN {column_name} {column_def}')
+                    print(f"Added column {column_name} to tpms_signals table")
+                except sqlite3.OperationalError as e:
+                    # Column might already exist or other issue
+                    print(f"Could not add column {column_name}: {e}")
+
 
     def insert_signal(self, signal_data: Dict) -> int:
         """Insert a raw TPMS signal"""
@@ -138,8 +266,8 @@ class TPMSDatabase:
                        INSERT INTO tpms_signals
                        (tpms_id, timestamp, latitude, longitude, frequency,
                         signal_strength, snr, pressure_psi, temperature_c,
-                        battery_low, protocol, raw_data)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        battery_low, protocol, raw_data, confidence, reprocessed)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ''', (
                            signal_data['tpms_id'],
                            signal_data['timestamp'],
@@ -152,7 +280,9 @@ class TPMSDatabase:
                            signal_data.get('temperature_c'),
                            signal_data.get('battery_low', 0),
                            signal_data.get('protocol', 'unknown'),
-                           signal_data.get('raw_data')
+                           signal_data.get('raw_data'),
+                           signal_data.get('confidence', 0.8),
+                           signal_data.get('reprocessed', 0)
                        ))
 
         signal_id = cursor.lastrowid
@@ -160,9 +290,288 @@ class TPMSDatabase:
         conn.close()
         return signal_id
 
+    def insert_signals_batch(self, signals: List[Dict]) -> int:
+        """Insert multiple signals in a batch for better performance"""
+        if not signals:
+            return 0
+
+        conn = self._connect()
+        cursor = conn.cursor()
+
+        rows = []
+        for signal_data in signals:
+            rows.append((
+                signal_data.get('tpms_id'),
+                signal_data.get('timestamp'),
+                signal_data.get('latitude'),
+                signal_data.get('longitude'),
+                signal_data.get('frequency'),
+                signal_data.get('signal_strength'),
+                signal_data.get('snr'),
+                signal_data.get('pressure_psi'),
+                signal_data.get('temperature_c'),
+                signal_data.get('battery_low', 0),
+                signal_data.get('protocol', 'unknown'),
+                signal_data.get('raw_data'),
+                signal_data.get('confidence', 0.8),
+                signal_data.get('reprocessed', 0)
+            ))
+
+        cursor.executemany('''
+                           INSERT INTO tpms_signals
+                           (tpms_id, timestamp, latitude, longitude, frequency,
+                            signal_strength, snr, pressure_psi, temperature_c,
+                            battery_low, protocol, raw_data, confidence, reprocessed)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           ''', rows)
+
+        count = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return count
+
+    def insert_unknown_signal(self, unknown_data: Dict) -> int:
+        """Insert an unknown signal for reprocessing"""
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"🔵 insert_unknown_signal() called with {len(unknown_data.get('raw_samples', b''))} bytes")
+
+        conn = self._connect()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+                       INSERT INTO unknown_signals
+                       (timestamp, frequency, signal_strength, snr, modulation_type,
+                        baud_rate, packet_length, pattern_signature, raw_samples)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ''', (
+                           unknown_data['timestamp'],
+                           unknown_data['frequency'],
+                           unknown_data['signal_strength'],
+                           unknown_data.get('snr'),
+                           unknown_data.get('modulation_type'),
+                           unknown_data.get('baud_rate'),
+                           unknown_data.get('packet_length'),
+                           unknown_data.get('pattern_signature'),
+                           unknown_data.get('raw_samples')
+                       ))
+
+        signal_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return signal_id
+
+    def get_unknown_signals_for_reprocessing(self, max_retries: int = 5, limit: int = 100) -> List[Dict]:
+        """Get unknown signals that need reprocessing"""
+        conn = self._connect(read_only=True)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+                       SELECT *
+                       FROM unknown_signals
+                       WHERE decoded = 0
+                         AND retry_count < ?
+                       ORDER BY signal_strength DESC, timestamp DESC
+                       LIMIT ?
+                       ''', (max_retries, limit))
+
+        columns = [description[0] for description in cursor.description]
+        results = [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+        conn.close()
+        return results
+
+    def update_unknown_signal_retry(self, signal_id: int, success: bool = False,
+                                    protocol: Optional[str] = None, tpms_id: Optional[str] = None):
+        """Update retry count and status for unknown signal"""
+        conn = self._connect()
+        cursor = conn.cursor()
+
+        if success:
+            cursor.execute('''
+                           UPDATE unknown_signals
+                           SET decoded          = 1,
+                               decoded_protocol = ?,
+                               decoded_at       = ?,
+                               retry_count      = retry_count + 1
+                           WHERE id = ?
+                           ''', (protocol, datetime.now().timestamp(), signal_id))
+        else:
+            cursor.execute('''
+                           UPDATE unknown_signals
+                           SET retry_count = retry_count + 1,
+                               last_retry  = ?
+                           WHERE id = ?
+                           ''', (datetime.now().timestamp(), signal_id))
+
+        conn.commit()
+        conn.close()
+
+    def insert_reprocessing_result(self, result_data: Dict) -> int:
+        """Record a reprocessing attempt result"""
+        conn = self._connect()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+                       INSERT INTO reprocessing_results
+                       (unknown_signal_id, strategy_used, retry_attempt, timestamp,
+                        success, protocol_found, tpms_id, confidence, notes)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ''', (
+                           result_data['unknown_signal_id'],
+                           result_data['strategy_used'],
+                           result_data['retry_attempt'],
+                           result_data['timestamp'],
+                           result_data['success'],
+                           result_data.get('protocol_found'),
+                           result_data.get('tpms_id'),
+                           result_data.get('confidence'),
+                           result_data.get('notes')
+                       ))
+
+        result_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return result_id
+
+    def save_discovered_protocol(self, protocol_data: Dict) -> int:
+        """Save a newly discovered protocol"""
+        conn = self._connect()
+        cursor = conn.cursor()
+
+        try:
+            cursor.execute('''
+                           INSERT INTO discovered_protocols
+                           (name, modulation, symbol_rate, deviation, preamble, packet_length,
+                            id_offset, pressure_offset, pressure_scale, temp_offset, temp_correction,
+                            confidence, sample_count, discovered_at, metadata)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           ''', (
+                               protocol_data['name'],
+                               protocol_data['modulation'],
+                               protocol_data['symbol_rate'],
+                               protocol_data.get('deviation'),
+                               json.dumps(protocol_data['preamble']),
+                               protocol_data['packet_length'],
+                               protocol_data.get('id_offset', 0),
+                               protocol_data.get('pressure_offset'),
+                               protocol_data.get('pressure_scale', 0.25),
+                               protocol_data.get('temp_offset'),
+                               protocol_data.get('temp_correction', -40),
+                               protocol_data['confidence'],
+                               protocol_data.get('sample_count', 1),
+                               protocol_data['discovered_at'],
+                               json.dumps(protocol_data.get('metadata', {}))
+                           ))
+            protocol_id = cursor.lastrowid
+            conn.commit()
+        except sqlite3.IntegrityError:
+            # Protocol already exists, update it
+            cursor.execute('''
+                           UPDATE discovered_protocols
+                           SET sample_count = sample_count + ?,
+                               confidence   = ?,
+                               last_seen    = ?
+                           WHERE name = ?
+                           ''', (
+                protocol_data.get('sample_count', 1),
+                protocol_data['confidence'],
+                datetime.now().timestamp(),
+                protocol_data['name']
+                           ))
+            conn.commit()
+            cursor.execute('SELECT id FROM discovered_protocols WHERE name = ?', (protocol_data['name'],))
+            protocol_id = cursor.fetchone()[0]
+
+        conn.close()
+        return protocol_id
+
+    def get_discovered_protocols(self, min_confidence: float = 0.5) -> List[Dict]:
+        """Get discovered protocols above confidence threshold"""
+        conn = self._connect(read_only=True)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+                       SELECT *
+                       FROM discovered_protocols
+                       WHERE confidence >= ?
+                       ORDER BY confidence DESC, sample_count DESC
+                       ''', (min_confidence,))
+
+        columns = [description[0] for description in cursor.description]
+        results = []
+        for row in cursor.fetchall():
+            protocol = dict(zip(columns, row))
+            protocol['preamble'] = json.loads(protocol['preamble'])
+            if protocol['metadata']:
+                protocol['metadata'] = json.loads(protocol['metadata'])
+            results.append(protocol)
+
+        conn.close()
+        return results
+
+    def update_protocol_success(self, protocol_name: str, success: bool = True):
+        """Update success/failure count for a protocol"""
+        conn = self._connect()
+        cursor = conn.cursor()
+
+        if success:
+            cursor.execute('''
+                           UPDATE discovered_protocols
+                           SET success_count = success_count + 1,
+                               last_seen     = ?
+                           WHERE name = ?
+                           ''', (datetime.now().timestamp(), protocol_name))
+
+        conn.commit()
+        conn.close()
+
+    def get_reprocessing_statistics(self) -> Dict:
+        """Get statistics on reprocessing efforts"""
+        conn = self._connect(read_only=True)
+        cursor = conn.cursor()
+
+        stats = {}
+
+        # Total unknown signals
+        cursor.execute('SELECT COUNT(*) FROM unknown_signals')
+        stats['total_unknown'] = cursor.fetchone()[0]
+
+        # Successfully decoded
+        cursor.execute('SELECT COUNT(*) FROM unknown_signals WHERE decoded = 1')
+        stats['successfully_decoded'] = cursor.fetchone()[0]
+
+        # Pending reprocessing
+        cursor.execute('SELECT COUNT(*) FROM unknown_signals WHERE decoded = 0 AND retry_count < 5')
+        stats['pending_reprocessing'] = cursor.fetchone()[0]
+
+        # Exhausted retries
+        cursor.execute('SELECT COUNT(*) FROM unknown_signals WHERE decoded = 0 AND retry_count >= 5')
+        stats['exhausted_retries'] = cursor.fetchone()[0]
+
+        # Success by strategy
+        cursor.execute('''
+                       SELECT strategy_used, COUNT(*) as count
+                       FROM reprocessing_results
+                       WHERE success = 1
+                       GROUP BY strategy_used
+                       ORDER BY count DESC
+                       ''')
+        stats['success_by_strategy'] = dict(cursor.fetchall())
+
+        # Discovery statistics
+        cursor.execute('SELECT COUNT(*) FROM discovered_protocols')
+        stats['discovered_protocols'] = cursor.fetchone()[0]
+
+        cursor.execute('SELECT COUNT(*) FROM discovered_protocols WHERE confidence >= 0.7')
+        stats['high_confidence_protocols'] = cursor.fetchone()[0]
+
+        conn.close()
+        return stats
+
     def get_recent_signals(self, time_window: int = 30) -> List[Dict]:
         """Get signals from the last N seconds"""
-        conn = self._connect()
+        conn = self._connect(read_only=True)
         cursor = conn.cursor()
 
         cutoff_time = datetime.now().timestamp() - time_window
@@ -183,20 +592,22 @@ class TPMSDatabase:
     def get_all_unique_sensors(self):
         """Get all unique TPMS sensors ever seen"""
         query = """
-                SELECT tpms_id, \
-                       protocol, \
-                       COUNT(*)             as signal_count, \
-                       MIN(timestamp)       as first_seen, \
-                       MAX(timestamp)       as last_seen, \
-                       AVG(signal_strength) as avg_rssi, \
-                       AVG(pressure_psi)    as avg_pressure, \
-                       AVG(temperature_c)   as avg_temperature, \
-                       MAX(frequency)       as frequency
+                SELECT tpms_id,
+                       protocol,
+                       COUNT(*)             as signal_count,
+                       MIN(timestamp)       as first_seen,
+                       MAX(timestamp)       as last_seen,
+                       AVG(signal_strength) as avg_rssi,
+                       AVG(pressure_psi)    as avg_pressure,
+                       AVG(temperature_c)   as avg_temperature,
+                       MAX(frequency)       as frequency,
+                       AVG(confidence)      as avg_confidence,
+                       SUM(reprocessed)     as reprocessed_count
                 FROM tpms_signals
                 GROUP BY tpms_id
-                ORDER BY last_seen DESC \
+                ORDER BY last_seen DESC
                 """
-        conn = self._connect()
+        conn = self._connect(read_only=True)
         result = pd.read_sql_query(query, conn)
         conn.close()
         return result
@@ -207,9 +618,9 @@ class TPMSDatabase:
                 SELECT *
                 FROM tpms_signals
                 WHERE tpms_id = ?
-                ORDER BY timestamp DESC \
+                ORDER BY timestamp DESC
                 """
-        conn = self._connect()
+        conn = self._connect(read_only=True)
         result = pd.read_sql_query(query, conn, params=(tpms_id,))
         conn.close()
         return result
@@ -217,23 +628,25 @@ class TPMSDatabase:
     def get_sensor_statistics(self, tpms_id):
         """Get detailed statistics for a sensor"""
         query = """
-                SELECT COUNT(*)             as total_signals, \
-                       MIN(timestamp)       as first_seen, \
-                       MAX(timestamp)       as last_seen, \
-                       AVG(signal_strength) as avg_rssi, \
-                       MIN(signal_strength) as min_rssi, \
-                       MAX(signal_strength) as max_rssi, \
-                       AVG(pressure_psi)    as avg_pressure, \
-                       MIN(pressure_psi)    as min_pressure, \
-                       MAX(pressure_psi)    as max_pressure, \
-                       AVG(temperature_c)   as avg_temp, \
-                       MIN(temperature_c)   as min_temp, \
-                       MAX(temperature_c)   as max_temp, \
-                       protocol
+                SELECT COUNT(*)             as total_signals,
+                       MIN(timestamp)       as first_seen,
+                       MAX(timestamp)       as last_seen,
+                       AVG(signal_strength) as avg_rssi,
+                       MIN(signal_strength) as min_rssi,
+                       MAX(signal_strength) as max_rssi,
+                       AVG(pressure_psi)    as avg_pressure,
+                       MIN(pressure_psi)    as min_pressure,
+                       MAX(pressure_psi)    as max_pressure,
+                       AVG(temperature_c)   as avg_temp,
+                       MIN(temperature_c)   as min_temp,
+                       MAX(temperature_c)   as max_temp,
+                       protocol,
+                       AVG(confidence)      as avg_confidence,
+                       SUM(reprocessed)     as times_reprocessed
                 FROM tpms_signals
-                WHERE tpms_id = ? \
+                WHERE tpms_id = ?
                 """
-        conn = self._connect()
+        conn = self._connect(read_only=True)
         conn.row_factory = sqlite3.Row
         result = conn.execute(query, (tpms_id,)).fetchone()
         conn.close()
@@ -244,14 +657,14 @@ class TPMSDatabase:
         query = """
                 SELECT DISTINCT ts.tpms_id, ts.protocol, MAX(ts.timestamp) as last_seen
                 FROM tpms_signals ts
-                         LEFT JOIN vehicles v ON ts.tpms_id IN (SELECT json_each.value \
-                                                                FROM vehicles, json_each(vehicles.tpms_ids) \
+                         LEFT JOIN vehicles v ON ts.tpms_id IN (SELECT json_each.value
+                                                                FROM vehicles, json_each(vehicles.tpms_ids)
                                                                 WHERE vehicles.id = v.id)
                 WHERE v.id IS NULL
                 GROUP BY ts.tpms_id
-                ORDER BY last_seen DESC \
+                ORDER BY last_seen DESC
                 """
-        conn = self._connect()
+        conn = self._connect(read_only=True)
         result = pd.read_sql_query(query, conn)
         conn.close()
         return result
@@ -280,7 +693,6 @@ class TPMSDatabase:
 
         conn.close()
         return False
-
 
     def upsert_vehicle(self, tpms_ids: List[str], timestamp: float,
                        location: Optional[Tuple[float, float]] = None) -> int:
@@ -316,7 +728,6 @@ class TPMSDatabase:
                        VALUES (?, ?, ?, ?)
                        ''', (vehicle_id, timestamp,
                              location[0] if location else None,
-
                              location[1] if location else None))
 
         conn.commit()
@@ -325,7 +736,7 @@ class TPMSDatabase:
 
     def get_vehicle_history(self, vehicle_id: int) -> Dict:
         """Get complete history for a vehicle"""
-        conn = self._connect()
+        conn = self._connect(read_only=True)
         cursor = conn.cursor()
 
         # Vehicle info
@@ -367,7 +778,7 @@ class TPMSDatabase:
 
     def get_all_vehicles(self, min_encounters: int = 1) -> List[Dict]:
         """Get all known vehicles"""
-        conn = self._connect()
+        conn = self._connect(read_only=True)
         cursor = conn.cursor()
 
         cursor.execute('''
@@ -389,13 +800,17 @@ class TPMSDatabase:
 
     def analyze_maintenance(self, vehicle_id: int, days: int = 30) -> Dict:
         """Analyze tire maintenance for a vehicle"""
-        conn = self._connect()
+        conn = self._connect(read_only=True)
         cursor = conn.cursor()
 
         # Get TPMS IDs for this vehicle
         cursor.execute('SELECT tpms_ids FROM vehicles WHERE id = ?', (vehicle_id,))
-        tpms_ids = json.loads(cursor.fetchone()[0])
+        result = cursor.fetchone()
+        if not result:
+            conn.close()
+            return {}
 
+        tpms_ids = json.loads(result[0])
         cutoff_time = datetime.now().timestamp() - (days * 86400)
 
         # Get pressure and temperature trends
@@ -466,7 +881,6 @@ class TPMSDatabase:
         conn.commit()
         conn.close()
 
-
     # -----------------------------
     # Fast, UI-friendly helpers
     # -----------------------------
@@ -508,6 +922,19 @@ class TPMSDatabase:
         except Exception:
             known_sensors = 0
 
+        # Reprocessing stats
+        try:
+            cur.execute("SELECT COUNT(*) FROM unknown_signals WHERE decoded = 0 AND retry_count < 5")
+            pending_reprocessing = int(cur.fetchone()[0] or 0)
+        except Exception:
+            pending_reprocessing = 0
+
+        try:
+            cur.execute("SELECT COUNT(*) FROM discovered_protocols WHERE confidence >= 0.7")
+            discovered_protocols = int(cur.fetchone()[0] or 0)
+        except Exception:
+            discovered_protocols = 0
+
         conn.close()
 
         return {
@@ -521,6 +948,8 @@ class TPMSDatabase:
             "rate_per_hour_last_min": rate_per_hour_last_min,
             "known_vehicles": known_vehicles,
             "known_sensors": known_sensors,
+            "pending_reprocessing": pending_reprocessing,
+            "discovered_protocols": discovered_protocols,
         }
 
     def get_signals_since_rowid(self, last_rowid: int = 0, limit: int = 5000) -> List[Dict[str, Any]]:
@@ -529,20 +958,21 @@ class TPMSDatabase:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT
-                rowid,
-                tpms_id,
-                protocol,
-                timestamp,
-                frequency,
-                pressure_psi,
-                temperature_c,
-                battery_low,
-                signal_strength,
-                snr,
-                latitude,
-                longitude,
-                raw_payload
+            SELECT rowid,
+                   tpms_id,
+                   protocol,
+                   timestamp,
+                   frequency,
+                   pressure_psi,
+                   temperature_c,
+                   battery_low,
+                   signal_strength,
+                   snr,
+                   latitude,
+                   longitude,
+                   raw_data,
+                   confidence,
+                   reprocessed
             FROM tpms_signals
             WHERE rowid > ?
             ORDER BY rowid ASC
@@ -550,13 +980,17 @@ class TPMSDatabase:
             """,
             (int(last_rowid), int(limit)),
         )
+
+        # Get column names
+        columns = [description[0] for description in cur.description]
         rows = cur.fetchall()
         conn.close()
 
         out: List[Dict[str, Any]] = []
         for r in rows:
-            # sqlite3.Row supports mapping-like access
-            out.append(dict(r))
+            # Build dict from column names and row values
+            row_dict = dict(zip(columns, r))
+            out.append(row_dict)
         return out
 
     def ensure_performance_indexes(self) -> None:
@@ -579,7 +1013,12 @@ class TPMSDatabase:
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_encounters_timestamp ON encounters(timestamp)"
             )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tpms_signals_protocol ON tpms_signals(protocol)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tpms_signals_reprocessed ON tpms_signals(reprocessed)"
+            )
             conn.commit()
         finally:
             conn.close()
-
