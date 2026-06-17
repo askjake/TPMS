@@ -227,7 +227,7 @@ with tab_overview:
         hover_data=["protocol", temp_col, "packet_count", "rssi_dbm"],
     )
     fig_pressure.update_layout(showlegend=False, xaxis_tickangle=-45)
-    st.plotly_chart(fig_pressure, use_container_width=True)
+    st.plotly_chart(fig_pressure, width='stretch')
 
     col_a, col_b = st.columns(2)
 
@@ -240,7 +240,7 @@ with tab_overview:
             title="Protocol Distribution",
             hole=0.4,
         )
-        st.plotly_chart(fig_proto, use_container_width=True)
+        st.plotly_chart(fig_proto, width='stretch')
 
     with col_b:
         # RSSI distribution
@@ -251,7 +251,7 @@ with tab_overview:
             title="RSSI Signal Strength Distribution",
             labels={"rssi_dbm": "RSSI (dBm)"},
         )
-        st.plotly_chart(fig_rssi, use_container_width=True)
+        st.plotly_chart(fig_rssi, width='stretch')
 
     # Scatter: Pressure vs Temperature coloured by protocol
     fig_scatter = px.scatter(
@@ -265,7 +265,7 @@ with tab_overview:
         size_max=20,
     )
     fig_scatter.update_traces(textposition="top center")
-    st.plotly_chart(fig_scatter, use_container_width=True)
+    st.plotly_chart(fig_scatter, width='stretch')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -323,7 +323,7 @@ with tab_history:
                 xaxis=dict(tickmode="linear", tick0=0, dtick=1),
                 bargap=0.05,
             )
-            st.plotly_chart(fig_cap_hr, use_container_width=True)
+            st.plotly_chart(fig_cap_hr, width='stretch')
 
         with rh2:
             # ── Capture count per day, coloured by session ────────────────────
@@ -337,7 +337,7 @@ with tab_history:
                 barmode="stack",
             )
             fig_cap_day.update_layout(xaxis_tickangle=-30, bargap=0.1)
-            st.plotly_chart(fig_cap_day, use_container_width=True)
+            st.plotly_chart(fig_cap_day, width='stretch')
 
         # ── Strip chart: each dot = one capture event for a repeated sensor ──
         st.markdown("##### Individual Capture Events (strip chart)")
@@ -355,29 +355,40 @@ with tab_history:
                   .index.tolist()
         )
 
+        # px.strip() does not accept color_continuous_scale.
+        # Convert integer sessions_seen -> readable category label for discrete coloring.
+        df_rep["sessions_label"] = df_rep["sessions_seen"].apply(
+            lambda n: f"{n} session{'s' if n != 1 else ''}"
+        )
+        label_order = sorted(df_rep["sessions_label"].unique(),
+                             key=lambda s: int(s.split()[0]))
+
         fig_strip = px.strip(
             df_rep,
             x="first_seen",
             y="sensor_id",
-            color="sessions_seen",
-            color_continuous_scale="Viridis",
+            color="sessions_label",
+            color_discrete_sequence=px.colors.qualitative.Plotly,
             hover_data=["protocol", pressure_col, temp_col,
                         "capture_hhmm", "session_label"],
             title="Repeated Sensor Capture Events Over Time",
             labels={
-                "first_seen":      "Capture Time (first_seen)",
-                "sensor_id":       "Sensor ID",
-                "sessions_seen":   "# Sessions",
-                "session_label":   "Session",
+                "first_seen":     "Capture Time (first_seen)",
+                "sensor_id":      "Sensor ID",
+                "sessions_label": "Sessions seen",
+                "session_label":  "Session",
             },
-            category_orders={"sensor_id": sensor_order},
+            category_orders={
+                "sensor_id":      sensor_order,
+                "sessions_label": label_order,
+            },
         )
         fig_strip.update_traces(marker=dict(size=8, opacity=0.75))
         fig_strip.update_layout(
             height=max(350, len(_repeated_ids) * 22 + 100),
-            coloraxis_colorbar=dict(title="Sessions"),
+            legend_title_text="Sessions seen",
         )
-        st.plotly_chart(fig_strip, use_container_width=True)
+        st.plotly_chart(fig_strip, width='stretch')
 
         # ── Summary table ────────────────────────────────────────────────────
         with st.expander("📋 Repeated-sensor summary table"):
@@ -398,7 +409,7 @@ with tab_history:
                 (df_rep_summary["last_capture"] - df_rep_summary["first_capture"])
                 .dt.total_seconds() / 3600
             ).round(1)
-            st.dataframe(df_rep_summary, use_container_width=True)
+            st.dataframe(df_rep_summary, width='stretch')
 
     st.markdown("---")
     # ── END repeated-sensor histogram block ───────────────────────────────────
@@ -429,7 +440,7 @@ with tab_history:
             title=f"Pressure History by Sensor",
             labels={"export_dt": "Export Time", pressure_col: pressure_label},
         )
-        st.plotly_chart(fig_ph, use_container_width=True)
+        st.plotly_chart(fig_ph, width='stretch')
 
         fig_th = px.line(
             df_hist, x="export_dt", y=temp_col,
@@ -437,7 +448,7 @@ with tab_history:
             title=f"Temperature History by Sensor",
             labels={"export_dt": "Export Time", temp_col: temp_label},
         )
-        st.plotly_chart(fig_th, use_container_width=True)
+        st.plotly_chart(fig_th, width='stretch')
 
         fig_rssi_h = px.line(
             df_hist[df_hist["rssi_dbm"] != 0],
@@ -446,7 +457,7 @@ with tab_history:
             title="RSSI History by Sensor",
             labels={"export_dt": "Export Time", "rssi_dbm": "RSSI (dBm)"},
         )
-        st.plotly_chart(fig_rssi_h, use_container_width=True)
+        st.plotly_chart(fig_rssi_h, width='stretch')
 
     # Session-level aggregated trends
     st.markdown("#### Session Averages Over Time")
@@ -477,7 +488,7 @@ with tab_history:
                               name="Packets"), row=2, col=2)
     fig_agg.update_layout(height=600, showlegend=False, title_text="Per-Session Aggregates")
     fig_agg.update_xaxes(tickangle=-45)
-    st.plotly_chart(fig_agg, use_container_width=True)
+    st.plotly_chart(fig_agg, width='stretch')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -522,13 +533,13 @@ with tab_sensors:
         ), row=3, col=1)
         fig_sensor.update_layout(height=600, title_text=f"Sensor {chosen} — Full History",
                                   showlegend=False)
-        st.plotly_chart(fig_sensor, use_container_width=True)
+        st.plotly_chart(fig_sensor, width='stretch')
 
         st.markdown("#### All readings for this sensor")
         display_cols = ["export_dt", "export_file", pressure_col, temp_col,
                         "rssi_dbm", "packet_count", "battery_low", "magic_ok"]
         existing = [c for c in display_cols if c in df_s.columns]
-        st.dataframe(df_s[existing].sort_values("export_dt", ascending=False), use_container_width=True)
+        st.dataframe(df_s[existing].sort_values("export_dt", ascending=False), width='stretch')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -553,7 +564,7 @@ with tab_patterns:
                 title=f"Pressure Heatmap (sensor × session)",
                 labels={"color": pressure_label},
             )
-            st.plotly_chart(fig_heat, use_container_width=True)
+            st.plotly_chart(fig_heat, width='stretch')
 
     with col_h2:
         # Heatmap: sensor × session, temperature
@@ -569,7 +580,7 @@ with tab_patterns:
                 title=f"Temperature Heatmap (sensor × session)",
                 labels={"color": temp_label},
             )
-            st.plotly_chart(fig_heat_t, use_container_width=True)
+            st.plotly_chart(fig_heat_t, width='stretch')
 
     # Low-pressure anomalies
     st.markdown("#### ⚠️ Low-Pressure Alerts (< 30 PSI)")
@@ -580,7 +591,7 @@ with tab_patterns:
     if df_low.empty:
         st.success("No low-pressure readings in selected data.")
     else:
-        st.dataframe(df_low, use_container_width=True)
+        st.dataframe(df_low, width='stretch')
 
     # Battery low events
     st.markdown("#### 🔋 Battery Low Events")
@@ -590,7 +601,7 @@ with tab_patterns:
     if df_bat.empty:
         st.success("No battery-low flags in selected data.")
     else:
-        st.dataframe(df_bat, use_container_width=True)
+        st.dataframe(df_bat, width='stretch')
 
     # Packet count distribution
     st.markdown("#### 📦 Packet Count Distribution")
@@ -600,7 +611,7 @@ with tab_patterns:
         title="Packet Count by Protocol",
         labels={"packet_count": "Packets per Reading"},
     )
-    st.plotly_chart(fig_pkt, use_container_width=True)
+    st.plotly_chart(fig_pkt, width='stretch')
 
     # New sensors per session
     st.markdown("#### 🆕 New Sensors per Session")
@@ -622,7 +633,7 @@ with tab_patterns:
                                   mode="lines+markers", name="Cumulative Unique"), secondary_y=True)
     fig_new.update_layout(title_text="New vs Cumulative Sensors per Session")
     fig_new.update_xaxes(tickangle=-45)
-    st.plotly_chart(fig_new, use_container_width=True)
+    st.plotly_chart(fig_new, width='stretch')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -638,7 +649,7 @@ with tab_raw:
         mask = df_view.apply(lambda r: search.lower() in str(r).lower(), axis=1)
         df_view = df_view[mask]
 
-    st.dataframe(df_view.sort_values("export_dt", ascending=False), use_container_width=True)
+    st.dataframe(df_view.sort_values("export_dt", ascending=False), width='stretch')
 
     csv_data = df_view.to_csv(index=False)
     st.download_button(
