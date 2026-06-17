@@ -9,7 +9,6 @@ from pathlib import Path
 @dataclass
 class Config:
     # Add to Config class
-    PROTOCOL_DETECTION_ENABLED = True
     HISTOGRAM_BINS: int = 50  # Number of bins for signal histogram
     DEFAULT_FREQUENCY: int = 315_000_000  # Default frequency
     BANDWIDTH: int = 1_750_000  # 1.75 MHz bandwidth
@@ -20,8 +19,8 @@ class Config:
     CENTER_FREQ: int = 315_000_000  # 315 MHz default
     
     # Gain Settings (conservative defaults)
-    LNA_GAIN: int = 36  # 0-40 dB (start moderate)
-    VGA_GAIN: int = 30  # 0-62 dB (start moderate)
+    LNA_GAIN: int = 40  # 0-40 dB (start moderate)
+    VGA_GAIN: int = 38  # 0-62 dB (start moderate)
     ENABLE_AMP: bool = True  # RF amp on
     
     # TPMS Frequency Bands - using default_factory for mutable default
@@ -32,7 +31,7 @@ class Config:
     ])
     
     # Signal Detection Thresholds
-    SIGNAL_THRESHOLD: float = -50.0  # dBm - lowered for better sensitivity
+    SIGNAL_THRESHOLD: float = -22.0  # dBm - lowered for better sensitivity
     MIN_SNR: float = 6.0  # dB - minimum SNR for valid decode
     
     # Symbol Rates (matching Maurader exactly)

@@ -1180,7 +1180,7 @@ def example_usage_predictive_analytics(clustering_engine: VehicleClusteringEngin
     Example of how to use the predictive analytics features.
     """
     print(f"\n=== Predictive Analytics for Vehicle {vehicle_id} ===\n")
-
+    
     # Predict next encounter
     prediction = clustering_engine.predict_next_encounter(vehicle_id)
     if prediction['predicted_time']:
@@ -1189,7 +1189,7 @@ def example_usage_predictive_analytics(clustering_engine: VehicleClusteringEngin
         print(f"   Confidence: {prediction['confidence']:.2%}")
         print(f"   Average interval: {prediction['interval_mean']/60:.1f} minutes")
         print(f"   Likely hours: {prediction['likely_hours']}")
-
+    
     # Check for missed encounters
     missed = clustering_engine.detect_missed_encounters(vehicle_id)
     if missed['missed']:
@@ -1197,7 +1197,7 @@ def example_usage_predictive_analytics(clustering_engine: VehicleClusteringEngin
         print(f"   Expected at: {datetime.fromtimestamp(missed['expected_time']).strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"   Overdue by: {missed['overdue_by']/60:.1f} minutes")
         print(f"   Confidence: {missed['confidence']:.2%}")
-
+    
     # Check sensor completeness
     observed = clustering_engine._observed_ids(time.time())
     completeness = clustering_engine.get_incomplete_sensor_sets(vehicle_id, observed)
@@ -1210,18 +1210,18 @@ def example_usage_predictive_analytics(clustering_engine: VehicleClusteringEngin
         print(f"   Unexpected sensors: {completeness['unexpected_sensors']}")
 
 
-def example_usage_orphan_sensor(clustering_engine: VehicleClusteringEngine, orphan_id: str,
+def example_usage_orphan_sensor(clustering_engine: VehicleClusteringEngine, orphan_id: str, 
                                 location: Optional[Tuple[float, float]] = None):
     """
     Example of how to handle an orphan sensor (detected but not associated).
     """
     print(f"\n=== Analyzing Orphan Sensor {orphan_id} ===\n")
-
+    
     suggestions = clustering_engine.suggest_sensor_associations(
-        orphan_id,
+        orphan_id, 
         location=location
     )
-
+    
     if suggestions:
         print(f"Found {len(suggestions)} possible vehicle associations:\n")
         for i, sugg in enumerate(suggestions[:3], 1):  # Top 3
@@ -1235,44 +1235,44 @@ def example_usage_orphan_sensor(clustering_engine: VehicleClusteringEngine, orph
         print("No strong associations found. This might be a new vehicle.")
 
 
-def example_usage_anomaly_detection(learning_engine: AdaptiveLearningEngine,
+def example_usage_anomaly_detection(learning_engine: AdaptiveLearningEngine, 
                                    sensor_id: str, pressure: float, temp: float):
     """
     Example of how to use anomaly detection.
     """
     print(f"\n=== Anomaly Detection for {sensor_id} ===\n")
-
+    
     anomaly = learning_engine.detect_anomaly(sensor_id, pressure, temp)
-
+    
     print(f"Pressure: {pressure:.1f} PSI")
     if anomaly['pressure_z_score'] is not None:
         print(f"  Z-score: {anomaly['pressure_z_score']:.2f}")
         print(f"  Anomaly: {'⚠️  YES' if anomaly['pressure_anomaly'] else '✓ Normal'}")
-
+    
     print(f"\nTemperature: {temp:.1f}°C")
     if anomaly['temp_z_score'] is not None:
         print(f"  Z-score: {anomaly['temp_z_score']:.2f}")
         print(f"  Anomaly: {'⚠️  YES' if anomaly['temp_anomaly'] else '✓ Normal'}")
-
+    
     print(f"\nConfidence: {anomaly['confidence']:.2%}")
 
 
-def example_usage_pattern_learner(pattern_learner: OnlinePatternLearner,
+def example_usage_pattern_learner(pattern_learner: OnlinePatternLearner, 
                                  sensor_id: str, lat: float, lon: float):
     """
     Example of how to use the OnlinePatternLearner for predictions.
     """
     print(f"\n=== Pattern-Based Prediction for {sensor_id} ===\n")
-
+    
     prediction = pattern_learner.predict(sensor_id, lat=lat, lon=lon)
-
+    
     if prediction['ok']:
         print(f"Predicted Pressure: {prediction['pressure_pred']:.1f} ± {prediction['pressure_std']:.1f} PSI")
         print(f"  Confidence: {prediction['pressure_conf']:.2%}")
-
+        
         print(f"\nPredicted Temperature: {prediction['temp_pred']:.1f} ± {prediction['temp_std']:.1f}°C")
         print(f"  Confidence: {prediction['temp_conf']:.2%}")
-
+        
         print(f"\nContext: Hour {prediction['hour']}, Cell {prediction['cell']}")
     else:
         print(f"Cannot predict: {prediction['reason']}")
@@ -1295,34 +1295,34 @@ class MLEngineScheduler:
     """
     Helper class to run periodic ML tasks (pattern updates, missed encounter checks, etc.)
     """
-
-    def __init__(self, clustering_engine: VehicleClusteringEngine,
+    
+    def __init__(self, clustering_engine: VehicleClusteringEngine, 
                  pattern_learner: OnlinePatternLearner,
                  db):
         self.clustering_engine = clustering_engine
         self.pattern_learner = pattern_learner
         self.db = db
-
+        
         self.last_pattern_update = time.time()
         self.last_missed_check = time.time()
-
+        
     def run_periodic_tasks(self, force: bool = False):
         """
         Run periodic maintenance tasks.
         Call this from your main loop every few seconds.
         """
         now = time.time()
-
+        
         # Update pattern learner from DB (every 60 seconds)
         if force or (now - self.last_pattern_update) > 60:
             self._update_patterns_from_db()
             self.last_pattern_update = now
-
+        
         # Check for missed encounters (every 5 minutes)
         if force or (now - self.last_missed_check) > 300:
             self._check_missed_encounters()
             self.last_missed_check = now
-
+    
     def _update_patterns_from_db(self):
         """Update pattern learner with new DB rows."""
         try:
@@ -1333,7 +1333,7 @@ class MLEngineScheduler:
                 print(f"📊 Updated patterns with {len(new_rows)} new signals", flush=True)
         except Exception as e:
             print(f"⚠️  Error updating patterns: {e}", flush=True)
-
+    
     def _check_missed_encounters(self):
         """Check all vehicles for missed encounters."""
         try:
@@ -1341,7 +1341,7 @@ class MLEngineScheduler:
             for vehicle_id in self.clustering_engine.vehicle_profiles.keys():
                 missed = self.clustering_engine.detect_missed_encounters(vehicle_id, now)
                 if missed['missed'] and missed['confidence'] > 0.5:
-                    print(f"⚠️  Vehicle {vehicle_id} possibly missed (overdue by {missed['overdue_by']/60:.1f} min)",
+                    print(f"⚠️  Vehicle {vehicle_id} possibly missed (overdue by {missed['overdue_by']/60:.1f} min)", 
                           flush=True)
         except Exception as e:
             print(f"⚠️  Error checking missed encounters: {e}", flush=True)
@@ -1354,7 +1354,7 @@ class MLEngineScheduler:
 def create_ml_engines(db):
     """
     Convenience function to create all ML engines at once.
-
+    
     Returns:
         Tuple of (clustering_engine, learning_engine, pattern_learner, scheduler)
     """
@@ -1362,7 +1362,7 @@ def create_ml_engines(db):
     learning_engine = create_learning_engine()
     pattern_learner = create_pattern_learner()
     scheduler = MLEngineScheduler(clustering_engine, pattern_learner, db)
-
+    
     return clustering_engine, learning_engine, pattern_learner, scheduler
 
 
@@ -1382,7 +1382,7 @@ def get_comprehensive_statistics(clustering_engine: VehicleClusteringEngine,
         'patterns': pattern_learner.get_statistics(),
         'timestamp': time.time(),
     }
-
+    
     # Add derived metrics
     if clustering_engine.enable_prediction:
         vehicles_with_predictions = sum(
@@ -1393,7 +1393,7 @@ def get_comprehensive_statistics(clustering_engine: VehicleClusteringEngine,
             'vehicles_predictable': vehicles_with_predictions,
             'prediction_coverage': vehicles_with_predictions / max(1, len(clustering_engine.vehicle_profiles)),
         }
-
+    
     return stats
 
 
@@ -1404,36 +1404,36 @@ def print_ml_summary(clustering_engine: VehicleClusteringEngine,
     Print a human-readable summary of ML engine status.
     """
     stats = get_comprehensive_statistics(clustering_engine, learning_engine, pattern_learner)
-
+    
     print("\n" + "="*60)
     print("ML ENGINE SUMMARY")
     print("="*60)
-
+    
     print("\n📊 Clustering Engine:")
     print(f"  Vehicles tracked: {stats['clustering']['num_vehicle_profiles']}")
     print(f"  Pair associations: {stats['clustering']['pair_edges']}")
     print(f"  Strong components: {stats['clustering']['num_components_strong']}")
-
+    
     if 'predictive' in stats:
         print(f"\n🔮 Predictive Analytics:")
         print(f"  Vehicles with patterns: {stats['clustering']['vehicles_with_patterns']}")
         print(f"  Predictable vehicles: {stats['predictive']['vehicles_predictable']}")
         print(f"  Prediction coverage: {stats['predictive']['prediction_coverage']:.1%}")
         print(f"  Total missed encounters: {stats['clustering']['total_missed_encounters']}")
-
+    
     print(f"\n🎓 Learning Engine:")
     print(f"  Total signals: {stats['learning']['total_signals']}")
     print(f"  Decode rate: {stats['learning']['decode_rate']:.1%}")
     print(f"  Protocols learned: {stats['learning']['protocols_learned']}")
     print(f"  Sensors with baselines: {stats['learning']['sensors_with_baselines']}")
     print(f"  Best protocol: {stats['learning']['best_protocol']}")
-
+    
     print(f"\n📈 Pattern Learner:")
     print(f"  Sensors tracked: {stats['patterns']['total_sensors']}")
     print(f"  Temporal patterns: {stats['patterns']['total_sensor_hour_patterns']}")
     print(f"  Location cells: {stats['patterns']['total_location_cells']}")
     print(f"  Total updates: {stats['patterns']['total_updates']}")
-
+    
     print("\n" + "="*60 + "\n")
 
 
@@ -1448,3 +1448,4 @@ if __name__ == "__main__":
     print("  • Sensor association suggestions")
     print("  • Anomaly detection for pressure/temperature")
     print("  • Online pattern learning with context awareness")
+
