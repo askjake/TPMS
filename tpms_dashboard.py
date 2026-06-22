@@ -277,9 +277,9 @@ with tab_history:
     # ── Repeated-sensor capture-time histogram ────────────────────────────────
     st.markdown("#### 📡 Capture-Time Distribution — Repeated Sensors")
     st.caption(
-        "Shows **when** sensors that appeared in more than one export session "
-        "were first captured, binned by hour-of-day and coloured by sensor. "
-        "Use the threshold slider to define what counts as 'repeated'."
+        "Shows **when** repeated sensors were physically captured (from the `first_seen` "
+        "broadcast timestamp), binned by hour-of-day and by calendar date. "
+        "Each colour is one sensor. Use the slider to set the recurrence threshold."
     )
 
     rep_min = st.slider(
@@ -296,47 +296,63 @@ with tab_history:
     if df_rep.empty:
         st.info(f"No sensors appear in ≥ {rep_min} sessions with current filters.")
     else:
-        # Derive capture hour and day-of-week from the actual first_seen timestamp
-        # (the moment the SDR caught the broadcast), not just the export file time.
-        df_rep["capture_hour"]    = df_rep["first_seen"].dt.hour
-        df_rep["capture_date"]    = df_rep["first_seen"].dt.date.astype(str)
-        df_rep["capture_dow"]     = df_rep["first_seen"].dt.day_name()
-        df_rep["capture_hhmm"]    = df_rep["first_seen"].dt.strftime("%H:%M")
-        df_rep["sessions_seen"]   = df_rep["sensor_id"].map(_session_counts)
+        # All time fields derive from first_seen — the actual SDR capture moment.
+        df_rep["capture_hour"]  = df_rep["first_seen"].dt.hour
+        df_rep["capture_date"]  = df_rep["first_seen"].dt.date.astype(str)
+        df_rep["capture_dow"]   = df_rep["first_seen"].dt.day_name()
+        df_rep["capture_hhmm"]  = df_rep["first_seen"].dt.strftime("%H:%M")
+        df_rep["sessions_seen"] = df_rep["sensor_id"].map(_session_counts)
+
+        # Stable sensor order: most-recurring first, then alphabetical
+        sensor_order_hist = (
+            df_rep.groupby("sensor_id")["sessions_seen"]
+                  .first()
+                  .sort_values(ascending=False)
+                  .index.tolist()
+        )
 
         rh1, rh2 = st.columns(2)
 
         with rh1:
-            # ── Primary histogram: hour-of-day, stacked by session ────────────
+            # Hour-of-day histogram — colour = sensor_id (capture time, not export time)
             fig_cap_hr = px.histogram(
                 df_rep,
                 x="capture_hour",
-                color="session_label",
+                color="sensor_id",
                 nbins=24,
                 title=f"Capture Hour-of-Day  ({len(_repeated_ids)} repeated sensors)",
                 labels={"capture_hour": "Hour of Day (0–23)", "count": "Capture Events",
-                        "session_label": "Session"},
+                        "sensor_id": "Sensor"},
                 barmode="stack",
-                category_orders={"capture_hour": list(range(24))},
+                category_orders={
+                    "capture_hour": list(range(24)),
+                    "sensor_id":    sensor_order_hist,
+                },
             )
             fig_cap_hr.update_layout(
                 xaxis=dict(tickmode="linear", tick0=0, dtick=1),
                 bargap=0.05,
+                legend_title_text="Sensor",
             )
             st.plotly_chart(fig_cap_hr, width='stretch')
 
         with rh2:
-            # ── Capture count per day, coloured by session ────────────────────
+            # Calendar-date histogram — colour = sensor_id (capture date from first_seen)
             fig_cap_day = px.histogram(
                 df_rep,
                 x="capture_date",
-                color="session_label",
+                color="sensor_id",
                 title="Capture Events by Date",
                 labels={"capture_date": "Date", "count": "Capture Events",
-                        "session_label": "Session"},
+                        "sensor_id": "Sensor"},
                 barmode="stack",
+                category_orders={"sensor_id": sensor_order_hist},
             )
-            fig_cap_day.update_layout(xaxis_tickangle=-30, bargap=0.1)
+            fig_cap_day.update_layout(
+                xaxis_tickangle=-30,
+                bargap=0.1,
+                legend_title_text="Sensor",
+            )
             st.plotly_chart(fig_cap_day, width='stretch')
 
         # ── Strip chart: each dot = one capture event for a repeated sensor ──
