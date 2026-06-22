@@ -18,6 +18,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -651,6 +652,380 @@ with tab_patterns:
     fig_new.update_xaxes(tickangle=-45)
     st.plotly_chart(fig_new, width='stretch')
 
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # CAPTURE TIME PATTERNS
+    # ══════════════════════════════════════════════════════════════════════════
+    st.markdown("---")
+    st.markdown("## ⏰ Capture Time Patterns")
+    st.caption(
+        "All charts below are based on the `first_seen` broadcast timestamp — "
+        "the moment the SDR actually heard the sensor, not when the export was created."
+    )
+
+    # Pre-compute time columns once for this whole section
+    df_ct = df.copy()
+    df_ct["hour"]    = df_ct["first_seen"].dt.hour
+    df_ct["dow"]     = df_ct["first_seen"].dt.day_name()
+    df_ct["dow_num"] = df_ct["first_seen"].dt.dayofweek
+    df_ct["date"]    = df_ct["first_seen"].dt.date.astype(str)
+    df_ct["dwell_s"] = (df_ct["last_seen"] - df_ct["first_seen"]).dt.total_seconds()
+
+    _sc       = df_ct.groupby("sensor_id")["export_file"].nunique()
+    _rep_ids  = _sc[_sc >= 2].index
+    df_ct_rep = df_ct[df_ct["sensor_id"].isin(_rep_ids)].copy()
+    df_ct_rep["sessions_seen"] = df_ct_rep["sensor_id"].map(_sc)
+
+    DOW_ORDER = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+
+    # ── 1. Polar clock  +  Day x Hour heatmap ────────────────────────────────
+    st.markdown("#### 1. When Are Sensors Captured?")
+    pc1, pc2 = st.columns(2)
+
+    with pc1:
+        st.markdown("**Radial Clock — All Sensors**")
+        st.caption(
+            "Hour-of-day captures plotted on a 24-hour clock face. "
+            "Spike = many sensors heard that hour across all sessions."
+        )
+        hr_counts = (
+            df_ct.groupby("hour")["sensor_id"]
+                 .count()
+                 .reindex(range(24), fill_value=0)
+                 .reset_index()
+        )
+        hr_counts.columns = ["hour", "count"]
+        hr_counts["angle"] = hr_counts["hour"] * 15
+        hr_counts["hour_label"] = hr_counts["hour"].apply(lambda h: f"{h:02d}:00")
+
+        fig_polar = go.Figure()
+        fig_polar.add_trace(go.Barpolar(
+            r=hr_counts["count"],
+            theta=hr_counts["angle"],
+            width=[15] * 24,
+            text=hr_counts["hour_label"],
+            customdata=hr_counts["count"],
+            hovertemplate="%{text}: %{customdata} captures<extra></extra>",
+            marker=dict(
+                color=hr_counts["count"],
+                colorscale="Plasma",
+                showscale=True,
+                colorbar=dict(title="Captures", thickness=12, len=0.7),
+            ),
+        ))
+        fig_polar.update_layout(
+            polar=dict(
+                angularaxis=dict(
+                    tickmode="array",
+                    tickvals=list(range(0, 360, 15)),
+                    ticktext=[f"{h:02d}h" for h in range(24)],
+                    direction="clockwise",
+                    rotation=90,
+                ),
+                radialaxis=dict(showticklabels=True, tickfont_size=9),
+            ),
+            title="Capture Clock (24 h)",
+            showlegend=False,
+            height=420,
+            margin=dict(t=60, b=20, l=20, r=20),
+        )
+        st.plotly_chart(fig_polar, width='stretch')
+
+    with pc2:
+        st.markdown("**Day-of-Week x Hour Heatmap**")
+        st.caption(
+            "Each cell = sensors captured on that weekday at that hour. "
+            "Reveals recurring weekly patterns — commute windows or parking lots."
+        )
+        pivot_dh = (
+            df_ct.groupby(["dow", "hour"])["sensor_id"]
+                 .count()
+                 .reset_index()
+                 .rename(columns={"sensor_id": "count"})
+        )
+        pivot_dh["dow"] = pd.Categorical(
+            pivot_dh["dow"], categories=DOW_ORDER, ordered=True
+        )
+        pivot_dh_wide = (
+            pivot_dh.pivot(index="dow", columns="hour", values="count")
+                    .fillna(0)
+                    .reindex([d for d in DOW_ORDER if d in pivot_dh["dow"].values])
+                    .reindex(columns=range(24), fill_value=0)
+        )
+        fig_dh = px.imshow(
+            pivot_dh_wide,
+            color_continuous_scale="YlOrRd",
+            aspect="auto",
+            title="Weekday x Hour Capture Density",
+            labels={"x": "Hour of Day", "y": "Day of Week", "color": "Captures"},
+        )
+        fig_dh.update_xaxes(
+            tickmode="array",
+            tickvals=list(range(0, 24, 2)),
+            ticktext=[f"{h:02d}h" for h in range(0, 24, 2)],
+        )
+        fig_dh.update_layout(
+            height=420,
+            coloraxis_colorbar=dict(thickness=12, len=0.7),
+        )
+        st.plotly_chart(fig_dh, width='stretch')
+
+    # ── 2. Capture Calendar ───────────────────────────────────────────────────
+    st.markdown("#### 2. Capture Calendar")
+    st.caption(
+        "Each tile is one calendar date. Colour intensity = unique sensors captured. "
+        "Shows scanning sessions, quiet periods, and activity bursts at a glance."
+    )
+    cal_df = (
+        df_ct.groupby("date")["sensor_id"]
+             .nunique()
+             .reset_index()
+             .rename(columns={"sensor_id": "sensors"})
+    )
+    cal_df["date_dt"]  = pd.to_datetime(cal_df["date"])
+    cal_df["dow_num"]  = cal_df["date_dt"].dt.dayofweek
+    cal_df["dow_name"] = cal_df["date_dt"].dt.day_name()
+    min_date = cal_df["date_dt"].min()
+    cal_df["week_idx"] = ((cal_df["date_dt"] - min_date).dt.days // 7)
+
+    cal_pivot = (
+        cal_df.pivot(index="dow_num", columns="week_idx", values="sensors")
+              .fillna(0)
+              .reindex(index=range(7), fill_value=0)
+    )
+
+    hover_grid = [["" for _ in cal_pivot.columns] for _ in range(7)]
+    for _, row in cal_df.iterrows():
+        wi = row["week_idx"]
+        if wi in cal_pivot.columns:
+            ci = list(cal_pivot.columns).index(wi)
+            hover_grid[int(row["dow_num"])][ci] = (
+                f"{row['date']} ({row['dow_name']})<br>{int(row['sensors'])} sensors"
+            )
+    week_labels = []
+    for wi in cal_pivot.columns:
+        match = cal_df[cal_df["week_idx"] == wi]
+        week_labels.append(
+            match.iloc[0]["date_dt"].strftime("%b %d") if not match.empty else ""
+        )
+
+    fig_cal = go.Figure(go.Heatmap(
+        z=cal_pivot.values,
+        x=week_labels,
+        y=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],
+        text=hover_grid,
+        hovertemplate="%{text}<extra></extra>",
+        colorscale="Blues",
+        showscale=True,
+        colorbar=dict(title="Sensors", thickness=12),
+        xgap=2,
+        ygap=2,
+    ))
+    fig_cal.update_layout(
+        title="Sensor Capture Calendar",
+        height=260,
+        yaxis=dict(autorange="reversed"),
+        margin=dict(t=50, b=30, l=50, r=80),
+    )
+    st.plotly_chart(fig_cal, width='stretch')
+
+    # ── 3. Repeated-sensor Gantt  +  gap distribution ────────────────────────
+    if not df_ct_rep.empty:
+        st.markdown("#### 3. Repeated Sensor Timelines")
+        rg1, rg2 = st.columns([3, 2])
+
+        with rg1:
+            st.markdown("**Recurrence Gantt**")
+            st.caption(
+                "Each bar = sensor lifespan (first to last capture). "
+                "Dots mark every individual capture event. Sorted by first capture."
+            )
+            span_df = (
+                df_ct_rep.groupby("sensor_id")
+                         .agg(
+                             first_cap=("first_seen", "min"),
+                             last_cap=("first_seen", "max"),
+                             sessions=("export_file", "nunique"),
+                         )
+                         .reset_index()
+                         .sort_values("first_cap")
+            )
+            palette = px.colors.qualitative.Plotly
+            fig_gantt = go.Figure()
+            for _gi, _gr in span_df.iterrows():
+                col = palette[_gi % len(palette)]
+                fig_gantt.add_trace(go.Scatter(
+                    x=[_gr["first_cap"], _gr["last_cap"]],
+                    y=[_gr["sensor_id"], _gr["sensor_id"]],
+                    mode="lines",
+                    line=dict(color=col, width=6),
+                    showlegend=False,
+                    hovertemplate=(
+                        f"<b>{_gr['sensor_id']}</b><br>"
+                        f"First: {_gr['first_cap'].strftime('%Y-%m-%d %H:%M')}<br>"
+                        f"Last:  {_gr['last_cap'].strftime('%Y-%m-%d %H:%M')}<br>"
+                        f"Sessions: {_gr['sessions']}"
+                        "<extra></extra>"
+                    ),
+                ))
+                caps = df_ct_rep[df_ct_rep["sensor_id"] == _gr["sensor_id"]]
+                fig_gantt.add_trace(go.Scatter(
+                    x=caps["first_seen"],
+                    y=[_gr["sensor_id"]] * len(caps),
+                    mode="markers",
+                    marker=dict(color=col, size=10, symbol="circle",
+                                line=dict(color="white", width=1)),
+                    showlegend=False,
+                    hovertemplate=(
+                        f"<b>{_gr['sensor_id']}</b><br>"
+                        "Captured: %{x}<extra></extra>"
+                    ),
+                ))
+            fig_gantt.update_layout(
+                title="Repeated Sensor Capture Timeline",
+                xaxis_title="Date",
+                yaxis_title="Sensor ID",
+                height=max(300, len(span_df) * 36 + 80),
+                margin=dict(l=110, r=20, t=50, b=40),
+                yaxis=dict(autorange="reversed"),
+            )
+            st.plotly_chart(fig_gantt, width='stretch')
+
+        with rg2:
+            st.markdown("**Inter-Capture Gap Distribution**")
+            st.caption(
+                "Time between consecutive captures of the same sensor. "
+                "Short = seen frequently. Long = parked or rarely passing."
+            )
+            gap_rows = []
+            for _sid, _grp in df_ct_rep.sort_values("first_seen").groupby("sensor_id"):
+                times = _grp["first_seen"].sort_values().tolist()
+                for _j in range(1, len(times)):
+                    gap_h = (times[_j] - times[_j-1]).total_seconds() / 3600
+                    gap_rows.append({
+                        "sensor_id": _sid,
+                        "gap_days":  round(gap_h / 24, 2),
+                        "sessions":  _sc[_sid],
+                    })
+            if gap_rows:
+                df_gaps = pd.DataFrame(gap_rows)
+                fig_gap = px.histogram(
+                    df_gaps,
+                    x="gap_days",
+                    color="sensor_id",
+                    nbins=30,
+                    title="Inter-Capture Gap (days)",
+                    labels={"gap_days": "Days Between Captures",
+                            "count":    "Occurrences",
+                            "sensor_id":"Sensor"},
+                    barmode="stack",
+                )
+                fig_gap.update_layout(legend_title_text="Sensor")
+                st.plotly_chart(fig_gap, width='stretch')
+                _short = df_gaps[df_gaps["gap_days"] <= 7]
+                _long  = df_gaps[df_gaps["gap_days"] >  7]
+                st.caption(
+                    f"**Short gaps (<=7 d):** {len(_short)} — nearby regulars.  \n"
+                    f"**Long gaps (>7 d):** {len(_long)} — reappear after extended absence."
+                )
+
+        # ── 4. Dwell time ─────────────────────────────────────────────────────
+        st.markdown("#### 4. Signal Dwell Time — Drive-by vs Parked")
+        st.caption(
+            "`last_seen - first_seen` per reading. Near-zero = drive-by. "
+            "Long dwell = sensor stationary within range (parked vehicle)."
+        )
+        df_dwell = df_ct[df_ct["dwell_s"] > 0].copy()
+        df_dwell["dwell_cat"] = pd.cut(
+            df_dwell["dwell_s"],
+            bins=[0, 10, 60, 300, 3600, float("inf")],
+            labels=["< 10 s  drive-by", "10-60 s", "1-5 min",
+                    "5-60 min", "> 1 h  parked"],
+        )
+        cat_order = ["< 10 s  drive-by","10-60 s","1-5 min","5-60 min","> 1 h  parked"]
+        dw1, dw2 = st.columns(2)
+        with dw1:
+            dwell_cats = df_dwell["dwell_cat"].value_counts().reset_index()
+            dwell_cats.columns = ["category","count"]
+            dwell_cats["category"] = pd.Categorical(
+                dwell_cats["category"], categories=cat_order, ordered=True
+            )
+            dwell_cats = dwell_cats.sort_values("category")
+            fig_dwell_pie = px.pie(
+                dwell_cats, names="category", values="count",
+                title="Dwell Time Categories",
+                color_discrete_sequence=px.colors.sequential.Teal,
+                hole=0.4,
+                category_orders={"category": cat_order},
+            )
+            st.plotly_chart(fig_dwell_pie, width='stretch')
+        with dw2:
+            df_dwell_log = df_dwell[df_dwell["dwell_s"] >= 1].copy()
+            df_dwell_log["log_dwell"] = np.log10(df_dwell_log["dwell_s"])
+            fig_dwell_hist = px.histogram(
+                df_dwell_log, x="log_dwell", nbins=40,
+                title="Dwell Time Distribution (log10 seconds)",
+                labels={"log_dwell": "log10(dwell seconds)", "count": "Readings"},
+                color_discrete_sequence=["#06b6d4"],
+            )
+            fig_dwell_hist.update_xaxes(
+                tickmode="array",
+                tickvals=[0,1,2,3,4,5,6],
+                ticktext=["1 s","10 s","100 s","~17 min","~3 h","~28 h","~12 d"],
+            )
+            st.plotly_chart(fig_dwell_hist, width='stretch')
+
+        # ── 5. Per-sensor hour-of-day radar ───────────────────────────────────
+        st.markdown("#### 5. Per-Sensor Hour-of-Day Radar")
+        st.caption(
+            "Spider chart showing each repeated sensor's capture-hour fingerprint. "
+            "Tight cluster = predictable schedule. Spread = random timing."
+        )
+        sensor_order_rep = (
+            df_ct_rep.groupby("sensor_id")["sessions_seen"]
+                     .first()
+                     .sort_values(ascending=False)
+                     .index.tolist()
+        )
+        max_radar = st.slider(
+            "Max sensors on radar (most recurring first)",
+            min_value=2,
+            max_value=min(10, len(sensor_order_rep)),
+            value=min(8, len(sensor_order_rep)),
+            key="radar_max",
+        )
+        theta_labels = [f"{h:02d}h" for h in range(24)] + ["00h"]
+        fig_radar = go.Figure()
+        for _sid in sensor_order_rep[:max_radar]:
+            hrs = (
+                df_ct_rep[df_ct_rep["sensor_id"] == _sid]["hour"]
+                .value_counts()
+                .reindex(range(24), fill_value=0)
+                .values.tolist()
+            )
+            fig_radar.add_trace(go.Scatterpolar(
+                r=hrs + [hrs[0]],
+                theta=theta_labels,
+                mode="lines+markers",
+                name=_sid,
+                fill="toself",
+                opacity=0.45,
+                hovertemplate=(
+                    f"<b>{_sid}</b><br>Hour: %{{theta}}<br>"
+                    "Captures: %{r}<extra></extra>"
+                ),
+            ))
+        fig_radar.update_layout(
+            polar=dict(
+                radialaxis=dict(visible=True, tickfont_size=8),
+                angularaxis=dict(direction="clockwise", rotation=90),
+            ),
+            title=f"Capture-Hour Radar — top {min(max_radar, len(sensor_order_rep))} recurring sensors",
+            height=520,
+            legend=dict(font_size=10),
+        )
+        st.plotly_chart(fig_radar, width='stretch')
+    # ══ END CAPTURE TIME PATTERNS ══════════════════════════════════════════════
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 5 – RAW DATA
