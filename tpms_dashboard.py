@@ -105,6 +105,8 @@ def pressure_alert_color(psi):
 # ─── DATA LOAD WITH AUTO-REFRESH ─────────────────────────────────────────────
 if "last_fingerprint" not in st.session_state:
     st.session_state["last_fingerprint"] = ""
+if "known_export_files" not in st.session_state:
+    st.session_state["known_export_files"] = set()
 
 fp = exports_fingerprint()
 if fp != st.session_state["last_fingerprint"]:
@@ -117,6 +119,18 @@ if df_all.empty:
     st.error(f"No JSON export files found in {EXPORTS_DIR}")
     st.stop()
 
+# Detect newly-appeared export files and auto-select them in the multiselect
+_current_files = set(df_all["export_file"].unique())
+_new_files = _current_files - st.session_state["known_export_files"]
+if _new_files and st.session_state["known_export_files"]:
+    # New files appeared after initial load — add them to the multiselect selection
+    _prev_selection = st.session_state.get("export_session_selector")
+    if _prev_selection is not None:
+        st.session_state["export_session_selector"] = sorted(
+            set(_prev_selection) | _new_files
+        )
+st.session_state["known_export_files"] = _current_files
+
 # ─── SIDEBAR ─────────────────────────────────────────────────────────────────
 st.sidebar.image("https://img.icons8.com/emoji/96/tire.png", width=64)
 st.sidebar.title("🛞 TPMS Dashboard")
@@ -128,6 +142,7 @@ selected_files = st.sidebar.multiselect(
     "📂 Export Sessions",
     options=all_files,
     default=all_files,
+    key="export_session_selector",
     help="Choose which export sessions to include",
 )
 
