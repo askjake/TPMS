@@ -119,16 +119,33 @@ if df_all.empty:
     st.error(f"No JSON export files found in {EXPORTS_DIR}")
     st.stop()
 
-# Detect newly-appeared export files and auto-select them in the multiselect
+# ─── Auto-include new export files in sidebar multiselects ───────────────────
+# Streamlit ignores `default=` once session_state has a stored value for a widget.
+# We must inject new files/sensors/protocols into session_state BEFORE the widget renders.
 _current_files = set(df_all["export_file"].unique())
 _new_files = _current_files - st.session_state["known_export_files"]
+
 if _new_files and st.session_state["known_export_files"]:
-    # New files appeared after initial load — add them to the multiselect selection
-    _prev_selection = st.session_state.get("export_session_selector")
-    if _prev_selection is not None:
-        st.session_state["export_session_selector"] = sorted(
-            set(_prev_selection) | _new_files
-        )
+    # New export files appeared since last render — auto-select them.
+    _prev = st.session_state.get("export_session_selector")
+    if _prev is not None:
+        st.session_state["export_session_selector"] = sorted(set(_prev) | _new_files)
+
+    # Also auto-include any new sensor IDs and protocols from the new files
+    _new_df = df_all[df_all["export_file"].isin(_new_files)]
+    _new_sensor_ids = set(_new_df["sensor_id"].unique())
+    _new_protocols  = set(_new_df["protocol"].unique())
+
+    _prev_sensors = st.session_state.get("sensor_selector")
+    if _prev_sensors is not None:
+        st.session_state["sensor_selector"] = sorted(set(_prev_sensors) | _new_sensor_ids)
+
+    _prev_protos = st.session_state.get("protocol_selector")
+    if _prev_protos is not None:
+        st.session_state["protocol_selector"] = sorted(set(_prev_protos) | _new_protocols)
+
+    st.toast(f"📡 {len(_new_files)} new export(s) detected and auto-selected!", icon="🆕")
+
 st.session_state["known_export_files"] = _current_files
 
 # ─── SIDEBAR ─────────────────────────────────────────────────────────────────
@@ -152,6 +169,7 @@ selected_sensors = st.sidebar.multiselect(
     "📡 Sensors",
     options=all_sensors,
     default=all_sensors,
+    key="sensor_selector",
     help="Filter to specific sensor IDs",
 )
 
@@ -161,6 +179,7 @@ selected_protocols = st.sidebar.multiselect(
     "🔌 Protocols",
     options=all_protocols,
     default=all_protocols,
+    key="protocol_selector",
 )
 
 st.sidebar.markdown("---")
@@ -1072,6 +1091,19 @@ st.caption(
     f"Exports directory: `{EXPORTS_DIR}`"
 )
 
+# ─── NON-BLOCKING AUTO-REFRESH via st.fragment ───────────────────────────────
+# Instead of time.sleep() which blocks the entire app, use a fragment that
+# Streamlit runs in the background at the specified interval.
+# When it detects new/changed files, it triggers a full app rerun.
+@st.fragment(run_every=REFRESH_INTERVAL_SECS)
+def _auto_refresh_poll():
+    """Lightweight background poller — checks exports/ fingerprint without blocking UI."""
+    current_fp = exports_fingerprint()
+    if current_fp != st.session_state.get("last_fingerprint", ""):
+        st.session_state["last_fingerprint"] = current_fp
+        st.cache_data.clear()
+        st.rerun()
+
 if auto_refresh:
-    time.sleep(REFRESH_INTERVAL_SECS)
-    st.rerun()
+    _auto_refresh_poll()
+
