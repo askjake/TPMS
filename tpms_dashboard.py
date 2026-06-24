@@ -155,11 +155,21 @@ st.sidebar.markdown("---")
 
 # File selector
 all_files = sorted(df_all["export_file"].unique())
+
+# Map filename → short "Jun 24 07:08" label for the sidebar display
+_file_label = (
+    df_all[["export_file", "session_label"]]
+    .drop_duplicates("export_file")
+    .set_index("export_file")["session_label"]
+    .to_dict()
+)
+
 selected_files = st.sidebar.multiselect(
     "📂 Export Sessions",
     options=all_files,
     default=all_files,
     key="export_session_selector",
+    format_func=lambda f: _file_label.get(f, f),
     help="Choose which export sessions to include",
 )
 
