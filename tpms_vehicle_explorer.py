@@ -26,11 +26,44 @@ import streamlit as st
 
 # ── paths ────────────────────────────────────────────────────────────────────
 THIS_DIR = Path(__file__).parent
-SOURCE_DB_OPTIONS = {
-    "tracker4 (39.5N/104.8W)": str(THIS_DIR / "tpms_tracker4.db"),
-    "tracker (main)":           str(THIS_DIR / "tpms_tracker.db"),
-}
-PROFILE_DB = str(THIS_DIR / "tpms_vehicle_profiles.db")
+
+# Search order: script dir, common remote mounts, home-relative paths
+_SEARCH_ROOTS = [
+    THIS_DIR,
+    Path("/home/diship-test/TPMS"),
+    Path("/home/montjac/TPMS"),
+    Path.home() / "TPMS",
+    Path("/opt/TPMS"),
+]
+
+def _find_db(name: str) -> str:
+    """Return the first existing path for a named DB file across search roots."""
+    for root in _SEARCH_ROOTS:
+        p = root / name
+        if p.exists():
+            return str(p)
+    return str(THIS_DIR / name)   # fallback (will show 'not found' in UI)
+
+def _discover_source_dbs() -> dict:
+    """Auto-discover all tpms_tracker*.db files across search roots."""
+    found = {}
+    seen = set()
+    for root in _SEARCH_ROOTS:
+        if not root.exists():
+            continue
+        for p in sorted(root.glob("tpms_tracker*.db")):
+            if str(p) not in seen and p.stat().st_size > 1024:
+                label = f"{p.name}  [{root}]"
+                found[label] = str(p)
+                seen.add(str(p))
+    if not found:
+        # Fallback entries so the selectbox always has something
+        found["tracker4 (not found)"] = _find_db("tpms_tracker4.db")
+        found["tracker (not found)"]  = _find_db("tpms_tracker.db")
+    return found
+
+SOURCE_DB_OPTIONS = _discover_source_dbs()
+PROFILE_DB = _find_db("tpms_vehicle_profiles.db")
 
 # ── page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -125,10 +158,23 @@ with st.sidebar:
     selected_source_name = st.selectbox("Source DB", list(SOURCE_DB_OPTIONS.keys()))
     selected_source = SOURCE_DB_OPTIONS[selected_source_name]
 
+    # Manual path override
+    with st.expander("Override path", expanded=not os.path.exists(selected_source)):
+        custom_path = st.text_input("Custom DB path", value=selected_source,
+                                    help="Paste full path to tpms_tracker*.db")
+        if custom_path and custom_path != selected_source:
+            selected_source = custom_path.strip()
+        custom_profile = st.text_input("Profile DB path", value=PROFILE_DB,
+                                       help="Where to store/read vehicle profiles")
+        if custom_profile and custom_profile.strip() != PROFILE_DB:
+            PROFILE_DB = custom_profile.strip()
+
     db_exists = os.path.exists(selected_source)
     profile_exists = os.path.exists(PROFILE_DB)
-    st.caption(f"Source: {'✅' if db_exists else '❌'} {Path(selected_source).name}")
+    st.caption(f"Source: {'✅' if db_exists else '❌ NOT FOUND'} {Path(selected_source).name}")
     st.caption(f"Profiles: {'✅' if profile_exists else '⚠ Not run yet'}")
+    if not db_exists:
+        st.warning(f"DB not found:\n`{selected_source}`\nUse override above.")
 
 
 # ════════════════════════════════════════════════════════════════════════════
