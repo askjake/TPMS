@@ -62,6 +62,13 @@ SYNC_PID=$!
 echo "$SYNC_PID" > "$PID_DIR/sync_watcher.pid"
 echo "[TPMS] Sync watcher PID=$SYNC_PID (log: $LOG_DIR/sync_watcher.log)"
 
+# ── Backfill + watch exports/ → tpms_local.sqlite3 ───────────────────────────
+echo "[TPMS] Starting JSON→SQLite importer (watch mode)..."
+nohup "$VENV/python3" "$SCRIPT_DIR/tpms_import_exports.py" --watch > "$LOG_DIR/import_exports.log" 2>&1 &
+IMPORT_PID=$!
+echo "$IMPORT_PID" > "$PID_DIR/import_exports.pid"
+echo "[TPMS] Importer PID=$IMPORT_PID (log: $LOG_DIR/import_exports.log)"
+
 # ── Start Streamlit ───────────────────────────────────────────────────────────
 STREAMLIT_CMD=(
     "$VENV/streamlit" run "$SCRIPT_DIR/tpms_dashboard.py"
@@ -85,6 +92,6 @@ else
     echo "[TPMS] Press Ctrl-C to stop."
     echo "[TPMS] Dashboard: http://$(hostname -I | awk '{print $1}'):$PORT"
     # exec replaces shell — Ctrl-C will kill Streamlit and also the sync watcher
-    trap "kill $SYNC_PID 2>/dev/null; exit 0" INT TERM
+    trap "kill $SYNC_PID $IMPORT_PID 2>/dev/null; exit 0" INT TERM
     exec "${STREAMLIT_CMD[@]}"
 fi
