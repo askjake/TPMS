@@ -765,7 +765,122 @@ elif view == "Observation Patterns":
         )
         st.plotly_chart(fig_stack, use_container_width=True)
 
-    # 6. Interpretation callout
+    # 6. Sensor Capture Schedule — per-sensor hour-of-day patterns
+    st.markdown("---")
+    st.markdown("### Sensor Capture Schedule")
+    st.caption(
+        "Which hours and day-types does each recurring sensor appear? "
+        "Use this to predict when you can next expect to capture a specific vehicle."
+    )
+
+    # Derive capture-time columns from actual last_seen timestamp
+    if "last_seen" in tl.columns and tl["last_seen"].notna().any():
+        _cap_ts = pd.to_datetime(tl["last_seen"], errors="coerce")
+    else:
+        _cap_ts = tl["export_dt"]
+    tl["capture_hour"] = _cap_ts.dt.hour
+    tl["capture_weekday_num"] = _cap_ts.dt.weekday
+    tl["capture_weekday"] = _cap_ts.dt.strftime("%a")
+    tl["is_weekend"] = tl["capture_weekday_num"] >= 5
+
+    recurring_sched = tl[tl.get("session_count", tl.groupby("sensor_id")["export_file"].transform("nunique")) >= 2].copy()
+
+    if not recurring_sched.empty:
+        # --- Schedule Table ---
+        sched_table = (
+            recurring_sched.groupby("sensor_id")
+            .agg(
+                sessions=("export_file", "nunique"),
+                weekday_caps=("is_weekend", lambda x: int((~x).sum())),
+                weekend_caps=("is_weekend", lambda x: int(x.sum())),
+                typical_hours=("capture_hour", lambda x: sorted(x.dropna().unique().astype(int).tolist())),
+                avg_hour=("capture_hour", "mean"),
+            )
+            .sort_values("sessions", ascending=False)
+        )
+        sched_table["day_pattern"] = sched_table.apply(
+            lambda r: "Both" if r["weekday_caps"] > 0 and r["weekend_caps"] > 0
+                      else ("Weekday only" if r["weekday_caps"] > 0 else "Weekend only"),
+            axis=1
+        )
+        sched_table["typical_hours"] = sched_table["typical_hours"].apply(
+            lambda hrs: ", ".join(f"{h:02d}:00" for h in hrs[:6]) + (" ..." if len(hrs) > 6 else "")
+        )
+        sched_table["avg_hour"] = sched_table["avg_hour"].round(1)
+
+        sched_disp = sched_table[["sessions", "day_pattern", "weekday_caps",
+                                   "weekend_caps", "typical_hours", "avg_hour"]].copy()
+        sched_disp.columns = ["Sessions", "Day Pattern", "Weekday Caps",
+                              "Weekend Caps", "Typical Hours", "Avg Hour"]
+        sched_disp = sched_disp.reset_index().rename(columns={"sensor_id": "Sensor ID"})
+        st.dataframe(sched_disp, use_container_width=True, hide_index=True, height=320)
+
+        # --- Heatmap: Sensor x Hour, Weekday vs Weekend side by side ---
+        top_n = min(25, recurring_sched["sensor_id"].nunique())
+        top_sensors = recurring_sched["sensor_id"].value_counts().head(top_n).index.tolist()
+        heat_data = recurring_sched[recurring_sched["sensor_id"].isin(top_sensors)]
+
+        col_wd, col_we = st.columns(2)
+
+        # Weekday heatmap
+        wd_data = heat_data[~heat_data["is_weekend"]]
+        if not wd_data.empty:
+            wd_pivot = wd_data.pivot_table(
+                index="sensor_id", columns="capture_hour",
+                values="export_file", aggfunc="count", fill_value=0
+            ).reindex(columns=range(24), fill_value=0)
+            with col_wd:
+                st.markdown("**Weekday (Mon–Fri)**")
+                fig_wd = px.imshow(
+                    wd_pivot, color_continuous_scale="Blues", aspect="auto",
+                    labels={"color": "Captures", "x": "Hour", "y": "Sensor"},
+                )
+                fig_wd.update_xaxes(dtick=2, tickvals=list(range(0, 24, 2)),
+                                     ticktext=[f"{h:02d}" for h in range(0, 24, 2)])
+                fig_wd.update_layout(height=max(300, top_n * 22), margin=dict(l=10, r=10))
+                st.plotly_chart(fig_wd, use_container_width=True)
+
+        # Weekend heatmap
+        we_data = heat_data[heat_data["is_weekend"]]
+        if not we_data.empty:
+            we_pivot = we_data.pivot_table(
+                index="sensor_id", columns="capture_hour",
+                values="export_file", aggfunc="count", fill_value=0
+            ).reindex(columns=range(24), fill_value=0)
+            with col_we:
+                st.markdown("**Weekend (Sat–Sun)**")
+                fig_we = px.imshow(
+                    we_pivot, color_continuous_scale="Oranges", aspect="auto",
+                    labels={"color": "Captures", "x": "Hour", "y": "Sensor"},
+                )
+                fig_we.update_xaxes(dtick=2, tickvals=list(range(0, 24, 2)),
+                                     ticktext=[f"{h:02d}" for h in range(0, 24, 2)])
+                fig_we.update_layout(height=max(300, top_n * 22), margin=dict(l=10, r=10))
+                st.plotly_chart(fig_we, use_container_width=True)
+
+        # --- Combined bar: captures by hour, weekday vs weekend overlay ---
+        st.markdown("#### Capture probability by hour of day")
+        st.caption("All recurring sensors combined — weekday vs weekend distribution.")
+        hour_dist = (
+            recurring_sched.groupby(["capture_hour", "is_weekend"])["sensor_id"]
+            .count()
+            .reset_index(name="captures")
+        )
+        hour_dist["day_type"] = hour_dist["is_weekend"].map({False: "Weekday", True: "Weekend"})
+        fig_prob = px.bar(
+            hour_dist, x="capture_hour", y="captures", color="day_type",
+            barmode="group",
+            labels={"capture_hour": "Hour of Day", "captures": "Captures", "day_type": ""},
+            color_discrete_map={"Weekday": "#1f77b4", "Weekend": "#ff7f0e"},
+        )
+        fig_prob.update_xaxes(dtick=1, tickvals=list(range(24)),
+                               ticktext=[f"{h:02d}" for h in range(24)])
+        fig_prob.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02))
+        st.plotly_chart(fig_prob, use_container_width=True)
+    else:
+        st.info("Need at least 2 sessions with recurring sensors to build a capture schedule.")
+
+    # 7. Interpretation callout
     st.markdown("---")
     st.markdown("### Interpretation")
     peak_hour = int(hourly_df.loc[hourly_df["unique_sensors"].idxmax(), "hour"]) if not hourly_df.empty else 0
