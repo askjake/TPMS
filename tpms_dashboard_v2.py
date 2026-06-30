@@ -207,6 +207,13 @@ def build_sensor_timelines(fingerprint: str) -> pd.DataFrame:
     tl["week"]          = tl["export_dt"].dt.isocalendar().week.astype(int)
     tl["session_label"] = tl["export_dt"].dt.strftime("%b %d %H:%M")
 
+    # Derive capture_label from actual sensor last_seen timestamp (not session time)
+    if "last_seen" in tl.columns:
+        tl["last_seen"] = pd.to_datetime(tl["last_seen"], errors="coerce")
+        tl["capture_label"] = tl["last_seen"].dt.strftime("%b %d %H:%M")
+    else:
+        tl["capture_label"] = tl["session_label"]  # fallback
+
     session_counts      = tl.groupby("sensor_id")["export_file"].nunique()
     tl["session_count"] = tl["sensor_id"].map(session_counts)
     tl["is_recurring"]  = tl["session_count"] > 1
@@ -536,12 +543,12 @@ elif view == "Sensor History":
         k[4].metric("Avg RSSI", f"{sdf['rssi_dbm'].mean():.1f} dBm")
 
     st.markdown("#### Capture-by-capture history")
-    raw_cols = [c for c in ["session_label", "pressure_psi", "pressure_kpa",
+    raw_cols = [c for c in ["capture_label", "pressure_psi", "pressure_kpa",
                              "temp_f", "temp_c", "rssi_dbm", "packet_count",
                              "battery_low", "export_file"]
                 if c in sdf.columns]
     st.dataframe(
-        sdf[raw_cols].rename(columns={"session_label": "Session"}),
+        sdf[raw_cols].rename(columns={"capture_label": "Captured"}),
         use_container_width=True, hide_index=True
     )
 
@@ -592,10 +599,15 @@ elif view == "Sensor History":
             st.plotly_chart(fig_pkts, use_container_width=True)
 
         st.markdown("#### Inter-capture gaps")
-        gaps_h = sdf["export_dt"].sort_values().diff().dropna().dt.total_seconds().div(3600).round(1).values
+        # Use actual capture time (last_seen) for gap calculation when available
+        if "last_seen" in sdf.columns and sdf["last_seen"].notna().any():
+            gap_series = sdf["last_seen"].sort_values()
+        else:
+            gap_series = sdf["export_dt"].sort_values()
+        gaps_h = gap_series.diff().dropna().dt.total_seconds().div(3600).round(1).values
         gap_df = pd.DataFrame({
-            "From": sdf["session_label"].iloc[:-1].values,
-            "To":   sdf["session_label"].iloc[1:].values,
+            "From": sdf["capture_label"].iloc[:-1].values,
+            "To":   sdf["capture_label"].iloc[1:].values,
             "Gap (h)": gaps_h,
             "Gap (days)": (gaps_h / 24).round(1),
         })
