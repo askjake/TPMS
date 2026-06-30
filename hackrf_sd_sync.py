@@ -369,7 +369,9 @@ CREATE TABLE IF NOT EXISTS sensors (
     packet_count    INTEGER,
     flags           TEXT,
     source          TEXT,
-    updated_at      TEXT
+    updated_at      TEXT,
+    magic_ok        INTEGER DEFAULT 1,
+    suspect_temp    INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS sync_log (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -383,9 +385,29 @@ CREATE TABLE IF NOT EXISTS sync_log (
 """
 
 
+# Columns that may have been added after initial schema; used by _migrate_schema
+_EXPECTED_COLUMNS = {
+    "magic_ok":     "INTEGER DEFAULT 1",
+    "suspect_temp": "INTEGER DEFAULT 0",
+}
+
+
+def _migrate_schema(conn: sqlite3.Connection):
+    """Auto-merge schema discrepancies: add any missing columns to sensors table."""
+    cur = conn.execute("PRAGMA table_info(sensors)")
+    existing_cols = {row[1] for row in cur.fetchall()}
+    for col_name, col_def in _EXPECTED_COLUMNS.items():
+        if col_name not in existing_cols:
+            stmt = f"ALTER TABLE sensors ADD COLUMN {col_name} {col_def}"
+            conn.execute(stmt)
+            log.info(f"Schema migration: added column '{col_name}' ({col_def})")
+    conn.commit()
+
+
 def open_local_db(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path), timeout=10)
     conn.executescript(_SCHEMA)
+    _migrate_schema(conn)
     conn.commit()
     return conn
 
@@ -408,7 +430,13 @@ def merge_records(conn: sqlite3.Connection,
 
         if row is None:
             cur.execute(
-                "INSERT INTO sensors VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO sensors "
+                "(sensor_id, protocol, first_seen, last_seen, "
+                " first_seen_ts, last_seen_ts, pressure_psi, pressure_kpa, "
+                " temp_c, temp_f, battery_low, rssi_dbm, "
+                " packet_count, flags, source, updated_at, "
+                " magic_ok, suspect_temp) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (sid, rec.protocol,
                  rec.first_seen_dt, rec.last_seen_dt,
                  rec.first_seen,    rec.last_seen,
@@ -416,7 +444,8 @@ def merge_records(conn: sqlite3.Connection,
                  rec.temp_c,        rec.temp_f,
                  int(rec.battery_low), rec.rssi_dbm,
                  rec.packet_count,  f"0x{rec.flags:02X}",
-                 source, now)
+                 source, now,
+                 int(rec.valid_magic), int(rec.suspect_temp))
             )
             new_c += 1
         else:
